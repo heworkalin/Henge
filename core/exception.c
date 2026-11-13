@@ -71,7 +71,35 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                  * report is not the faulting state, which is why it disagreed with the code that
                  * built the address.
                  */
-                if (cpu->m->log >= 2) hv_trace_ring_dump(cpu);
+                if (cpu->m->log >= 2) {
+                    hv_trace_ring_dump(cpu);
+                    /*
+                     * The code at each of the last distinct block starts. The trace says where the
+                     * guest was; the instructions there say what it was doing — and a loop that
+                     * corrupts a register shows as several blocks cycling, which reads very
+                     * differently from a straight line.
+                     */
+                    uint64_t seen[8];
+                    int nseen = 0;
+                    for (int i = 63; i >= 0 && nseen < 8; i--) {
+                        uint64_t va = cpu->trace_ring[(cpu->trace_idx + (uint32_t) i) & 63];
+                        int dup = 0;
+                        for (int k = 0; k < nseen; k++) if (seen[k] == va) dup = 1;
+                        if (dup || !va) continue;
+                        seen[nseen++] = va;
+                        fprintf(stderr, "hengevm: block %llx:", (unsigned long long) va);
+                        for (int w = 0; w < 10; w++) {
+                            HvWalk bww;
+                            uint32_t word = 0;
+                            hv_mmu_walk(cpu, va + (uint64_t) w * 4, HV_ACC_READ, 0, &bww);
+                            if (bww.fsc == 0 && hv_phys_read(cpu->m, bww.pa, &word, 4) == 0)
+                                fprintf(stderr, " %08x", word);
+                            else
+                                fprintf(stderr, " ????????");
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
                 fprintf(stderr, "hengevm: at the fault: x0=%llx x1=%llx x2=%llx x3=%llx "
                                 "x4=%llx x5=%llx x6=%llx x7=%llx\n",
                         (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],

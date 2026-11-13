@@ -1191,8 +1191,11 @@ void hv_pc_hist_dump(HvCpu *cpu) {
    block was reached. */
 void hv_trace_ring_dump(HvCpu *cpu) {
     if (!cpu) return;
-    fprintf(stderr, "hengevm: traced blocks on cpu %u (oldest first):\n", (unsigned) cpu->index);
-    for (uint32_t n = 0; n < 64; n++)
-        fprintf(stderr, "  %llx\n",
-                (unsigned long long) cpu->trace_ring[(cpu->trace_idx + n) & 63]);
+    fprintf(stderr, "hengevm: traced blocks on cpu %u (oldest first): va x0 x4\n",
+            (unsigned) cpu->index);
+    for (uint32_t n = 0; n < 64; n++) {
+        const uint64_t *e = &cpu->trace_ring[((cpu->trace_idx + n) & 63) * 4];
+        fprintf(stderr, "  %llx %llx %llx\n", (unsigned long long) e[0],
+                (unsigned long long) e[1], (unsigned long long) e[2]);
+    }
 }

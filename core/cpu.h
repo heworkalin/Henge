@@ -115,7 +115,9 @@ typedef struct HvCpu {
        indirect branches never pass through C to be recorded there. Off unless log >= 3. */
     uint32_t trace_idx;
     uint32_t trace_pad;
-    uint64_t trace_ring[64];
+    /* {block VA, guest x0, guest x4, spare} per entry: a register that goes wrong between two
+       block entries is then visible, which a trace of addresses alone cannot show. */
+    uint64_t trace_ring[64 * 4];
 
     struct HvMachine *m;
     uint32_t el;
