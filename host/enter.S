@@ -64,6 +64,13 @@
     .globl _hv_xjump_thunk
     .globl _hv_fp_enter
     .globl _hv_fp_leave
+    /* The JIT reaches these through HvCpu, and C takes their addresses to fill it in. Hidden, so
+       that an address is a link-time constant: otherwise taking it goes through the GOT, and the
+       instructions that do that use x16 — which is a guest register here. That is how a .got.plt
+       address turned up in a guest's x16 and the firmware died on it. */
+    .hidden _hv_enter, _hv_exit, _hv_helper_entry, _hv_helper_thunk
+    .hidden _hv_chain_thunk, _hv_ijc_thunk, _hv_xjump_thunk
+    .hidden _hv_fp_enter, _hv_fp_leave
 
 // Not x6, x7, x15: guest x6, x7 and x15 live in the HvCpu, the host registers are scratch.
 .macro SAVE_X2_X29

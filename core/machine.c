@@ -637,7 +637,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->ijc_salt[1] = 1ull << 48; /* tags of an all-zero table never match */
     hv_ijc_switch(cpu);
     cpu->exit_routine = (uint64_t)hv_exit;
-    cpu->helper_routine = (uint64_t)hv_helper_entry;
+    /* helper_routine was never read: the JIT calls the thunk, which jumps to hv_helper_entry.
+       Taking the address was the one thing that put a GOT slot address in x16. */
     cpu->helper_thunk = (uint64_t)hv_helper_thunk;
     cpu->chain_thunk = (uint64_t)hv_chain_thunk;
     cpu->ijc_thunk = (uint64_t)hv_ijc_thunk;
