@@ -261,7 +261,7 @@ static void put_trace_entry(Emit *e, uint64_t va) {
     put(e, 0x120014c6u);                                   /* and w6, w6, #0x3f */
     put(e, 0xb90001e6u);                                   /* str w6, [x15] */
     put(e, 0x910021efu);                                   /* add x15, x15, #8: the ring follows */
-    put(e, 0x8b0611efu);                                   /* add x15, x15, x6, lsl #4 (32B/entry) */
+    put(e, 0x8b0615efu);                                   /* add x15, x15, x6, lsl #5 (32B/entry) */
     put(e, 0xf90005e0u);                                   /* str x0, [x15, #8] */
     put(e, 0xf90009e4u);                                   /* str x4, [x15, #16] */
     /* The block's address, in the same register, built with movz/movk. */
