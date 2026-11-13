@@ -1,5 +1,9 @@
 #include "vmapple.h"
+#ifdef HENGE_HAVE_REIMS
+#include "reims_pvg.h"
+#else
 #include "pvg_lite.h"
+#endif
 #include "sysreg.h"
 
 #include <errno.h>
@@ -13,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -32,11 +37,21 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
     HvVmapple *b = opaque;
     b->panic_events = v;
     fprintf(stderr, "hengevm: guest reported a panic (pvpanic event %llx)\n", (unsigned long long)v);
+    if (b->m->log >= 2) hv_pc_hist_dump(b->m->cpu);
     /* The panic text, wherever the kernel formatted it (pram is not always
        where the log ends up, e.g. in the restore OS). */
-    const char key[] = "panic(cpu ";
+    /* XNU writes "panic(cpu ", the restore firmware writes its own report; both are worth showing,
+       because the alternative is a panic event with no reason attached. */
+    static const char *const keys[] = {"panic(cpu ", "Panic", "assert", "Assertion", "Fatal error"};
+    const char *key = keys[0];
+    for (unsigned k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+        if (memmem(b->ram, b->ram_size, keys[k], strlen(keys[k]))) {
+            key = keys[k];
+            break;
+        }
+    }
     for (uint8_t *p = b->ram, *end = b->ram + b->ram_size; p && p < end;) {
-        p = memmem(p, (size_t)(end - p), key, sizeof key - 1);
+        p = memmem(p, (size_t)(end - p), key, strlen(key));
         if (!p) break;
         size_t n = 0;
         while (p + n < end && n < 3000 && (p[n] == '\n' || p[n] == '\t' || (p[n] >= 32 && p[n] < 127))) n++;
@@ -53,7 +68,7 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
             fprintf(stderr, "hengevm: panic text at PA %llx:\n%s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - b->ram)), out);
             break;
         }
-        p += sizeof key - 1;
+        p += strlen(key);
     }
     if (v & 1) hv_machine_halt(b->m, HV_HALT_PANIC);
 }
@@ -225,7 +240,11 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     if (cpu->index != 0) return deadline; /* the others only have their own timers to look after */
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
+#ifdef HENGE_HAVE_REIMS
+    hv_reims_pvg_poll(b->pvg);
+#else
     hv_pvg_lite_poll(b->pvg);
+#endif
     hv_virtio_blk_poll(b->root_blk);
     hv_virtio_blk_poll(b->aux_blk);
     hv_xhci_poll(b->usb);
@@ -262,10 +281,45 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        The file is unlinked at once and goes away with the process. */
     const char *ram_file = getenv("HV_RAM_FILE");
     b->ram = MAP_FAILED;
+#if defined(__ANDROID__)
+    /* Android: guest RAM lives in a memfd, always.
+     *
+     * Not for the iOS reason (that alloc_no_footprint trick is about iOS's
+     * footprint ledger, which does not exist here). The reason is the GPU: the
+     * Vulkan platform of reims-vgpu builds its views of guest pages by mapping
+     * *files* that back them (RvgMemoryRangeFile; a range with no file gets no
+     * view, and a guest use that needs one fails). Anonymous pages cannot be
+     * given a file, so guest RAM has to be file-backed or the GPU has no way to
+     * reach it.
+     *
+     * memfd rather than a named file: nothing to clean up, nothing to unlink,
+     * no filesystem or permission involved, and it is the same primitive the JIT
+     * already uses (host/jit_region.c). The fd also serves virtio-balloon's hole
+     * punching, which takes a file descriptor.
+     */
+    if (!getenv("HV_RAM_ANON")) {
+        int fd = (int)syscall(__NR_memfd_create, "henge-ram", 1 /* MFD_CLOEXEC */);
+        if (fd >= 0) {
+            if (ftruncate(fd, (off_t)ram_size) == 0)
+                b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (b->ram != MAP_FAILED) {
+                b->ram_fd = fd;
+                fprintf(stderr, "hengevm: guest RAM (%llu MB) is a memfd (fd %d)\n",
+                        (unsigned long long)(ram_size >> 20), fd);
+            } else {
+                close(fd);
+            }
+        }
+        if (b->ram == MAP_FAILED)
+            fprintf(stderr, "hengevm: memfd for guest RAM failed: %s; using anonymous memory "
+                            "(the GPU will have no views of it)\n", strerror(errno));
+    }
+#else
     if (!getenv("HV_RAM_NO_LEDGER")) {
         uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
         if (free_of_footprint) b->ram = free_of_footprint;
     }
+#endif
     if (b->ram == MAP_FAILED && ram_file && *ram_file) {
         int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) {
@@ -302,7 +356,15 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);
     b->aes = hv_aes_create(m, b->gic, VMAPPLE_AES_1, VMAPPLE_AES_2, 32 + VMAPPLE_IRQ_AES);
     hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
+#ifdef HENGE_HAVE_REIMS
+    /* The paravirtual GPU, on reims-vgpu instead of on Metal (android/reims_pvg.c). The guest's
+     * RAM goes with it, together with the file behind it: reims-vgpu builds its views of guest
+     * pages from that file, so the memfd made above is not optional here. */
+    b->pvg = hv_reims_pvg_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10,
+                                 VMAPPLE_MEM, b->ram, ram_size, b->ram_fd);
+#else
     b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
+#endif
     hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
     avp_regs_create(b, ram_size);
     HvCfgParams p = *cfg;
@@ -363,7 +425,11 @@ void hv_vmapple_destroy(HvVmapple *b) {
     /* Device workers and GPU completions can still touch RAM and the GIC. */
     hv_virtio_blk_destroy(b->root_blk);
     hv_virtio_blk_destroy(b->aux_blk);
+#ifdef HENGE_HAVE_REIMS
+    hv_reims_pvg_destroy(b->pvg);
+#else
     hv_pvg_lite_destroy(b->pvg);
+#endif
     if (b->vusb) {
         hv_vusb_set_online(b->vusb, 0);
         pthread_mutex_destroy(&b->vusb->mu);

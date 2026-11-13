@@ -109,6 +109,14 @@ typedef struct HvCpu {
     uint8_t ret_tab[HV_IJC_TABLES][HV_RET_TAB_BYTES];
 
     /* The rest is only touched by C. */
+
+    /* A ring of the blocks this CPU entered, written by the translated code itself (see
+       put_trace_entry): it is the only way to see the path into a fault, because chained and
+       indirect branches never pass through C to be recorded there. Off unless log >= 3. */
+    uint32_t trace_idx;
+    uint32_t trace_pad;
+    uint64_t trace_ring[64];
+
     struct HvMachine *m;
     uint32_t el;
 

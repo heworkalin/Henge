@@ -25,5 +25,10 @@
 #define HAVE_FVISIBILITY 1
 #define HAVE_SO_NOSIGPIPE 1
 #define HAVE_PTHREAD 1
+/* Apple has <net/if_dl.h>; Android and other Linuxes do not, and take the
+   AF_PACKET path instead (libimobiledevice-glue/src/socket.c picks by this macro). */
+#if !defined(__ANDROID__)
 #define HAVE_NET_IF_DL_H 1
+#endif
+#define HAVE_NETPACKET_PACKET_H 1
 #define HAVE_STPNCPY 1

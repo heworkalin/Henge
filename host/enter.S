@@ -1,3 +1,22 @@
+// Mach-O prefixes C symbols with an underscore; ELF does not. This file is
+// assembled through the C preprocessor (.S), so a name map is enough to build it
+// for a non-Apple target without touching a line of the assembly — every _hv_*
+// name below is a C symbol the engine links against.
+#if !defined(__APPLE__)
+#define _hv_chain_thunk      hv_chain_thunk
+#define _hv_enter            hv_enter
+#define _hv_exit             hv_exit
+#define _hv_fp_enter         hv_fp_enter
+#define _hv_fp_leave         hv_fp_leave
+#define _hv_helper           hv_helper
+#define _hv_helper_entry     hv_helper_entry
+#define _hv_helper_thunk     hv_helper_thunk
+#define _hv_ijc_resolve      hv_ijc_resolve
+#define _hv_ijc_thunk        hv_ijc_thunk
+#define _hv_tlb_refill       hv_tlb_refill
+#define _hv_xjump_thunk      hv_xjump_thunk
+#endif
+
 // Entering and leaving translated code.
 //
 // hv_enter(HvCpu *cpu, void *block) saves the host's callee-saved registers,

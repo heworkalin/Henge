@@ -1,11 +1,30 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* SEEK_DATA / SEEK_HOLE on glibc */
+#endif
+
 #include "hvsparse.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* bionic does not declare the hole-reporting whence values, even though the
+ * kernel implements them (Linux 3.1+). These are the kernel's numbers, from
+ * fcntl.h's SEEK_* family: 0 SET, 1 CUR, 2 END, so 3 and 4 are free.
+ *
+ * Support is still probed at run time below, because a filesystem that lacks
+ * hole reporting (exFAT, FUSE, some SD-card stacks) answers EINVAL regardless
+ * of what the header said. */
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#endif
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
+#endif
 
 #define CHUNK (8u << 20)
 
@@ -59,13 +78,32 @@ int hv_sparse_pack_progress(const char *src, const char *dst, void (*progress)(u
     if (out < 0) goto done;
     uint64_t size = (uint64_t)st.st_size;
     if (write_all(out, "HVSPARSE", 8) || write_all(out, &size, 8)) goto done;
-    /* Walk the data runs (SEEK_DATA/SEEK_HOLE), and skip zero chunks inside them too. */
+    /* Walk the data runs (SEEK_DATA/SEEK_HOLE), and skip zero chunks inside them too.
+
+       Hole reporting is not universal: Linux has it since 3.1 and ext4/f2fs/xfs/btrfs
+       implement it, but exFAT, FUSE and some SD-card stacks answer EINVAL/EOPNOTSUPP.
+       A refusal is NOT the same as "no more data" — reading it that way would pack an
+       empty archive from a full file. So the first refusal flips to a plain walk, where
+       the zero-chunk skip below still finds the holes, just less cheaply. */
+    int holes_supported = 1;
     off_t pos = 0;
     while ((uint64_t)pos < size) {
-        off_t data = lseek(in, pos, SEEK_DATA);
-        if (data < 0) break; /* no more data */
-        off_t hole = lseek(in, data, SEEK_HOLE);
-        if (hole < 0) hole = (off_t)size;
+        off_t data, hole;
+        if (holes_supported) {
+            data = lseek(in, pos, SEEK_DATA);
+            if (data < 0) {
+                if (errno == ENXIO) break; /* past the last data: genuinely done */
+                holes_supported = 0;
+                data = pos;
+                hole = (off_t)size;
+            } else {
+                hole = lseek(in, data, SEEK_HOLE);
+                if (hole < 0) hole = (off_t)size; /* a trailing hole need not be reported */
+            }
+        } else {
+            data = pos;
+            hole = (off_t)size;
+        }
         for (off_t at = data; at < hole;) {
             size_t n = (size_t)(hole - at < CHUNK ? hole - at : CHUNK);
             if (pread(in, buf, n, at) != (ssize_t)n) goto done;

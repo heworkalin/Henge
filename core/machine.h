@@ -339,6 +339,12 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);
 
 /* Physical accesses from C (page-table walks, devices doing DMA, slow paths). */
 int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len);
+/* The blocks a CPU entered last; filled while log >= 2, printed when the guest panics. */
+void hv_pc_hist_note(HvCpu *cpu);
+void hv_pc_hist_note_va(int index, uint64_t va);
+uint64_t hv_pc_hist_last(int index);
+void hv_pc_hist_dump(HvCpu *cpu);
+void hv_trace_ring_dump(HvCpu *cpu);
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m); /* CPU 0 */

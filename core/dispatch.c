@@ -771,6 +771,7 @@ static void print_stats(HvCpu *cpu, int force) {
    jump gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     uint32_t idx = (uint32_t)(slot - m->slots);
+    if (m->log >= 2 && hv_self) hv_pc_hist_note_va(hv_self->index, b->va);
     if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
         fprintf(stderr, "hengevm: chain slot %u site %p to rx+%llx va %llx: block gen %u now %u\n", idx, (void *)m->slot_site[idx], (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen);
     uint64_t xa = m->slot_xa[idx];
@@ -1090,6 +1091,10 @@ static int run_loop(HvCpu *cpu, int one) {
         if (pending_chain && !m->trace && b->va == chain_pc && b->flags == chain_flags) chain(m, pending_chain, b);
         pending_chain = NULL;
         if (m->trace) fprintf(stderr, "block %llx el%u\n", (unsigned long long)cpu->pc, cpu->el);
+        /* The last blocks a CPU entered, for a crash report to show what led to it: a fault says
+           where the guest died, not how it got there. Kept only while diagnosing (log >= 2), and
+           it is one store per block, which is why it can be on at all. */
+        if (m->log >= 2) hv_pc_hist_note(cpu);
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
         prev_pc = cpu->pc;
         prev_b = b;
@@ -1142,4 +1147,52 @@ static int run_loop(HvCpu *cpu, int one) {
         }
         if (one) return HV_EXIT_BRANCH;
     }
+}
+
+/* ---- the blocks a CPU entered last ----------------------------------------
+
+   A fault says where the guest died, not how it got there: the pointer that went bad was usually
+   loaded several blocks earlier, and the load that produced it is what a report has to name. This
+   ring is filled while m->log >= 2 — one store per block entry — and printed when the guest
+   reports its own panic. */
+
+#define PC_HIST 64
+static uint64_t pc_hist[HV_MAX_CPUS][PC_HIST];
+static uint32_t pc_hist_at[HV_MAX_CPUS];
+
+void hv_pc_hist_note(HvCpu *cpu) {
+    if (!cpu) return;
+    hv_pc_hist_note_va(cpu->index, cpu->pc);
+}
+
+void hv_pc_hist_note_va(int index, uint64_t va) {
+    if (index < 0 || index >= HV_MAX_CPUS) return;
+    uint32_t i = pc_hist_at[index]++ & (PC_HIST - 1);
+    pc_hist[index][i] = va;
+}
+
+uint64_t hv_pc_hist_last(int index) {
+    if (index < 0 || index >= HV_MAX_CPUS) return 0;
+    uint32_t at = pc_hist_at[index];
+    if (at == 0) return 0;
+    return pc_hist[index][(at - 1) & (PC_HIST - 1)];
+}
+
+void hv_pc_hist_dump(HvCpu *cpu) {
+    if (!cpu || cpu->index >= HV_MAX_CPUS) return;
+    uint32_t at = pc_hist_at[cpu->index];
+    fprintf(stderr, "hengevm: last %d blocks entered on cpu %u, oldest first:\n",
+            PC_HIST, (unsigned) cpu->index);
+    for (uint32_t n = 0; n < PC_HIST; n++)
+        fprintf(stderr, "  %llx\n", (unsigned long long) pc_hist[cpu->index][(at + n) & (PC_HIST - 1)]);
+}
+
+/* The ring the translated code fills: the exact block path, in order, regardless of how each
+   block was reached. */
+void hv_trace_ring_dump(HvCpu *cpu) {
+    if (!cpu) return;
+    fprintf(stderr, "hengevm: traced blocks on cpu %u (oldest first):\n", (unsigned) cpu->index);
+    for (uint32_t n = 0; n < 64; n++)
+        fprintf(stderr, "  %llx\n",
+                (unsigned long long) cpu->trace_ring[(cpu->trace_idx + n) & 63]);
 }

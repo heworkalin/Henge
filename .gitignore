@@ -1,1 +1,6 @@
 build/
+# The embedded Vulkan driver is fetched, not committed (10 MB binary).
+# PROVENANCE.txt next to it *is* committed — it is the record of what it was.
+android/app/src/main/jniLibs/arm64-v8a/*.so
+# The driver-plugin module's copy, when that module is enabled.
+android/driver-plugin/src/main/jniLibs/arm64-v8a/*.so

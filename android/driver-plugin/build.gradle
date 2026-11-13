@@ -1,0 +1,121 @@
+// The Vulkan driver plugin module.
+//
+// This reproduces the plugin contract from FCL-Team/FCLDriverPlugin, so that the
+// same APK works both for Henge and for FoldCraftLauncher. Copying the contract
+// rather than inventing one has a concrete payoff: it is already proven in the
+// field, and it means the driver packaging cannot drift into something only this
+// project understands.
+//
+// The contract is entirely manifest-based — four <meta-data> keys read by the
+// host, plus the driver library sitting in jniLibs/<abi>/:
+//
+//   fclPlugin   "true"          must be true for the host to see a plugin
+//   driver      display name    e.g. "Turnip 26.x"
+//   driver_lib  file name       must exist in jniLibs/<abi>/
+//   driver_gpu  family          adreno / mali / any
+//
+// Differences from the reference build, and why:
+//
+//   - Java only, no Kotlin plugin. The contract is manifest data; Kotlin would
+//     add a second plugin dependency to an offline build for no benefit.
+//   - applicationIdSuffix is a property, so several driver versions can be
+//     installed side by side, which is the whole point of the suffix.
+//   - A check task fails the build when the driver library is absent, instead of
+//     producing an APK that installs and then loads nothing.
+//
+// One thing NOT copied: FCL's linker hook. That exists because FCL has to make a
+// *game process* it does not own call android_dlopen_ext on the plugin's library.
+// Henge is its own Vulkan client — it can name the ICD it wants — so the hook is
+// not needed here. See android/README.md, "Which Vulkan driver".
+
+apply plugin: 'com.android.application'
+
+// Driver identity. Override per build:
+//   ./gradlew :driver-plugin:assembleDebug -PdriverName="Turnip 26.1" \
+//       -PpluginSuffix=.turnip261
+def driverName = (project.findProperty('driverName') ?: 'Turnip (unversioned)').toString()
+def driverLib = (project.findProperty('driverLib') ?: 'libvulkan_freedreno.so').toString()
+def driverGpu = (project.findProperty('driverGpu') ?: 'adreno').toString()
+def pluginSuffix = (project.findProperty('pluginSuffix') ?: '.turnip').toString()
+
+android {
+    namespace 'dev.henge.driverplugin'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'dev.henge.driverplugin'
+        // Turnip needs a Vulkan 1.1-era loader path; 26 keeps us in line with the app.
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName '0.1'
+
+        // The four contract keys. Quoted through placeholders because driverName
+        // may contain spaces.
+        manifestPlaceholders = [
+                driver   : driverName,
+                driverLib: driverLib,
+                driverGpu: driverGpu,
+        ]
+
+        // FCL reads resValue("string","app_name") for the label; keep it identical
+        // so the same APK behaves the same in both hosts.
+        resValue 'string', 'app_name', driverName
+
+        // One suffix per driver version, so they coexist on the device.
+        applicationIdSuffix pluginSuffix
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    // REQUIRED by the contract, and the opposite of the Henge app's setting:
+    // the host passes the plugin's *extracted* native library directory (FCL calls
+    // it DRIVER_PATH) and loads driver_lib from there. With extractNativeLibs
+    // false the library stays inside the APK and there is no such directory, so
+    // the plugin would install and then provide nothing.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    // Only arm64: Turnip's Android builds target Adreno aarch64, and the devices
+    // this project runs on are arm64.
+    defaultConfig {
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Fail loudly rather than shipping an empty plugin.
+tasks.register('checkDriverLib') {
+    group = 'verification'
+    description = "Fails if ${driverLib} is not in jniLibs"
+    def so = file("src/main/jniLibs/arm64-v8a/${driverLib}")
+    doLast {
+        if (!so.exists()) {
+            throw new GradleException(
+                    "Driver library missing: ${so}\n" +
+                    "Fetch it first:  ./android/fetch-turnip.sh\n" +
+                    "(see android/driver-plugin/README.md for provenance rules)")
+        }
+        println "[driver-plugin] ${driverLib}: ${so.length()} bytes"
+    }
+}
+
+tasks.matching { it.name == 'preBuild' }.configureEach {
+    dependsOn 'checkDriverLib'
+}

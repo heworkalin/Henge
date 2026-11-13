@@ -8,9 +8,76 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#if defined(__ANDROID__)
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 /* The split shape on a host that can make it itself: plain RW memory, an
    alias, and the original turned R-X. Works for macOS binaries without the
-   hardened runtime; on iOS the executable half has to come from a debugger. */
+   hardened runtime; on iOS the executable half has to come from a debugger.
+
+   Android takes the same shape by a different route, because vm_remap does not
+   exist: one memfd, mapped twice — MAP_SHARED R-X for execution, MAP_SHARED R-W
+   for writing. Both mappings are the same page-cache pages, so a store through
+   the writable half is what the executable half fetches, with no remap and no
+   W+X mapping at any moment. That last part is the reason to prefer it: nothing
+   here ever asks for a page that is writable and executable at once, which is
+   exactly what Android's W^X rules are written to refuse. It is also how ART's
+   JIT code cache and Chromium's V8 do it.
+
+   Whether a given app is allowed to map a memfd executable depends on its
+   SELinux domain and targetSdkVersion, which cannot be decided from the engine
+   side. hv_jit_region_open() therefore probes the shapes in order and records
+   which one worked, so a run can report it rather than guess. */
+#if defined(__ANDROID__)
+
+#ifndef __NR_memfd_create
+#define __NR_memfd_create 279 /* arm64 */
+#endif
+
+/* One memfd, mapped R-X and R-W: the split shape without vm_remap. */
+static int open_split_memfd(HvJitRegion *region, size_t bytes) {
+    int fd = (int)syscall(__NR_memfd_create, "henge-jit", 0 /* MFD_CLOEXEC */);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)bytes) != 0) {
+        close(fd);
+        return -1;
+    }
+    void *rx = mmap(NULL, bytes, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+    void *rw = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd); /* the mappings hold the pages */
+    if (rx == MAP_FAILED || rw == MAP_FAILED) {
+        if (rx != MAP_FAILED) munmap(rx, bytes);
+        if (rw != MAP_FAILED) munmap(rw, bytes);
+        return -1;
+    }
+    if (hv_jit_region_attach(region, rx, rw, bytes) != 0) {
+        munmap(rx, bytes);
+        munmap(rw, bytes);
+        return -1;
+    }
+    region->owned = 1;
+    return 0;
+}
+
+/* A single mapping that is writable and executable at once. Only reached where
+   the split shape was refused; see hv_jit_region_open(). */
+static int open_wx(HvJitRegion *region, size_t bytes) {
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    region->base = p;
+    region->rw_diff = 0;
+    region->capacity = bytes / sizeof(uint32_t);
+    region->owned = 1;
+    return 0;
+}
+
+#else /* Apple */
+
 static int open_split(HvJitRegion *region, size_t bytes) {
     void *rx = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (rx == MAP_FAILED) return -1;
@@ -27,10 +94,28 @@ static int open_split(HvJitRegion *region, size_t bytes) {
     return 0;
 }
 
+#endif /* __ANDROID__ */
+
 int hv_jit_region_open(HvJitRegion *region, size_t bytes) {
     memset(region, 0, sizeof *region);
-    if (getenv("HV_JIT_SPLIT")) return open_split(region, bytes);
-#if TARGET_OS_OSX
+    if (getenv("HV_JIT_SPLIT")) {
+#if defined(__ANDROID__)
+        return open_split_memfd(region, bytes);
+#else
+        return open_split(region, bytes);
+#endif
+    }
+#if defined(__ANDROID__)
+    /* Order is a policy question, not a preference, and only a real app can
+       settle it: a W+X mapping is the cheapest shape but is what the W^X rules
+       exist to refuse, while the memfd split is policy-clean by construction.
+       Try the clean one first so a locked-down device still works, and keep the
+       W+X attempt for hosts that allow it. hv_jit_region_attach() in either case
+       leaves rw_diff as the alias offset the writer uses. */
+    if (open_split_memfd(region, bytes) == 0) return 0;
+    if (open_wx(region, bytes) == 0) return 0;
+    return -1;
+#elif TARGET_OS_OSX
     void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (p == MAP_FAILED) return -1;
     region->base = p;

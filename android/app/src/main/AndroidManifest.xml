@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- macOS 的恢复映像从 Apple 的 CDN 下载（十几 GB），安装不是本地的。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 下载要能分辨「网络断了」和「服务器错了」，好决定是重试还是报错。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 下载跑在前台服务里，切到后台才不会被回收；通知是它的可见凭据。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Android 13 起通知需要用户授权：启动时申请这一次，其余权限按需再问。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      extractNativeLibs="true": the libraries are extracted onto the filesystem and loaded from
+      nativeLibraryDir.
+
+      This is about the embedded Vulkan driver, not about libhenge.so. The driver is opened by
+      absolute path, and an extracted file is an ordinary file, whereas an unextracted one can only
+      be reached through a base.apk!/lib/... path that depends on the zip entry being uncompressed
+      and aligned. Extracting also makes an embedded driver and a driver shipped in a separate
+      plugin APK behave identically, which is what the selection code assumes.
+    -->
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:label="Henge"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <!-- 实例库: the root screen. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          The display: full screen, and it must not be rebuilt when the user turns the device.
+          `configChanges` keeps the activity (and therefore the surface) through an orientation
+          change, and `sensorLandscape` matches the guest's own orientation.
+        -->
+        <activity
+            android:name=".DisplayActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density|uiMode"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+
+        <activity
+            android:name=".DiagnosticsActivity"
+            android:exported="true" />
+
+        <activity
+            android:name=".LogsActivity"
+            android:exported="true" />
+
+        <!-- 下载由服务持有，不随界面销毁而结束。 -->
+        <service
+            android:name=".DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 安装由服务持有，切到后台不会被回收。 -->
+        <service
+            android:name=".InstallService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 一台 Mac 自己的页面，从 Macs 页推入。 -->
+        <activity
+            android:name=".MacSettingsActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+</manifest>

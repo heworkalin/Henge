@@ -1,0 +1,49 @@
+// Henge — Android app project.
+//
+// Only :app for now. The C engine is built outside Gradle (see build-c.sh and
+// gradle.properties for why), and the app module consumes its output through
+// jniLibs.srcDirs.
+
+pluginManagement {
+    repositories {
+        // Mirrors first: this machine reaches Google/Maven Central slowly, and
+        // the same ordering is what the reference project uses.
+        maven { url 'https://maven.aliyun.com/repository/public/' }
+        maven { url 'https://maven.aliyun.com/repository/google/' }
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/public/' }
+        maven { url 'https://maven.aliyun.com/repository/central/' }
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'Henge'
+include ':app'
+
+// The Vulkan driver plugin module is deliberately NOT part of the default build.
+//
+// Users install one app: the driver is embedded in :app's jniLibs
+// (android/fetch-turnip.sh), and the app opens that library by absolute path.
+// Maintaining a second APK for every user would be worse in every way.
+//
+// The module stays in the tree because the FCL-Team/FCLDriverPlugin contract is
+// what the driver-selection code speaks, and building a plugin is the quickest
+// way to check that contract — and the only way to hand a driver to
+// FoldCraftLauncher. Enable it when you want that:
+//
+// include ':driver-plugin'

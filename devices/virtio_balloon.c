@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#if defined(__ANDROID__) || defined(__linux__)
+#include <linux/falloc.h> /* FALLOC_FL_PUNCH_HOLE, FALLOC_FL_KEEP_SIZE */
+#endif
 
 #define INFLATEQ 0
 #define DEFLATEQ 1
@@ -21,11 +24,27 @@
 static void give_back(HvVirtioBalloon *b, uint64_t off, uint64_t len) {
     int bad;
     if (b->ram_fd >= 0) {
+#if defined(__ANDROID__) || defined(__linux__)
+        /* Linux has no F_PUNCHHOLE/struct fpunchhole: the same operation is
+           fallocate(FALLOC_FL_PUNCH_HOLE) paired with KEEP_SIZE, so the file's
+           length does not move under the guest. */
+        bad = fallocate(b->ram_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)len) != 0;
+        if (!bad) msync(b->ram + off, len, MS_INVALIDATE);
+#else
         struct fpunchhole ph = {.fp_flags = 0, .reserved = 0, .fp_offset = (off_t)off, .fp_length = (off_t)len};
         bad = fcntl(b->ram_fd, F_PUNCHHOLE, &ph) != 0;
         if (!bad) msync(b->ram + off, len, MS_INVALIDATE);
+#endif
     } else {
+#if defined(__ANDROID__) || defined(__linux__)
+        /* MADV_FREE_REUSABLE is Mach's "keep the pages, count them free, drop
+           before compressing". Linux's nearest is MADV_DONTNEED, which drops
+           them at once: more eager, never wrong, and the guest gets zeroed
+           pages back, which is what balloon inflation promises anyway. */
+        bad = madvise(b->ram + off, len, MADV_DONTNEED) != 0;
+#else
         bad = madvise(b->ram + off, len, MADV_FREE_REUSABLE) != 0;
+#endif
     }
     if (bad) {
         if (b->failed++ < 4) fprintf(stderr, "hengevm: balloon: giving back %llu KB at +%llx failed: %s\n",
@@ -36,7 +55,15 @@ static void give_back(HvVirtioBalloon *b, uint64_t off, uint64_t len) {
 }
 
 static void take_back(HvVirtioBalloon *b, uint64_t off, uint64_t len) {
+#if defined(__ANDROID__) || defined(__linux__)
+    /* MADV_DONTNEED on give_back released the pages outright, so there is no
+       "reuse" state to leave: touching the range faults zeroed pages back in.
+       The kernel's counters already count them as used again. */
+    (void)off;
+    (void)len;
+#else
     if (b->ram_fd < 0) madvise(b->ram + off, len, MADV_FREE_REUSE); /* the guest has them again: count them as used */
+#endif
     b->taken_back += len / HOST_PAGE;
 }
 

@@ -228,6 +228,49 @@ static void put_lit(Emit *e, int reg, uint64_t value) {
     put(e, 0x58000000u | reg);
 }
 
+/*
+ * A block records its own guest address before running, into a ring in the HvCpu.
+ *
+ * Recording from C is not enough: chained blocks and indirect-branch hits enter translated code
+ * without C seeing them, so a crash report built that way names a block several branches away from
+ * where the guest actually was. Two stores per block entry are cheap enough to leave in a
+ * diagnostic build and are exact.
+ */
+static void put_trace_entry(Emit *e, uint64_t va) {
+    if (!e->m || e->m->log < 2) return;
+    /*
+     * Only x6 and x15 may be touched here. `is_stolen()` frees exactly x6, x7, x15 (plus x18 and
+     * x28, which are the CPU's), so a block entry may clobber nothing else: x16 and x17 look like
+     * scratch because the helper thunks spill them first, but a block entered by a chain holds its
+     * guest values in registers, and overwriting them corrupts the guest — which is how an earlier
+     * version of this trace made the firmware reset itself instead of reaching DFU.
+     *
+     * The address is computed rather than encoded as an immediate: HvCpu is megabytes (its TLB),
+     * so the ring's offset is past what an LDR/STR immediate can reach, and encoding it anyway
+     * truncates the offset and stores into the middle of the CPU struct.
+     */
+    uint32_t off = (uint32_t) offsetof(HvCpu, trace_idx);
+    for (int hw = 0; hw < 2; hw++) {
+        uint32_t part = (off >> (hw * 16)) & 0xffff;
+        if (!part) continue;
+        put(e, (hw == 0 ? 0xd2800000u : 0xf2800000u) | (uint32_t)(hw << 21) | part << 5 | 15);
+    }
+    put(e, 0x8b0f038fu);                                   /* add x15, x28, x15 */
+    put(e, 0xb94001e6u);                                   /* ldr w6, [x15] */
+    put(e, 0x110004c6u);                                   /* add w6, w6, #1 */
+    put(e, 0x120014c6u);                                   /* and w6, w6, #0x3f */
+    put(e, 0xb90001e6u);                                   /* str w6, [x15] */
+    put(e, 0x910021efu);                                   /* add x15, x15, #8: the ring follows */
+    put(e, 0x8b060defu);                                   /* add x15, x15, x6, lsl #3 */
+    /* The block's address, in the same register, built with movz/movk. */
+    for (int hw = 0; hw < 4; hw++) {
+        uint32_t part = (uint32_t)((va >> (hw * 16)) & 0xffff);
+        if (hw == 0) put(e, 0xd2800000u | part << 5 | 6);
+        else if (part) put(e, 0xf2800000u | (uint32_t)(hw << 21) | part << 5 | 6);
+    }
+    put(e, 0xf90001e6u);                                   /* str x6, [x15] */
+}
+
 /* adr xR, <16-byte HvHelperInfo in the pool> */
 
 static void put_ool(Emit *e, Ool o) {
@@ -1450,7 +1493,13 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
 #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
 static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) {
     static int type = -1;
-    if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
+    if (type < 0) {
+        /* This is a *host* address: XNU maps every process's commpage at 0xfffffc000, and the
+           two fields below say how that machine's timebase is read. Android has no such mapping,
+           so compat_android.c creates one with the same contents before any guest code is
+           translated (hv_android_map_commpage). Reading it is therefore correct on both. */
+        type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
+    }
     if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
     int rt = insn & 0x1f;
     if (rt == 31) return 1;
@@ -1965,6 +2014,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->m = m;
     e->nogroup = nogroup;
     e->u_live = e->u_prev = 0;
+    put_trace_entry(e, b->va);
 
     /* No prologue: hv_enter, chained exits and the indirect-branch cache all
        enter with guest x0 and x1 live. */

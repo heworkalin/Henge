@@ -1,0 +1,33 @@
+// Top-level build file.
+//
+// The Android Gradle Plugin is applied the classic buildscript way rather than
+// through the `plugins { id 'com.android.application' version ... }` block.
+//
+// Reason, specific to this machine: the plugins-DSL form resolves a *plugin
+// marker* artifact (com.android.application:com.android.application.gradle.plugin)
+// which is not in the local Gradle cache, so a --offline build cannot start.
+// The real artifact (com.android.tools.build:gradle) is cached, and a buildscript
+// classpath resolves exactly that, with no marker in the way.
+//
+// The reference project (AlinOs app_proot) uses the version-catalog + plugins-DSL
+// form because it builds with network access. Both end at the same AGP.
+
+buildscript {
+    repositories {
+        // Mirrors first: this machine reaches Google/Maven Central slowly.
+        maven { url 'https://maven.aliyun.com/repository/public/' }
+        maven { url 'https://maven.aliyun.com/repository/google/' }
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        // 8.13.2 is the newest AGP whose pom, module and jar are all in the
+        // local cache. AGP 8.13.x pairs with Gradle 8.13, which is what the
+        // wrapper pins.
+        classpath 'com.android.tools.build:gradle:8.13.2'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

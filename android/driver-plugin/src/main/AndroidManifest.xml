@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The driver plugin contract, copied from FCL-Team/FCLDriverPlugin.
+
+  A host (Henge, or FoldCraftLauncher) finds this package, reads the four
+  meta-data values below, and loads the library named in "driver_lib" from this
+  APK's extracted native library directory when the device's GPU family matches
+  "driver_gpu".
+
+  Note: do not write dollar-brace placeholders in comments. The manifest merger
+  substitutes them textually before parsing, and an unrecognised name such as
+  driver_lib (the real placeholder key is driverLib) fails the whole manifest.
+
+  extractNativeLibs="true" is load-bearing: the host loads the driver from
+  getNativeLibraryDir(), which only exists when the libraries are extracted.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:label="@string/app_name"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- FCL driver-plugin contract -->
+        <meta-data
+            android:name="fclPlugin"
+            android:value="true" />
+        <meta-data
+            android:name="driver"
+            android:value="${driver}" />
+        <meta-data
+            android:name="driver_lib"
+            android:value="${driverLib}" />
+        <meta-data
+            android:name="driver_gpu"
+            android:value="${driverGpu}" />
+    </application>
+</manifest>

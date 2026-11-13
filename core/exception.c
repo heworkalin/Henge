@@ -52,9 +52,127 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
         st->elchg[k].from = ret, st->elchg[k].spsr = spsr, st->elchg[k].kind = (uint32_t)type, st->elchg[k].el = cpu->el;
         st->elchg[k].to = esr;
     }
-    if (cpu->m->trace || cpu->m->log >= 2)
-        fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
-                (unsigned long long)ret, cpu->el);
+    if (cpu->m->trace || cpu->m->log >= 2) {
+        char extra[64];
+        extra[0] = '\0';
+        /* A data abort from a lower EL is the interesting one: print the instruction that made
+           the access, because "fault at pc X" alone does not say whether the guest wandered into
+           bad code or used a bad pointer from good code. The page PC is in is mapped, so it can be
+           read through the same walk the TLB uses. */
+        if (type == HV_EXC_SYNC && ((esr >> 26) & 0x3f) == 0x24) {
+            HvWalk w;
+            hv_mmu_walk(cpu, ret, HV_ACC_READ, 1, &w);
+            uint32_t insn = 0;
+            if (w.fsc == 0 && hv_phys_read(cpu->m, w.pa, &insn, 4) == 0) {
+                snprintf(extra, sizeof extra, " insn %08x", insn);
+                /*
+                 * The registers at the fault, not at the panic. The guest runs its own handler
+                 * before it reports, and that handler is free to use x0-x8: the dump in its panic
+                 * report is not the faulting state, which is why it disagreed with the code that
+                 * built the address.
+                 */
+                if (cpu->m->log >= 2) hv_trace_ring_dump(cpu);
+                fprintf(stderr, "hengevm: at the fault: x0=%llx x1=%llx x2=%llx x3=%llx "
+                                "x4=%llx x5=%llx x6=%llx x7=%llx\n",
+                        (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                        (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3],
+                        (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[5],
+                        (unsigned long long) cpu->x[6], (unsigned long long) cpu->x[7]);
+                /*
+                 * The word the guest's 32-bit load was supposed to bring in, read with the *fault
+                 * time* context (el 0) rather than the kernel context the panic handler runs in.
+                 * It settles the only question left: whether the memory held the expected value
+                 * and the translation dropped it, or the memory itself held a host address.
+                 */
+                {
+                    uint64_t at = cpu->x[0] + 0x1C0, word = 0;
+                    HvWalk ww;
+                    hv_mmu_walk(cpu, at, HV_ACC_READ, 0, &ww);
+                    if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 8) == 0)
+                        fprintf(stderr, "hengevm: [x0+0x1c0] = %016llx (pa %llx)\n",
+                                (unsigned long long) word, (unsigned long long) ww.pa);
+                    else
+                        fprintf(stderr, "hengevm: [x0+0x1c0] unreadable (fsc %u)\n", ww.fsc);
+                }
+                /*
+                 * The executed path, not the bytes before it. A linear window before the fault
+                 * mixes in branches that were not taken — the load that put the bad value in the
+                 * base register is then invisible, and the window says the wrong thing. The last
+                 * block this CPU entered starts the path; from there every word up to the fault
+                 * is an instruction that ran.
+                 */
+                uint64_t from = hv_pc_hist_last(cpu->index);
+                if (!from || from > ret) from = ret - 32 * 4;
+                fprintf(stderr, "hengevm: path from block %llx to fault %llx:",
+                        (unsigned long long) from, (unsigned long long) ret);
+                for (uint64_t at = from; at <= ret; at += 4) {
+                    HvWalk ww;
+                    uint32_t word = 0;
+                    hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &ww);
+                    if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 4) == 0)
+                        fprintf(stderr, " %08x", word);
+                    else
+                        fprintf(stderr, " ????????");
+                }
+                fprintf(stderr, "\n");
+                /*
+                 * The words the guest was reading from. A host address inside guest-visible
+                 * memory is the answer to "who put it there": it cannot come from the guest.
+                 */
+                {
+                    uint64_t base = cpu->x[0];
+                    fprintf(stderr, "hengevm: guest memory at x0 %llx:\n",
+                            (unsigned long long) base);
+                    for (int row = 0; row < 8; row++) {
+                        fprintf(stderr, "  %llx:", (unsigned long long) (base + (uint64_t) row * 32));
+                        for (int k = 0; k < 4; k++) {
+                            uint64_t at = base + (uint64_t) row * 32 + (uint64_t) k * 8, word = 0;
+                            HvWalk ww;
+                            hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &ww);
+                            if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 8) == 0)
+                                fprintf(stderr, " %016llx", (unsigned long long) word);
+                            else
+                                fprintf(stderr, " ????????????????");
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+                /* Where x4 points, if it is a host address: the words there say what kind of
+                   object it is (a GOT slot, a JIT literal, a C stack frame). */
+                {
+                    uint64_t v = cpu->x[4];
+                    fprintf(stderr, "hengevm: x4 = %llx, words there:",
+                            (unsigned long long) v);
+                    for (int k = 0; k < 4; k++) {
+                        HvWalk ww;
+                        uint32_t word = 0;
+                        hv_mmu_walk(cpu, v + (uint64_t) k * 4, HV_ACC_READ, 1, &ww);
+                        if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 4) == 0)
+                            fprintf(stderr, " %08x", word);
+                        else
+                            fprintf(stderr, " ????????");
+                    }
+                    fprintf(stderr, "\n");
+                }
+                uint64_t here = (uint64_t)(uintptr_t) &hv_take_exception;
+                uint64_t jit_base = (uint64_t)(uintptr_t) cpu->m->jit.base;
+                uint64_t jit_end = jit_base + cpu->m->jit.capacity * 4;
+                fprintf(stderr, "hengevm: jit rx %llx..%llx, self %llx\n",
+                        (unsigned long long) jit_base, (unsigned long long) jit_end,
+                        (unsigned long long) here);
+                for (int r = 0; r < 31; r++) {
+                    uint64_t v = cpu->x[r];
+                    uint64_t d = v > here ? v - here : here - v;
+                    if (v && d < (64ull << 20))
+                        fprintf(stderr, "hengevm: x%d = host %llx (%s0x%llx)\n", r,
+                                (unsigned long long) v, v > here ? "+" : "-",
+                                (unsigned long long) d);
+                }
+            }
+        }
+        fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u%s\n", type, esr,
+                (unsigned long long)far, (unsigned long long)ret, cpu->el, extra);
+    }
     uint64_t offset = cpu->el == 0 ? 0x400 : cpu->spsel ? 0x200 : 0x000;
     cpu->spsr_el1 = spsr;
     cpu->elr_el1 = ret;

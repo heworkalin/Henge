@@ -62,7 +62,11 @@ typedef struct HvVmapple {
     HvPcie *pcie;
     HvBdif *bdif;
     HvAes *aes;
+#ifdef HENGE_HAVE_REIMS
+    struct HvReimsPvg *pvg;  /* the graphics device, on reims-vgpu (android/reims_pvg.c) */
+#else
     struct HvPvgLite *pvg;   /* our own graphics device (the Mac replaces it with the framework) */
+#endif
     HvVirtioBlk *aux_blk, *root_blk;
     HvVirtioNet *net;
     HvVirtioSnd *snd;
