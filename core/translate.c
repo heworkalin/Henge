@@ -737,8 +737,17 @@ static void put_strip(Emit *e, int r) {
     if (!is_stolen(r)) {
         uint8_t t = pick(&used);
         spill(e, &t, 1);
+        /* XPAC/AUT strip means: every bit the signature occupies goes to the sign extension of
+           bit 55. For a 48-bit VA that is bits 63:48 -- a 16-bit field starting at 48, whose
+           rotation is 48 mod 16 = 0 -- and not a 7-bit field at bits 22:16, which is what this
+           used to overwrite, corrupting the middle of every pointer that went through an AUT. */
+        /* Strip means: bits 62:48 become the sign extension of bit 55. The mask for
+           BFM #immr, #imms is ROR(Ones(imms + 1), immr), so immr 16 / imms 14 covers
+           62:48 -- the whole signature field with bit 55 inside it, which the sign
+           extension leaves alone. Clearing only 54:48 (imms 6) left the upper half of
+           every signature in the pointer, and the guest wrote through 0xfffffe90... */
         put(e, SBFM_X(t, r, 55, 55));
-        put(e, BFM_X(r, t, 16, 6));
+        put(e, BFM_X(r, t, 16, 14));
         unspill(e, &t, 1);
         return;
     }
@@ -748,7 +757,7 @@ static void put_strip(Emit *e, int r) {
     spill(e, regs, 2);
     put(e, LDR_X(regs[0], 28, slot_of(r)));
     put(e, SBFM_X(regs[1], regs[0], 55, 55));
-    put(e, BFM_X(regs[0], regs[1], 16, 6));
+    put(e, BFM_X(regs[0], regs[1], 16, 14));
     put(e, STR_X(regs[0], 28, slot_of(r)));
     unspill(e, regs, 2);
 }
