@@ -210,14 +210,12 @@ final class InstallTab {
                 InstallService.requestStop(a);
                 return;
             }
-            if (InstallService.running()) {
-                /* A run this screen is not following (the previous attempt's service outlived its
-                 * thread). End it and let the next tap start a fresh one; marking this screen as
-                 * installing would make the next tap stop a run it never started. */
-                action.setText("正在停止上一次…");
-                InstallService.requestStop(a);
-                return;
-            }
+            if (InstallService.running())
+                /* The previous attempt's service is still up. It is superseded rather than stopped:
+                 * stopping it here would leave the tap with nothing started, which is what "tap
+                 * again and nothing happens" was, and a stop in that window is also what takes the
+                 * process down. The new run's id invalidates the old one's teardown. */
+                AppLog.i("安装: 上一次的服务仍在，直接让新运行取代它");
 
             String local = Prefs.localIpsw(a);
             File localFile = local == null ? null : new File(local);
@@ -239,6 +237,7 @@ final class InstallTab {
             installing[0] = true;
             cancelled.set(false);
             action.setText("停止安装");
+            showProgress(progress, bar, "准备安装…");
             final boolean ours = (localFile == null);   // downloaded by this app, so it may be re-fetched
             // A restore is the one operation where being reclaimed costs an hour.
             final int run = InstallService.start(a);
