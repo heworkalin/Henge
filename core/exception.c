@@ -156,6 +156,22 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                     hv_mmu_walk(cpu, pg + 0x790 + 8u * (uint64_t) k, HV_ACC_READ, 1, &w2);
                     (void) hv_phys_read(cpu->m, w2.pa, &gv[k], 8);
                 }
+                /* The call chain into panic is on the stack, not in a register: each frame's
+                   saved return address is at [x29+8] and the previous x29 at [x29]. Walking it
+                   says who asked for the report, which no global did. */
+                uint64_t chain[10];
+                uint64_t fp = cpu->x[29];
+                for (int k = 0; k < 10; k++) {
+                    chain[k] = 0;
+                    if (!fp || (fp & 7) || (fp >> 48) != 0xffff) break;
+                    hv_mmu_walk(cpu, fp + 8, HV_ACC_READ, 1, &w2);
+                    if (hv_phys_read(cpu->m, w2.pa, &chain[k], 8)) break;
+                    uint64_t prev = 0;
+                    hv_mmu_walk(cpu, fp, HV_ACC_READ, 1, &w2);
+                    if (hv_phys_read(cpu->m, w2.pa, &prev, 8)) break;
+                    if (prev <= fp) break;   /* a frame must be above the one that called it */
+                    fp = prev;
+                }
                 uint64_t stack[12];
                 HvWalk w3;
                 for (int k = 0; k < 12; k++) {
@@ -177,6 +193,14 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                             (unsigned long long) cpu->x[19], (unsigned long long) cpu->x[20],
                             (unsigned long long) cpu->x[25], (unsigned long long) cpu->x[27],
                             (unsigned long long) cpu->x[29], (unsigned long long) lr2);
+                if (n0 <= 4)
+                    fprintf(stderr, "hengevm:   chain %llx %llx %llx %llx %llx %llx %llx "
+                                    "%llx %llx %llx\n",
+                            (unsigned long long) chain[0], (unsigned long long) chain[1],
+                            (unsigned long long) chain[2], (unsigned long long) chain[3],
+                            (unsigned long long) chain[4], (unsigned long long) chain[5],
+                            (unsigned long long) chain[6], (unsigned long long) chain[7],
+                            (unsigned long long) chain[8], (unsigned long long) chain[9]);
                 if (n0 <= 4)
                     fprintf(stderr, "hengevm:   panic globals 790 %llx 798 %llx 7a0 %llx "
                                     "7a8 %llx 7b0 %llx 7b8 %llx\n",
