@@ -346,17 +346,24 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                         fprintf(f, "\n");
                         fclose(f);
                     }
-                    /* The firmware's own code, once: its addresses are physical (the MMU is off
-                       while it runs), so what writes the watched slot can be disassembled from
-                       this alone, without another run. */
-                    /* Refreshed on every hit, not once: the address range is reused by each
-                       firmware stage in turn, so a dump taken at the first hit holds iBSS while the
-                       code that matters belongs to iBEC, loaded over it later. */
+                    /* The firmware's own code, around the instruction that did the store.
+                       The pc is a virtual address — the firmware does run with its MMU on — so it
+                       is translated first; reading a physical window at the pc itself is what made
+                       earlier dumps disassemble to something else entirely. */
                     static int fw_dumps;
                     if (fw_dumps < 64) {
                         fw_dumps++;
-                        uint8_t *code = malloc(1u << 20);
-                        if (code && hv_phys_read(cpu->m, 0x70080000ull, code, 1u << 20) == 0) {
+                        HvWalk cw;
+                        hv_mmu_walk(cpu, pc, HV_ACC_EXEC, el, &cw);
+                        uint64_t cpa = cw.pa ? cw.pa : pc;
+                        uint32_t words[4] = {0, 0, 0, 0};
+                        hv_phys_read(cpu->m, pc & ~3ull, words, sizeof words);
+                        fprintf(f, "  code pc %#llx -> pa %#llx  insn %08x %08x %08x %08x\n",
+                                (unsigned long long) pc, (unsigned long long) cpa,
+                                words[0], words[1], words[2], words[3]);
+                        uint8_t *code = malloc(1u << 16);
+                        uint64_t win = cpa & ~0xffffull;
+                        if (code && hv_phys_read(cpu->m, win, code, 1u << 16) == 0) {
                             char p3[512];
                             snprintf(p3, sizeof p3, "%s", wd);
                             char *sl3 = strrchr(p3, '/');
@@ -364,10 +371,11 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                                 snprintf(sl3 + 1, sizeof p3 - (size_t)(sl3 + 1 - p3), "fwcode.bin");
                                 FILE *cf = fopen(p3, "wb");
                                 if (cf) {
-                                    fwrite(code, 1, 1u << 20, cf);
+                                    fwrite(code, 1, 1u << 16, cf);
                                     fclose(cf);
-                                    fprintf(f, "code dumped at pa 0x70080000, hit pc %#llx callersite %#llx\n",
-                                            (unsigned long long) pc, (unsigned long long) cpu->x[30]);
+                                    fprintf(f, "  code window pa %#llx..%#llx written\n",
+                                            (unsigned long long) win,
+                                            (unsigned long long) (win + (1u << 16)));
                                 }
                             }
                         }
