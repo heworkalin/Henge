@@ -151,6 +151,8 @@ static int startup_dump_blocks(const char *workdir) {
        copy in the region iBEC assembles the kernel in before copying it into place: the value that
        ends up in the image at 0x74507860 is written here first. */
     setenv("HV_WATCH_PA", "837ef860", 1);
+    /* One run, for the question of whether the firmware decoded the bytes that were sent. */
+    if (getenv("HENGE_DUMP_RAM")) setenv("HV_DUMP_RAM", "1", 1);
     return 0;
 }
 
@@ -240,6 +242,43 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
      * the guest side — the guest's own instructions do not touch it — so the emitted code has to be
      * read, and this is how it becomes readable.
      */
+    /*
+     * Knobs from a file, so a codegen difference can be tested without rebuilding anything:
+     *
+     *   work/knobs.txt:   HV_K2=1
+     *                     HV_SUPERBLOCKS=0
+     *
+     * Every knob the engine has is an environment variable (core/machine.c), so this only has to
+     * read the file before the machine is built. The dump files are tagged with a hash of these
+     * lines, so two runs with different knobs do not overwrite each other's evidence.
+     */
+    {
+        char kpath[512];
+        snprintf(kpath, sizeof kpath, "%s/knobs.txt", workdir ? workdir : ".");
+        FILE *kf = fopen(kpath, "r");
+        unsigned long tag = 2166136261ul;
+        if (kf) {
+            char line[256];
+            while (fgets(line, sizeof line, kf)) {
+                char *eq = strchr(line, '=');
+                if (!eq) continue;
+                *eq = 0;
+                char *name = line;
+                char *val = eq + 1;
+                for (char *c = val; *c; c++) if (*c == '\n' || *c == '\r') *c = 0;
+                if (!*name) continue;
+                setenv(name, val, 1);
+                for (const char *c = name; *c; c++) tag = (tag ^ (unsigned char) *c) * 16777619ul;
+                for (const char *c = val; *c; c++) tag = (tag ^ (unsigned char) *c) * 16777619ul;
+                say(&cursor, end, "  knob           : %s=%s\n", name, val);
+            }
+            fclose(kf);
+            char t[32];
+            snprintf(t, sizeof t, "%08lx", tag & 0xfffffffful);
+            setenv("HV_DUMP_TAG", t, 1);
+            say(&cursor, end, "  knob tag       : %s\n", t);
+        }
+    }
     if (startup_dump_blocks(workdir) != 0)
         say(&cursor, end, "  block dump     : unavailable\n");
     /*

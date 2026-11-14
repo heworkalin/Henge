@@ -368,12 +368,33 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                             snprintf(p7, sizeof p7, "%s", wd);
                             char *sl7 = strrchr(p7, '/');
                             if (sl7) {
-                                snprintf(sl7 + 1, sizeof p7 - (size_t)(sl7 + 1 - p7), "dataconst.bin");
+                                snprintf(sl7 + 1, sizeof p7 - (size_t)(sl7 + 1 - p7), "dataconst-%s.bin",
+                                         getenv("HV_DUMP_TAG") ? getenv("HV_DUMP_TAG") : "none");
                                 FILE *df = fopen(p7, "wb");
                                 if (df) { fwrite(dc, 1, n, df); fclose(df); }
                             }
                         }
                         free(dc);
+                    }
+                    /* The whole of guest RAM, once, when asked for: finding the compressed
+                       payload wherever the firmware happens to have put it is the only way to
+                       settle whether the bytes it decoded were the bytes that were sent. */
+                    static int ram_done;
+                    if (!ram_done && getenv("HV_DUMP_RAM")) {
+                        ram_done = 1;
+                        size_t n = (size_t) 512 << 20;
+                        uint8_t *whole = malloc(n);
+                        if (whole && hv_phys_read(cpu->m, 0x70000000ull, whole, (unsigned) n) == 0) {
+                            char p8[512];
+                            snprintf(p8, sizeof p8, "%s", wd);
+                            char *sl8 = strrchr(p8, '/');
+                            if (sl8) {
+                                snprintf(sl8 + 1, sizeof p8 - (size_t)(sl8 + 1 - p8), "ram.bin");
+                                FILE *rf = fopen(p8, "wb");
+                                if (rf) { fwrite(whole, 1, n, rf); fclose(rf); }
+                            }
+                        }
+                        free(whole);
                     }
                     /* The compressed stream the firmware is decoding, once per run: what the
                        guest actually received is the only way to tell a decoder that is wrong from
