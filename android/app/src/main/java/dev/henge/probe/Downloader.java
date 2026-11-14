@@ -267,6 +267,10 @@ final class Downloader {
             try {
                 t.join();
             } catch (InterruptedException e) {
+                /* The caller was interrupted, but the workers are not the caller: say cancelled
+                   here so they stop too, and close what they are reading. */
+                cancelled.set(true);
+                abort();
                 Thread.currentThread().interrupt();
                 return "已取消";
             }
@@ -285,6 +289,9 @@ final class Downloader {
     private static long fetchInto(String url, File part, long start, long end, AtomicLong held,
                                   long total, Progress progress, AtomicBoolean cancelled)
             throws IOException {
+        /* A worker that got this far after a stop must not open another connection: that would
+           be a download that keeps going after the user ended it. */
+        if (cancelled.get()) throw new IOException("已取消");
         HttpURLConnection c = open(url);
         try {
             Tls.apply(c);

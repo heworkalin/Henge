@@ -72,6 +72,15 @@ public class DownloadService extends Service {
     private static final long REPORT_INTERVAL_MS = 250;
     private static final CopyOnWriteArrayList<Runnable> LISTENERS = new CopyOnWriteArrayList<>();
     private static volatile Thread worker;
+    /**
+     * The flag the download's own threads read.
+     *
+     * It used to be a local of startWorker, which meant the canceller could not reach it: it
+     * interrupted the thread waiting in join(), that thread returned, and the four threads doing
+     * the actual fetching carried on writing into the same file. Stopping has to be addressed to
+     * the threads that are fetching, not to the one that is waiting for them.
+     */
+    private static final AtomicBoolean CANCEL = new AtomicBoolean(false);
 
     /** The current state; the same object every time, so a reader sees it move. */
     static State state() {
@@ -154,6 +163,7 @@ public class DownloadService extends Service {
             /* Interrupt is not enough: the read that is holding the worker is inside a socket and
                does not see it. Disconnecting is what makes it return — and the state is set here,
                not in the worker, so the button and the notification change on the next frame. */
+            CANCEL.set(true);
             Downloader.abort();
             if (worker != null) worker.interrupt();
             if (STATE.phase.equals(State.RUNNING)) {
@@ -196,7 +206,8 @@ public class DownloadService extends Service {
 
     private void startWorker(String url, String name, long bytes) {
         final File vm = new File(getExternalFilesDir(null), "vm");
-        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        CANCEL.set(false);
+        final AtomicBoolean cancelled = CANCEL;
 
         STATE.phase = State.RUNNING;
         STATE.name = name;
@@ -371,6 +382,9 @@ public class DownloadService extends Service {
     public void onDestroy() {
         NotificationManager nm0 = getSystemService(NotificationManager.class);
         if (nm0 != null) nm0.cancel(NOTIFY_ID);
+        /* A service going away is a stop too: its threads must not outlive it. */
+        CANCEL.set(true);
+        Downloader.abort();
         if (worker != null && worker.isAlive()) worker.interrupt();
         super.onDestroy();
     }
