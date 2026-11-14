@@ -1498,6 +1498,43 @@ static int run_loop(HvCpu *cpu, int one) {
                         for (uint64_t pa = 0x70000000ull; pa < 0xf0000000ull; pa += 0x1000) {
                             if (hv_phys_read(cpu->m, pa, h, sizeof h) != 0) continue;
                             if (!kf_is_kernel(h)) continue;
+                            /* Every page that looks like a kernel header, not just the first: if
+                               there is more than one the scan is picking by luck, and the one the
+                               firmware goes on to overwrite is as likely as the real one. */
+                            /* The boot args carry the authoritative layout: a memory map whose
+                               entries are { char type[32]; uint64_t physAddr; uint64_t size; }.
+                               Printing it next to the addresses the firmware writes says at once
+                               which component is being written where. Scanned as bytes rather than
+                               parsed, so a different struct layout cannot make it silently empty. */
+                            {
+                                static int map_done;
+                                if (!map_done) {
+                                    map_done = 1;
+                                    static uint8_t pg[4096];
+                                    for (uint64_t q = 0x83000000ull; q < 0x84000000ull; q += 0x1000) {
+                                        if (hv_phys_read(cpu->m, q, pg, sizeof pg) != 0) continue;
+                                        for (unsigned i = 0; i + 16 < sizeof pg; i += 8) {
+                                            const char *t = (const char *) pg + i;
+                                            if (memcmp(t, "KernelCache", 11) && memcmp(t, "RAMDisk", 7) &&
+                                                memcmp(t, "TrustCache", 10) && memcmp(t, "BootArgs", 8))
+                                                continue;
+                                            uint64_t ad = 0, sz = 0;
+                                            memcpy(&ad, pg + i + 32, 8);
+                                            memcpy(&sz, pg + i + 40, 8);
+                                            /* A real entry names a load address inside RAM and a
+                                               sane size; the kernel's own string table is full of
+                                               these names followed by unrelated bytes. */
+                                            if (ad < 0x70000000ull || ad >= 0x100000000ull) continue;
+                                            if (!sz || sz > 0x40000000ull) continue;
+                                            fprintf(stderr, "hengevm: map %-12s at pa %llx: addr %llx size %llx\n",
+                                                    t, (unsigned long long) (q + i),
+                                                    (unsigned long long) ad, (unsigned long long) sz);
+                                        }
+                                    }
+                                }
+                            }
+                            fprintf(stderr, "hengevm: kf hit at pa %llx (first used: %llx)\n",
+                                    (unsigned long long) pa, (unsigned long long) (m->kimage_pa ? m->kimage_pa : pa));
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
                             if (getenv("HV_SLOW_MEM")) cpu->m->slow_mem = 1;
                             /* HV_NO_KFIX=1 skips the rebase. iBoot is supposed to have done it
@@ -2206,11 +2243,13 @@ static int run_loop(HvCpu *cpu, int one) {
                 (void) hv_phys_read(m, cpu->x[21] + 0x10 - 0xfffffdffa8000000ull, &nmpa, 8);
                 hv_mmu_walk(cpu, cpu->x[26] + 0x8c0, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &slid, 8);
-                fprintf(stderr, "hengevm: pchk pc %llx x0 %llx x1 %llx x21 %llx x23 %llx "
+                fprintf(stderr, "hengevm: pchk pc %llx x0 %llx x1 %llx x21 %llx x22 %llx x23 %llx x24 %llx "
                                 "w27 %llx flags48 %llx name10 %llx namePA %llx x8 %llx x9 %llx x10 %llx x26 %llx slide %llx namePA %llx icount %llu\n",
                         (unsigned long long) cpu->pc, (unsigned long long) cpu->x[0],
                         (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[21],
-                        (unsigned long long) cpu->x[23], (unsigned long long) cpu->x[27],
+                        (unsigned long long) cpu->x[22],
+                        (unsigned long long) cpu->x[23],
+                        (unsigned long long) cpu->x[24], (unsigned long long) cpu->x[27],
                         (unsigned long long) (wx & 0xffffffffu), (unsigned long long) nm,
                         (unsigned long long) npa,
                         (unsigned long long) cpu->x[8], (unsigned long long) cpu->x[9],
