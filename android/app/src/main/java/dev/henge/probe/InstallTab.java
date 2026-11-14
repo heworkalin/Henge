@@ -178,6 +178,10 @@ final class InstallTab {
         transfer.addView(buttons);
 
         Runnable refreshWaiting = () -> {
+            /* While a pipeline runs, the screen belongs to it: this painter describes what is on
+               disk for a download that has not started, and writing it over a running install is
+               what made the text flicker between "preparing" and a stale percentage. */
+            if (PIPELINE.get()) return;
             Releases.Release r = chosen[0];
             File ipsw = Releases.ipswFile(dir, r);
             File part = Releases.partFile(dir, r);
