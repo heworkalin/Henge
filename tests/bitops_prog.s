@@ -307,3 +307,150 @@ mathops_prog:
     ldp     x19, x20, [sp], #32
     ret
     .size   mathops_prog, .-mathops_prog
+
+// Exclusive and atomic read-modify-write: what a free list is built from.
+//
+// Each group starts from a known scratch word, does one thing to it, and records both the
+// instruction's own result (the old value, or the store-exclusive status) and the word
+// afterwards — so a wrong answer shows up either as a wrong result or as a wrong memory.
+// The failure cases matter as much as the success ones: a store-exclusive that succeeds when
+// the value changed is how one element gets handed to two callers.
+    .arch   armv8.4-a
+    .text
+    .globl  atomics_prog
+    .type   atomics_prog, %function
+atomics_prog:
+    stp     x19, x20, [sp, #-32]!
+    stp     x21, x22, [sp, #16]
+    add     x25, x0, #0x400
+    add     x26, x0, #0x800
+
+    // LDXR/STXR with nothing in between: succeeds, status 0.
+    mov     x9, #0x11
+    str     x9, [x26]
+    ldxr    x1, [x26]
+    add     x1, x1, #1
+    stxr    w2, x1, [x26]
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // A plain store between them: the monitor is lost, status 1.
+    ldxr    x1, [x26]
+    mov     x4, #0x22
+    str     x4, [x26]
+    stxr    w2, x1, [x26]
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // STXR with no LDXR before it: status 1.
+    mov     x1, #0x33
+    stxr    w2, x1, [x26]
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // CLREX clears the monitor: status 1.
+    ldxr    x1, [x26]
+    clrex
+    mov     x1, #0x44
+    stxr    w2, x1, [x26]
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // Exclusive pair, nothing in between: succeeds.
+    mov     x9, #0x100
+    str     x9, [x26]
+    str     x9, [x26, #8]
+    ldxp    x1, x3, [x26]
+    add     x1, x1, #1
+    add     x3, x3, #2
+    stxp    w2, x1, x3, [x26]
+    str     x2, [x25], #8
+    ldp     x4, x5, [x26]
+    str     x4, [x25], #8
+    str     x5, [x25], #8
+
+    // Exclusive pair with one word changed in between: fails, memory unchanged.
+    ldxp    x1, x3, [x26]
+    mov     x4, #0x777
+    str     x4, [x26, #8]
+    stxp    w2, x1, x3, [x26]
+    str     x2, [x25], #8
+    ldp     x4, x5, [x26]
+    str     x4, [x25], #8
+    str     x5, [x25], #8
+
+    // LDADDAL: old value out, sum in.
+    mov     x9, #0x10
+    str     x9, [x26]
+    mov     x1, #5
+    ldaddal x1, x2, [x26]
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // LDSMAXAL / LDUMINAL: signed and unsigned are not the same instruction.
+    mov     x9, #0
+    sub     x9, x9, #1
+    str     x9, [x26]
+    mov     x1, #1
+    ldsmaxal x1, x2, [x26]          // signed: 1 > -1, so memory becomes 1
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+    mov     x9, #0
+    sub     x9, x9, #1
+    str     x9, [x26]
+    lduminal x1, x2, [x26]          // unsigned: 1 < 0xffff... , so memory stays
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // CASAL: matching compare swaps, mismatching one does not.
+    mov     x9, #0x99
+    str     x9, [x26]
+    mov     x1, #0x99
+    mov     x2, #0xaa
+    casal   x1, x2, [x26]
+    str     x1, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+    mov     x1, #0x11
+    mov     x2, #0xbb
+    casal   x1, x2, [x26]
+    str     x1, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+
+    // SWPAL, and the byte forms of the same ideas.
+    mov     x1, #0x5a
+    swpal   x1, x2, [x26]
+    str     x2, [x25], #8
+    ldr     x3, [x26]
+    str     x3, [x25], #8
+    mov     w1, #0x7
+    ldaddalb w1, w2, [x26]
+    str     x2, [x25], #8
+    ldrb    w3, [x26]
+    str     x3, [x25], #8
+
+    // CASPAL: compare and swap a pair, matching and not.
+    mov     x9, #0x111
+    str     x9, [x26]
+    mov     x9, #0x222
+    str     x9, [x26, #8]
+    ldp     x0, x1, [x26]
+    mov     x2, #0x333
+    mov     x3, #0x444
+    caspal  x0, x1, x2, x3, [x26]
+    ldp     x6, x7, [x26]
+    str     x6, [x25], #8
+    str     x7, [x25], #8
+
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #32
+    ret
+    .size   atomics_prog, .-atomics_prog

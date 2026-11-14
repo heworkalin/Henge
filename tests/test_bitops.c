@@ -218,6 +218,8 @@ int main(void) {
         failed += run_one("memops", code_run, MEMOPS_OFF, MEMOPS_LEN, &m, OUT_BYTES);
     if (!only || !strcmp(only, "mathops"))
         failed += run_one("mathops", code_run, MATHOPS_OFF, MATHOPS_LEN, &m, 25 * 8);
-    printf("%d of 3 programs differ\n", failed);
+    if (!only || !strcmp(only, "atomics"))
+        failed += run_one("atomics", code_run, ATOMICS_OFF, ATOMICS_LEN, &m, 32 * 8);
+    printf("%d of 4 programs differ\n", failed);
     return failed != 0;
 }

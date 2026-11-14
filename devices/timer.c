@@ -25,6 +25,13 @@ static uint64_t one(HvGic *g, int c, int ppi, uint64_t ctl, uint64_t cval, uint6
 
 uint64_t hv_timer_update(HvGic *g, HvCpu *cpu) {
     uint64_t now = hv_counter();
+    {
+        static int seen;
+        if (seen++ < 5)
+            fprintf(stderr, "hengevm: timer update vctl %llx cval %llx now-off %llx\n",
+                    (unsigned long long) cpu->cntv_ctl, (unsigned long long) cpu->cntv_cval,
+                    (unsigned long long) (now - cpu->cntvoff));
+    }
     uint64_t v = one(g, (int)cpu->index, HV_PPI_VTIMER, cpu->cntv_ctl, cpu->cntv_cval, now, cpu->cntvoff);
     uint64_t p = one(g, (int)cpu->index, HV_PPI_PTIMER, cpu->cntp_ctl, cpu->cntp_cval, now, 0);
     if (!v) return p;

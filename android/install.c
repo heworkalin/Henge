@@ -34,6 +34,7 @@
 
 #include "dispatch.h"
 #include "mmu.h"
+#include "sysreg.h"
 #include "disk.h"
 #include "install.h"
 #include "machine.h"
@@ -372,9 +373,13 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
    end: one interrupt in ninety seconds, and every timeout in the restore path expires. */
 static void *kicker_thread(void *arg) {
     (void) arg;
+    uint64_t n = 0;
     while (g_running) {
         usleep(1000);
         hv_machine_kick_all(&g_machine);
+        if (getenv("HENGE_HEARTBEAT") && (++n % 1000) == 0)
+            fprintf(stderr, "hengevm: kicked %llu times, ncpus %d\n",
+                    (unsigned long long) n, g_machine.ncpus);
     }
     return NULL;
 }
@@ -400,14 +405,24 @@ static void *monitor_thread(void *arg) {
             if (walk.fsc == 0) hv_phys_read(&g_machine, walk.pa, &w[k], 4);
         }
         fprintf(stderr, "hengevm: alive %.0fs pc %llx el%u daif %llx exc %llu irq %llu "
-                        "moved %llu/%llu vctl %llx pctl %llx %08x %08x\n",
+                        "moved %llu/%llu vctl %llx cval %llx now-off %llx vp %llx\n",
                 (double) (mach_absolute_time() - t0) / 24000000.0, (unsigned long long) pc,
                 c->el, (unsigned long long) c->daif,
                 (unsigned long long) g_machine.stats.exceptions,
                 (unsigned long long) g_machine.stats.interrupts,
                 (unsigned long long) changes, (unsigned long long) samples,
-                (unsigned long long) c->cntv_ctl, (unsigned long long) c->cntp_ctl,
-                w[0], w[1]);
+                (unsigned long long) c->cntv_ctl, (unsigned long long) c->cntv_cval,
+                (unsigned long long) (hv_counter() - c->cntvoff),
+                (unsigned long long) g_machine.stats.interrupts);
+        /* The GIC's own view of the virtual timer line: a timer that fires is not an interrupt
+           delivered, and only these say which of the gates is shut. */
+        if (g_board.gic) {
+            HvGicCpu *g = &g_board.gic->cpu[0];
+            fprintf(stderr, "hengevm: gic ppi27 en %u grp %u prio %02x pmr %02x igrpen1 %llu "
+                            "ctlr %x line %d\n", g->enabled[27], g->group[27], g->priority[27],
+                    (unsigned) (g->pmr & 0xff), (unsigned long long) g->igrpen1,
+                    g_board.gic->ctlr, (int) g_machine.percpu[0].irq_line);
+        }
     }
     return NULL;
 }
