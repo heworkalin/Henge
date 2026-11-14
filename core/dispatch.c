@@ -3,6 +3,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <dlfcn.h>

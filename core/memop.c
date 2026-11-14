@@ -355,7 +355,27 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                         for (int r = 0; r < 16; r++)
                             fprintf(f, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
                         fprintf(f, "\n");
-                        /* The compressed stream the firmware is decoding, once per run: what the
+                        /* The kernel's __DATA_CONST as the firmware left it, once per run: comparing
+                       two runs byte for byte says whether the wrong bytes are the same wrong bytes
+                       every time (an emulation fault) or differ (a transfer fault). */
+                    static int dc_done;
+                    if (!dc_done && w == cpu->m->watch_va) {
+                        dc_done = 1;
+                        size_t n = (size_t) 0x680000;
+                        uint8_t *dc = malloc(n);
+                        if (dc && hv_phys_read(cpu->m, 0x74504000ull, dc, (unsigned) n) == 0) {
+                            char p7[512];
+                            snprintf(p7, sizeof p7, "%s", wd);
+                            char *sl7 = strrchr(p7, '/');
+                            if (sl7) {
+                                snprintf(sl7 + 1, sizeof p7 - (size_t)(sl7 + 1 - p7), "dataconst.bin");
+                                FILE *df = fopen(p7, "wb");
+                                if (df) { fwrite(dc, 1, n, df); fclose(df); }
+                            }
+                        }
+                        free(dc);
+                    }
+                    /* The compressed stream the firmware is decoding, once per run: what the
                        guest actually received is the only way to tell a decoder that is wrong from
                        bytes that never arrived. The decoder's input pointer sits near 0x8EBF0000
                        and the payload is 21 MB, so this window covers it. */

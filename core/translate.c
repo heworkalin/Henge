@@ -258,12 +258,21 @@ static void put_trace_entry(Emit *e, uint64_t va) {
     put(e, 0x8b0f038fu);                                   /* add x15, x28, x15 */
     put(e, 0xb94001e6u);                                   /* ldr w6, [x15] */
     put(e, 0x110004c6u);                                   /* add w6, w6, #1 */
-    put(e, 0x120014c6u);                                   /* and w6, w6, #0x3f */
+    put(e, 0x12001cc6u);                                   /* and w6, w6, #0xff */
     put(e, 0xb90001e6u);                                   /* str w6, [x15] */
     put(e, 0x910021efu);                                   /* add x15, x15, #8: the ring follows */
     put(e, 0x8b0615efu);                                   /* add x15, x15, x6, lsl #5 (32B/entry) */
-    put(e, 0xf90005e0u);                                   /* str x0, [x15, #8] */
-    put(e, 0xf90009e4u);                                   /* str x4, [x15, #16] */
+    /* The slot of x16 rather than x0: x16 is one of the registers an instruction may borrow as
+       scratch, and a guest value left behind in it is what would make a later `add` produce a host
+       address. */
+    put(e, 0xf9404386u);                                   /* ldr x6, [x28, #128] (slot of x16) */
+    put(e, 0xf90005e6u);                                   /* str x6, [x15, #8] */
+    put(e, 0xf90009f0u);                                   /* str x16, [x15, #16] (the host copy) */
+    /* And the spill slot's copy. A guest register is either held in its host register or spilled;
+       only one of the two is current, and which one differs per block, so both are recorded and
+       the fault tells which was authoritative. */
+    put(e, 0xf9401386u);                                   /* ldr x6, [x28, #32] (slot of x4) */
+    put(e, 0xf9000de6u);                                   /* str x6, [x15, #24] */
     /* The block's address, in the same register, built with movz/movk. */
     for (int hw = 0; hw < 4; hw++) {
         uint32_t part = (uint32_t)((va >> (hw * 16)) & 0xffff);
@@ -455,6 +464,15 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
         }
         return;
     }
+    if (!e->m->slots) {
+        /* A machine whose slot table is gone must not be written through: without this the
+           translator dereferences a null table during a flush that raced a translation. */
+        fprintf(stderr, "hengevm: chaining slot table missing (m %p max_slots %u nslots %u target %#llx)\n",
+                (void *) e->m, e->m->max_slots, (unsigned) __atomic_load_n(&e->m->nslots, __ATOMIC_RELAXED),
+                (unsigned long long) target);
+        e->m->nslots = e->m->max_slots;   /* no chaining until the next flush */
+        return;
+    }
     uint64_t *slot = &e->m->slots[slot_index];
     *slot = 0;
     e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
@@ -569,8 +587,13 @@ static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
 /* Host x6, x7 and x15 hold no guest register (guest x6, x7, x15 live in the
    HvCpu, like x18 and x28: they are the least used in compiled code), so they
    are free scratch: picked first and never spilled. */
+/* x16 and x17 are not candidates: a helper call saves them by number (SAVE_X2_X29 stores host x16
+   and x17 straight into the guest's slots), so host x16 must always hold guest x16 and nothing
+   else. Borrowing them for another guest register makes that save write that register's value into
+   guest x16's slot, and the slot is what the next block reads: the guest's x16 turned into host
+   addresses that way, and the firmware died on them. */
 static const uint8_t candidates[] = {6, 7, 15, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3, 4, 5, 8,
-                                     16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29, 30};
+                                     19, 20, 21, 22, 23, 24, 25, 26, 27, 29, 30};
 
 static int is_free(int reg) {
     return reg == 6 || reg == 7 || reg == 15;
@@ -595,6 +618,11 @@ static int need_spill(const uint8_t *regs, int n, uint8_t *out) {
     return k;
 }
 
+/* Where a register the translator does not keep in a host register lives. */
+static uint32_t slot_of(int reg) {
+    return reg == 31 ? HV_CPU_SP : HV_CPU_X(reg);
+}
+
 static void spill(Emit *e, const uint8_t *regs, int n) {
     uint8_t r[4];
     n = need_spill(regs, n, r);
@@ -614,10 +642,6 @@ static void unspill(Emit *e, const uint8_t *regs, int n) {
 /* Where a register the translator does not keep in a host register lives. */
 static int is_stolen(int reg) {
     return reg == 18 || reg == 28 || is_free(reg);
-}
-
-static uint32_t slot_of(int reg) {
-    return reg == 31 ? HV_CPU_SP : HV_CPU_X(reg);
 }
 
 /* ---- instruction groups ---- */
