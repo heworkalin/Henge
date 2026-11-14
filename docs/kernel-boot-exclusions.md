@@ -145,6 +145,29 @@ block 700cab20 left x16 5500000004 but entered with 6168702c4c504141 ("AAPL,hap"
 
 → 没有证据表明宿主指针漏进 guest 内存。
 
+
+### E16 `kernel_memory_populate` 静默失败、页照样发出去 —— 排除
+
+`zalloc.c` 的 **运行时** 扩容路径（`zone_expand_locked`）是"先映射、再发布"：
+
+```c
+kernel_memory_populate_object_and_unlock(object, addr, ...);   /* 逐页 pmap_enter */
+zcram_and_lock(z, addr, new_va, cur_pages, cur_pages + pages, 0);  /* 才进 freelist */
+```
+
+而 `kernel_memory_populate_pmap_enter()`（`vm_kern.c`）遇到 `KERN_RESOURCE_SHORTAGE`
+会**去掉 NOWAIT 重试一次**，然后：
+
+```c
+assert(pe_result == KERN_SUCCESS);
+```
+
+⇒ 映射要么成功，要么当场 panic，不存在"静默失败继续发页"。
+
+`zone_fill_initially()` 里那个被丢弃的返回值（`zalloc.c:4206`）只影响**开机首次填充**，
+而那次填充发生在内核接管之前、故障页出现之后的大量扩容都是运行时的
+`zone_expand_locked` 路径。
+
 ---
 
 ## 二、已经确认的事实（正向结论）
@@ -183,19 +206,24 @@ block 700cab20 left x16 5500000004 but entered with 6168702c4c504141 ("AAPL,hap"
 
 ---
 
-## 三、剩下的假设（只有两条）
+## 三、剩下的问题（假设已经用完）
 
-### H1 `kernel_memory_populate` / `kmem_alloc` 静默失败，页照样发出去
+两条假设（H1 populate 静默失败、H2 原子导致双重发放）都已在 E14 / E16 里排除。
+现在剩下的不是一个假设，而是一个**必须解释的事实**：
 
-链路：**页表页 zone 短缺 → `pmap_enter` 返回资源不足 → populate 失败被忽略 →
-`zcram` 仍把这段 VA 挂进 freelist → 分配器发出未映射的页。**
+> 内核在 `0xfffffe001cfaaea4` 调用一个函数（6 个参数，返回 `w0` 状态 + `x1` 地址），
+> 状态为成功，`x1` 是一个**页对齐**的堆地址；随后 `memmove` 往这个地址写 0x158 字节时，
+> 这一页在 guest 自己的页表里**从来没有被映射过**。
 
-这条与所有观测吻合：状态成功、地址页对齐、PTE 从未被写、故障页后来才被映射（panic 之后
-其它路径继续扩容）。
+而 zone / `kmem_alloc` 两条分配路径都保证"先映射后发布、失败即 assert"。
 
-取证办法：用已定位的 PTE 写点（`pc = 0xfffffe001ca29778` / `0xfffffe001ca2b0d4`）反推
-`pmap_enter` 的函数边界，在函数入口和**错误返回点**各挂 `HV_LOGPC`，看故障前是否出现
-错误返回。
+下一步要确认的就是**那个被调函数是谁**：
+
+- 参数形状：`(全局 map 指针, size, 0, 0x40, 6, 0)`
+- 返回值形状：`w0` = 状态、`x1` = 地址（典型 16 字节结构体返回）
+- 调用点：`0xfffffe001cfaae8c`，返回点 `0xfffffe001cfaaea8`
+
+拿到它的名字，就能知道这类分配"本该"怎样映射，以及为什么这次没有。
 
 ### H2 分配器把同一段 VA 发了两次（freelist 记账坏了）—— 可能性已很低
 
