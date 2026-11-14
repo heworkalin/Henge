@@ -170,7 +170,10 @@ final class InstallTab {
         buttons.setOrientation(LinearLayout.VERTICAL);
         int pad = Ui.dp(a, 12);
         buttons.setPadding(pad, Ui.dp(a, 8), pad, Ui.dp(a, 12));
-        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        /* One cancel flag for the app, not one per screen: the pipeline runs on a thread that
+           outlives the screen that started it, so a flag owned by the screen meant "stop" only
+           silenced the screen and the work carried on -- the button stayed on 正在停止… forever. */
+        final AtomicBoolean cancelled = CANCELLED;
         final boolean[] busy = {false};
         final android.widget.Button action = Ui.primaryButton(a, "下载并安装", () -> { });
         buttons.addView(action, new LinearLayout.LayoutParams(
@@ -531,6 +534,7 @@ final class InstallTab {
        statics instead of falling through to "nothing is happening". */
     private static final java.util.concurrent.atomic.AtomicBoolean PIPELINE =
             new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final AtomicBoolean CANCELLED = new AtomicBoolean(false);
 
     /* One place that sets the button, so its label survives a screen change too. */
     private static void setAction(android.widget.Button action, String label) {
