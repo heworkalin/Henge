@@ -30,10 +30,19 @@ public class InstallService extends Service {
     private static volatile boolean up;
 
     static void start(Context c) {
-        if (up) return;
+        /* No "already up" short-circuit: the flag only says an instance exists, and after a failed
+         * run the instance can be on its way out while the screen still believes it is running.
+         * A second start command is harmless (onStartCommand re-enters the foreground), while a
+         * skipped one leaves the caller doing a restore with no foreground service behind it. */
         Intent intent = new Intent(c, InstallService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) c.startForegroundService(intent);
         else c.startService(intent);
+    }
+
+    /** Whether an install service is up: the screen's button state is derived from this rather
+     *  than from a flag of its own, so a re-created screen still knows a restore is in progress. */
+    static boolean running() {
+        return up;
     }
 
     static void stop(Context c) {
@@ -49,6 +58,24 @@ public class InstallService extends Service {
     public void onCreate() {
         super.onCreate();
         AppLog.i("安装服务: onCreate");
+        /*
+         * Foreground here, not in onStartCommand: the platform gives a started service a few
+         * seconds to say so, and the first call of a restore can hold the main thread long enough
+         * for that to expire — which ends the process and the install with it.
+         */
+        try {
+            createChannel(this);
+            startForeground(NOTIFY_ID, note("正在安装 macOS…", 0));
+            up = true;
+            AppLog.i("安装服务: onCreate 已进入前台");
+        } catch (Throwable t) {
+            /* Swallowing this leaves the process on the platform's "started a foreground service
+             * and never said so" timer, which ends the app a few seconds later. Say it failed and
+             * go away instead of leaving that timer armed. */
+            AppLog.w("安装服务: onCreate 进入前台失败", t);
+            finishForeground();
+            stopSelf();
+        }
     }
 
     @Override
@@ -64,6 +91,7 @@ public class InstallService extends Service {
             AppLog.i("安装服务: 已进入前台");
         } catch (Throwable t) {
             AppLog.w("安装服务: 进入前台失败", t);
+            finishForeground();
             stopSelf();
         }
         return START_STICKY;
@@ -73,7 +101,24 @@ public class InstallService extends Service {
     public void onDestroy() {
         up = false;
         AppLog.i("安装服务: onDestroy");
+        finishForeground();
         super.onDestroy();
+    }
+
+    /**
+     * Leaves the foreground and takes the notification away. A finished or failed run must not
+     * leave its "installing…" card behind: it says work is happening when nothing is, and the next
+     * attempt would update a notification the user already believes belongs to a dead run.
+     */
+    private void finishForeground() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE);
+            else stopForeground(true);
+        } catch (Throwable t) {
+            AppLog.w("安装服务: 退出前台失败", t);
+        }
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) nm.cancel(NOTIFY_ID);
     }
 
     /** Says what the installer is doing; called from the screen's polling thread. */

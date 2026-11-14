@@ -204,9 +204,13 @@ final class InstallTab {
                 action.setText("正在停止…");
                 return;
             }
-            if (installing[0]) {
+            if (installing[0] || InstallService.running()) {
+                /* The service outlives this screen, so a second tap must stop the run that is
+                 * actually happening rather than start another one beside it. */
+                installing[0] = true;
                 cancelled.set(true);
                 action.setText("正在停止…");
+                InstallService.stop(a);
                 return;
             }
 

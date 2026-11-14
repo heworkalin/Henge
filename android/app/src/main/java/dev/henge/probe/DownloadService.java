@@ -122,6 +122,28 @@ public class DownloadService extends Service {
     }
 
     @Override
+    public void onCreate() {
+        super.onCreate();
+        /*
+         * Foreground at once, not in onStartCommand: the platform allows a started service a few
+         * seconds to say it is foreground, and the main thread is shared with everything else the
+         * screen is doing when the download is requested. Missing that window ends the process.
+         */
+        try {
+            createChannel(this);
+            startForeground(NOTIFY_ID, buildNotification("准备下载…", 0, 0, true));
+            AppLog.i("下载服务: onCreate 已进入前台");
+        } catch (Throwable t) {
+            /* Without this the platform's "you started a foreground service and never said so"
+             * timer stays armed and ends the process a few seconds later. */
+            AppLog.w("下载服务: onCreate 进入前台失败", t);
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) nm.cancel(NOTIFY_ID);
+            stopSelf();
+        }
+    }
+
+    @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         createChannel(this);
 
@@ -285,6 +307,8 @@ public class DownloadService extends Service {
 
     @Override
     public void onDestroy() {
+        NotificationManager nm0 = getSystemService(NotificationManager.class);
+        if (nm0 != null) nm0.cancel(NOTIFY_ID);
         if (worker != null && worker.isAlive()) worker.interrupt();
         super.onDestroy();
     }
