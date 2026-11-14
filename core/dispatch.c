@@ -2176,6 +2176,37 @@ static int run_loop(HvCpu *cpu, int one) {
                 dc_last = v;
             }
         }
+        /* A one-shot dump at a pc chosen from outside (HV_PCHK=start:end): an inline check keeps
+           its operands in registers, and by the time it panics and the fault is seen they are
+           gone, so this is the only place the arguments can still be read. */
+        {
+            static uint64_t pc_lo, pc_hi;
+            static int pc_read, pc_n;
+            if (!pc_read) {
+                const char *e = getenv("HV_PCHK");
+                pc_read = 1;
+                if (e) pc_lo = strtoull(e, (char **) &e, 16), e && *e == ':' ? pc_hi = strtoull(e + 1, 0, 16) : 0;
+            }
+            /* The range is given as the low 32 bits, the way every other pc in the log is
+               printed: the high half is always 0xfffffe00 for the kernel image. */
+            uint64_t plow = (uint32_t) cpu->pc;
+            if (pc_lo && pc_n < 6 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
+                uint64_t wx = 0, nm = 0;
+                HvWalk wpc;
+                pc_n++;
+                hv_mmu_walk(cpu, cpu->x[21] + 0x48, HV_ACC_READ, 1, &wpc);
+                (void) hv_phys_read(m, wpc.pa, &wx, 4);
+                hv_mmu_walk(cpu, cpu->x[21] + 0x10, HV_ACC_READ, 1, &wpc);
+                (void) hv_phys_read(m, wpc.pa, &nm, 8);
+                fprintf(stderr, "hengevm: pchk pc %llx x0 %llx x1 %llx x21 %llx x23 %llx "
+                                "w27 %llx flags48 %llx name10 %llx icount %llu\n",
+                        (unsigned long long) cpu->pc, (unsigned long long) cpu->x[0],
+                        (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[21],
+                        (unsigned long long) cpu->x[23], (unsigned long long) cpu->x[27],
+                        (unsigned long long) (wx & 0xffffffffu), (unsigned long long) nm,
+                        (unsigned long long) cpu->icount);
+            }
+        }
         if (g_timing) {
             uint64_t te0 = mach_absolute_time();
             hv_enter(cpu, b->code);
