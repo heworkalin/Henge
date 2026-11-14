@@ -427,3 +427,77 @@ static inline void kalloc_type_slide_fixed(vm_offset_t addr) {
    （否则内核仍会重写这些字段）。
 3. 纯诊断选项：把内核里 `kalloc_type_validate_flags` 的比较**临时**改成不 panic，
    看内核能不能带着损坏的视图继续走下去（能走多远、下一个卡点是什么）。
+
+## 十四、取证结论：镜像没问题，是 iBEC 把这些字段改写了（2026-11-14 下午）
+
+### 1. 通过 USB 实际发出的内核镜像 = IPSW 里的 kernelcache（逐字节相同）
+
+抓包方式：`host/libusb_shim.c` 把 OUT 传输落盘（`work/usb_out.bin`，400 MB 上限），
+再从中解出 IM4P：
+
+```
+IM4P 类型 rkrn，描述 "KernelManagement_host-463.100.7"
+payload 21,187,498 字节，LZFSE(bvx2) → 解出 75,546,624 字节 Mach-O
+```
+
+与 IPSW 提取的 kernelcache 对比：
+
+```
+长度: 发送 75546624, IPSW 75546624
+前 75546624 字节完全相同: True
+```
+
+⇒ **idevicerestore / 个性化环节发出的镜像没有被动过**，问题不在发送侧。
+
+### 2. 内核启动那一刻，`__DATA_CONST` 已被改写 10,144 个槽
+
+用同一次运行的 `dataconst_boot.bin`（第一个内核块之前导出）对比镜像：
+
+| 项 | 值 |
+|---|---|
+| 不同槽 | **10,144 / 851,968** |
+| 其中原本为 0 的 | 1,105 |
+| 集中区域 | `0x2d0000..0x320000`（**`__kalloc_type` / `__kalloc_var` 所在区**）共 7,724 槽 |
+
+具体到 `com.apple.driver.AppleUSBAudio` 的那条记录：
+
+```
+段内 +0x2f7860  zv_name   镜像 0x00200000002e0f96 → 启动 0x0020000000935144  (差 +0x6541ae)
+段内 +0x2f7870  sig_type  镜像 0x00600000002e0214 → 启动 0x006000000093e03c  (差 +0x65de28)
+段内 +0x2f7878            镜像 0x000402f000000071 → 启动 0x00043c0200000002
+```
+
+- 两个字段的差**不相等**（`+0x6541ae` vs `+0x65de28`），所以不是简单整体重定位
+- 新 target 指到的位置是**二进制垃圾**，而旧 target（`0x2e0f96`）正好指到字符串
+  `"site.AppleUSBAudioEngine"`（在 RAM 中只存在这一处）
+
+### 3. 由此确定的因果链
+
+```
+iBEC 加载内核时改写 __DATA_CONST 里的 kalloc 视图（值来源不明/被算错）
+  → kalloc_type_init 读到的 zv_name / sig_type 是非法指针
+  → kalloc_type_validate_flags 失败 → panic("kalloc_type_view(%s) from kext(%s) ...")
+  → panic 打印自身用那个坏指针当 %s → 打印路径数据异常
+  → panic 重入 → 异常成对重复 4 次（SP 每轮降 0x770）
+  → 越过 16 KB 内核栈的 guard 页 → 异常桩发现 SP 不在栈内 → wfe 自旋
+  → idevicerestore 超时：Failed to place device in restore mode
+```
+
+### 4. 下一步要查的点（明确、可执行）
+
+1. **找到 iBEC 里改写这些槽的代码**：写发生在 MMU 关闭的固件阶段（identity），
+   普通 store 不走慢路径，所以现有 `watch_va` 抓不到；需要在 JIT 的固件阶段 store
+   路径上挂钩子，或按页对比两次 dump 来夹逼写入时机。
+2. **确认它依据什么算新值**：怀疑它用某个我们给错的输入（`boot_args` 字段、某个
+   `mrs` 的值、或某种哈希/CRC 指令的结果）。差值不恒定说明不是纯加法。
+3. 备选（绕开而不是修）：内核启动后、`kalloc_type_init` 之前，用镜像里的原始值
+   把这些被改写且"解不出合法指针"的槽恢复回去。
+
+### 5. 与本次崩溃无关但同批修掉的（App 侧）
+
+| 问题 | 根因 | 修法 |
+|---|---|---|
+| 失败后通知不消失 | `InstallService` 从不清通知、不退出前台 | `finishForeground()`：`stopForeground(REMOVE)` + `cancel`，在 `onDestroy` 与失败路径都调用 |
+| 失败后重装闪退 | `startForegroundService()` 与 `startForeground()` 之间被 `stopService`（系统日志：`Bringing down service while still waiting for start foreground`）| `foregrounded` 标志 + 延迟停止（`pendingStop`）；界面的"停止"改为下发 `ACTION_STOP` 命令 |
+| 上一次的收尾线程把新服务关掉 | 线程与 service 实例无关 | 每次启动分配 generation，只有当前代号的运行才能停服务 |
+| 失败后点重装没反应 | 点击分支先去停旧服务就 `return` | 直接启动新运行，旧运行由 generation 作废 |
