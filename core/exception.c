@@ -42,7 +42,27 @@ void hv_pstate_set(HvCpu *cpu, uint64_t spsr) {
     hv_sp_switch(cpu, el, m & 1);
 }
 
+/* The last exceptions as the guest saw them, in order: the fault a halt reports is only the last
+   one, and the path that led there is usually a different, earlier exception. */
+HvExcRec hv_exc_ring[HV_EXC_RING];
+uint32_t hv_exc_at;
+
 void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set_far, uint64_t ret) {
+    {
+        HvExcRec *r = &hv_exc_ring[hv_exc_at++ & (HV_EXC_RING - 1)];
+        r->elr = ret, r->far = far, r->sp = cpu->sp, r->esr = esr;
+        r->el = (uint32_t) cpu->el, r->type = (uint32_t) type;
+    }
+    /* Every exception and interrupt the engine delivers, while diagnosing: a guest that ends up in
+       its own vector with no log of how leaves nothing to go on. */
+    /* Not the SVCs: a user process making syscalls says nothing, and there is enough of that to
+       fill any limit and hide the one exception that matters. */
+    if (cpu->m->log >= 2 && (type != HV_EXC_SYNC || (esr >> 26) != 0x15) &&
+        cpu->m->stats.exceptions + cpu->m->stats.interrupts < 4096)
+        fprintf(stderr, "hengevm: take %s esr %08x far %llx at pc %llx el%u vector %llx\n",
+                type == HV_EXC_SYNC ? "sync" : type == HV_EXC_IRQ ? "irq" : "fiq",
+                esr, (unsigned long long) far, (unsigned long long) ret, cpu->el,
+                (unsigned long long) (cpu->vbar_el1 + (cpu->el ? 0x200 : 0x400)));
     if (type == HV_EXC_SYNC) cpu->m->stats.exceptions++;
     else cpu->m->stats.interrupts++;
     uint64_t spsr = hv_pstate_get(cpu);
@@ -63,6 +83,15 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
             HvWalk w;
             hv_mmu_walk(cpu, ret, HV_ACC_READ, 1, &w);
             uint32_t insn = 0;
+            /* Always, whatever the walk said: the heavy diagnostics below sit behind conditions
+               that a stale TLB can fail, and a fault that prints nothing is worse than one that
+               prints only the essentials. */
+            if (cpu->m->log >= 2)
+                fprintf(stderr, "hengevm: data abort: esr %08x far %llx pc %llx el%u insn-ok %d "
+                                "x0 %llx x2 %llx x4 %llx x16 %llx\n",
+                        esr, (unsigned long long) far, (unsigned long long) ret, cpu->el,
+                        w.fsc == 0, (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[2],
+                        (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[16]);
             if (w.fsc == 0 && hv_phys_read(cpu->m, w.pa, &insn, 4) == 0) {
                 snprintf(extra, sizeof extra, " insn %08x", insn);
                 /*
@@ -73,6 +102,7 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                  */
                 if (cpu->m->log >= 2) {
                     hv_trace_ring_dump(cpu);
+                    hv_helper_hist_dump(cpu);
                     /*
                      * The code at each of the last distinct block starts. The trace says where the
                      * guest was; the instructions there say what it was doing — and a loop that
@@ -81,14 +111,14 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                      */
                     uint64_t seen[8];
                     int nseen = 0;
-                    for (int i = 63; i >= 0 && nseen < 8; i--) {
-                        uint64_t va = cpu->trace_ring[(cpu->trace_idx + (uint32_t) i) & 63];
+                    for (int i = 255; i >= 0 && nseen < 8; i--) {
+                        uint64_t va = cpu->trace_ring[((cpu->trace_idx + (uint32_t) i) & 255) * 4];
                         int dup = 0;
                         for (int k = 0; k < nseen; k++) if (seen[k] == va) dup = 1;
                         if (dup || !va) continue;
                         seen[nseen++] = va;
                         fprintf(stderr, "hengevm: block %llx:", (unsigned long long) va);
-                        for (int w = 0; w < 10; w++) {
+                        for (int w = 0; w < 56; w++) {
                             HvWalk bww;
                             uint32_t word = 0;
                             hv_mmu_walk(cpu, va + (uint64_t) w * 4, HV_ACC_READ, 0, &bww);
@@ -97,6 +127,48 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                             else
                                 fprintf(stderr, " ????????");
                         }
+                        fprintf(stderr, "\n");
+                    }
+                }
+                /*
+                 * The header of whatever image the firmware is decoding, found by its magic. The
+                 * ROM decompresses the iBSS it received over DFU, so if that image is intact at its
+                 * header the fault is in how it is decoded; if it is shifted or absent, the fault is
+                 * in the transfer — and the two need different fixes.
+                 */
+                {
+                    /*
+                     * What the firmware is decoding. The ROM decompresses the iBSS it received, and
+                     * the container is not necessarily IM4P: what matters is whether the stream
+                     * begins where the decoder says it does, so the magics of both formats Apple
+                     * uses are looked for, and the bytes at the decoder's own position are printed.
+                     */
+                    HvRam *ram = hv_ram_lookup(cpu->m, 0x70000000ull);
+                    uint8_t *base = ram ? ram->host : NULL;
+                    size_t span = ram ? ram->size : 0;
+                    static const char *const magics[] = {"bvx2", "bvxn", "IM4P", "IM4M"};
+                    int found = 0;
+                    size_t limit = span < (64u << 20) ? span : (64u << 20);
+                    for (size_t off = 0; base && off + 4 < limit && found < 6; off += 4) {
+                        for (unsigned k = 0; k < sizeof magics / sizeof magics[0]; k++) {
+                            if (memcmp(base + off, magics[k], 4) != 0) continue;
+                            fprintf(stderr, "hengevm: %s at ram+%#zx: ", magics[k], off);
+                            for (int b = 0; b < 24 && off + (size_t) b < span; b++)
+                                fprintf(stderr, "%02x", base[off + (size_t) b]);
+                            fprintf(stderr, "\n");
+                            found++;
+                            break;
+                        }
+                    }
+                    if (!found) fprintf(stderr, "hengevm: no bvx2/bvxn/IM4P/IM4M in the first 64 MB\n");
+                    fprintf(stderr, "hengevm: diag end\n");
+                    /* The bytes the decoder is currently reading. */
+                    if (base && cpu->x[2] >= 0x70000000ull && cpu->x[2] < 0x70000000ull + span) {
+                        size_t at = (size_t)(cpu->x[2] - 0x70000000ull) & ~(size_t)0x3f;
+                        fprintf(stderr, "hengevm: at x2 %llx (%#zx): ",
+                                (unsigned long long) cpu->x[2], at);
+                        for (int b = 0; b < 48 && at + (size_t) b < span; b++)
+                            fprintf(stderr, "%02x", base[at + (size_t) b]);
                         fprintf(stderr, "\n");
                     }
                 }
@@ -198,6 +270,63 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                 }
             }
         }
+        /* A data abort taken by kernel code is where the guest's own bookkeeping has already
+           gone wrong, so the registers are the only remaining evidence of how. Four of them
+           are enough to see the pattern; the rest are the same fault over and over. */
+        if (type == HV_EXC_SYNC && ((esr >> 26) & 0x3f) == 0x25 && cpu->m->log >= 2) {
+            static int el1_dabt;
+            if (el1_dabt < 4) {
+                el1_dabt++;
+                fprintf(stderr, "hengevm: el1 data abort, registers:");
+                for (int r = 0; r < 31; r++) {
+                    if ((r % 6) == 0) fprintf(stderr, "\nhengevm:  ");
+                    fprintf(stderr, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
+                }
+                /* Whether the guest's own tables map what it just touched: the descriptors say
+                   if the page is missing (the guest's data is wrong) or the walk went somewhere
+                   else (this engine's translation is wrong). */
+                {
+                    fprintf(stderr, "\nhengevm:  ttbr0=%llx ttbr1=%llx tcr=%llx\n",
+                            (unsigned long long) cpu->ttbr0_el1, (unsigned long long) cpu->ttbr1_el1,
+                            (unsigned long long) cpu->tcr_el1);
+                    FILE *saved = hv_walk_dbg;
+                    hv_walk_dbg = stderr;
+                    HvWalk w0;
+                    hv_mmu_walk(cpu, cpu->x[0], HV_ACC_READ, 1, &w0);
+                    fprintf(stderr, "hengevm:  x0 walk: fsc %u pa %llx\n",
+                            w0.fsc, (unsigned long long) w0.pa);
+                    /* The table the walk stopped in, entry by entry: a table full of valid
+                       descriptors with one zero is a page the kernel meant to map and did not;
+                       an empty table means the address itself is not one the kernel allocated. */
+                    if (w0.fsc == HV_FSC_TRANSLATION(3) && w0.table) {
+                        int filled = 0, first = -1, last = -1;
+                        for (int k = 0; k < 512; k++) {
+                            uint64_t e = 0;
+                            if (hv_phys_read(cpu->m, w0.table + (uint64_t) k * 8, &e, 8) != 0) continue;
+                            if (e) { filled++; if (first < 0) first = k; last = k; }
+                        }
+                        fprintf(stderr, "hengevm:  L3 table %llx: %d of 512 entries set, first %d last %d\n",
+                                (unsigned long long) w0.table, filled, first, last);
+                    }
+                    hv_walk_dbg = saved;
+                    for (int k = 0; k < 2; k++) {
+                        uint64_t base = k ? cpu->x[20] : cpu->x[19];
+                        fprintf(stderr, "hengevm:  at x%d %llx:", k ? 20 : 19, (unsigned long long) base);
+                        for (int w = 0; w < 8; w++) {
+                            HvWalk ww; uint64_t word = 0;
+                            hv_mmu_walk(cpu, base + (uint64_t) w * 8, HV_ACC_READ, 1, &ww);
+                            if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 8) == 0)
+                                fprintf(stderr, " %016llx", (unsigned long long) word);
+                            else fprintf(stderr, " ????????????????");
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+                fprintf(stderr, "\nhengevm:  sp_el0=%llx sp_el1=%llx sp=%llx far=%llx\n",
+                        (unsigned long long) cpu->sp_el0, (unsigned long long) cpu->tpidr_el1,
+                        (unsigned long long) cpu->sp, (unsigned long long) far);
+            }
+        }
         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u%s\n", type, esr,
                 (unsigned long long)far, (unsigned long long)ret, cpu->el, extra);
     }
@@ -278,9 +407,11 @@ static HvCpu *cpu_by_mpidr(HvMachine *m, uint64_t mpidr) {
 static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     static int log = -1;
     if (log < 0) log = getenv("HV_PSCI_LOG") != NULL;
+    if (cpu->m->log >= 2) log = 1;   /* the machine's own log covers this too */
     if (log && ((uint32_t)fn >> 24 == 0x84 || (uint32_t)fn >> 24 == 0xc4))
-        fprintf(stderr, "psci %#llx x1 %#llx x2 %#llx x3 %#llx pc %llx\n", (unsigned long long)fn, (unsigned long long)cpu->x[1],
-                (unsigned long long)cpu->x[2], (unsigned long long)cpu->x[3], (unsigned long long)cpu->pc);
+        fprintf(stderr, "hengevm: psci %#llx x1 %#llx x2 %#llx x3 %#llx pc %llx ncpus %d\n", (unsigned long long)fn, (unsigned long long)cpu->x[1],
+                (unsigned long long)cpu->x[2], (unsigned long long)cpu->x[3],
+                (unsigned long long)cpu->pc, cpu->m->ncpus);
     switch ((uint32_t)fn) {
     case 0x84000000: return 0x10000;                         /* PSCI_VERSION: 1.0 */
     case 0x84000006: return 2;                               /* MIGRATE_INFO_TYPE: no trusted OS */

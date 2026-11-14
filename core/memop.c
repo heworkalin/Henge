@@ -355,7 +355,30 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                         for (int r = 0; r < 16; r++)
                             fprintf(f, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
                         fprintf(f, "\n");
-                        /* The kernel's __DATA_CONST as the firmware left it, once per run: comparing
+                        /* __DATA_CONST as the firmware leaves it, once per hit for the first few: the
+                       image is copied down in pieces, so which moment counts is not knowable in
+                       advance and comparing the copies says which one is complete. */
+                    {
+                        static int dc_hits;
+                        if (w != cpu->m->watch_va && dc_hits < 8) {
+                            dc_hits++;
+                            size_t n = (size_t) 0x680000;
+                            uint8_t *dc = malloc(n);
+                            if (dc && hv_phys_read(cpu->m, 0x74504000ull, dc, (unsigned) n) == 0) {
+                                char p9[512];
+                                snprintf(p9, sizeof p9, "%s", wd);
+                                char *sl9 = strrchr(p9, '/');
+                                if (sl9) {
+                                    snprintf(sl9 + 1, sizeof p9 - (size_t)(sl9 + 1 - p9),
+                                             "dc-%02d.bin", dc_hits);
+                                    FILE *df = fopen(p9, "wb");
+                                    if (df) { fwrite(dc, 1, n, df); fclose(df); }
+                                }
+                            }
+                            free(dc);
+                        }
+                    }
+                    /* The kernel's __DATA_CONST as the firmware left it, once per run: comparing
                        two runs byte for byte says whether the wrong bytes are the same wrong bytes
                        every time (an emulation fault) or differ (a transfer fault). */
                     static int dc_done;

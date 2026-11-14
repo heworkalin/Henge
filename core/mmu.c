@@ -80,6 +80,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
         int idx_bits = level == 4 - levels ? inputsize - shift : stride;
         uint64_t idx = (va >> shift) & ((1ull << idx_bits) - 1);
         uint64_t desc;
+        out->table = base;
         if (read_desc(cpu->m, base + idx * 8, &desc) != 0) {
             out->fsc = 0x14 + level; /* synchronous external abort on a table walk */
             out->s1ptw = 1;

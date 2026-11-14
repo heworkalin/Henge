@@ -1379,6 +1379,24 @@ static int run_loop(HvCpu *cpu, int one) {
                             if (!kf_is_kernel(h)) continue;
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
                             kernel_fixups(cpu->m, pa, pa + off_k);
+                            /* The moment worth keeping: the firmware has finished with the image
+                               and the kernel has not run yet, so whatever is wrong in it is the
+                               firmware's doing alone. */
+                            if (getenv("HV_DUMP_DC")) {
+                                const char *wd5 = getenv("HV_BLOCK_DUMP");
+                                uint8_t *dc = malloc(0x680000);
+                                if (wd5 && dc && hv_phys_read(cpu->m, pa + 0x6f8000ull, dc, 0x680000) == 0) {
+                                    char dp[512];
+                                    snprintf(dp, sizeof dp, "%s", wd5);
+                                    char *sl5 = strrchr(dp, '/');
+                                    if (sl5) {
+                                        snprintf(sl5 + 1, sizeof dp - (size_t)(sl5 + 1 - dp), "dc-boot.bin");
+                                        FILE *df = fopen(dp, "wb");
+                                        if (df) { fwrite(dc, 1, 0x680000, df); fclose(df); }
+                                    }
+                                }
+                                free(dc);
+                            }
                             break;
                         }
                     }

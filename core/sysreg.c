@@ -288,9 +288,15 @@ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     uint64_t v;
     if (is_pauth_key(reg)) v = 0;
     else if (read_reg(cpu, reg, &v) != 0) return undefined(cpu, pc);
-    if (cpu->m->log >= 3)
+    /* Every system register the kernel reads during its early initialisation: it builds structures
+       out of these values, so one we invent is one it miscomputes with. The firmware's own reads
+       stay quiet (log >= 3 only), or a whole install would be spent printing them. */
+    static uint32_t kernel_reads;
+    if (cpu->m->log >= 3 || (cpu->m->log >= 2 && pc >= 0xfffffe0000000000ull && kernel_reads < 400)) {
+        if (pc >= 0xfffffe0000000000ull) kernel_reads++;
         fprintf(stderr, "mrs S%u_%u_C%u_C%u_%u = %llx pc %llx el%u\n", reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15,
                 (reg >> 3) & 15, reg & 7, (unsigned long long)v, (unsigned long long)pc, cpu->el);
+    }
     if (rt != 31) cpu->x[rt] = v;
     return 0;
 }

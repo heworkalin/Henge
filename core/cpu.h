@@ -115,9 +115,10 @@ typedef struct HvCpu {
        indirect branches never pass through C to be recorded there. Off unless log >= 3. */
     uint32_t trace_idx;
     uint32_t trace_pad;
+
     /* {block VA, guest x0, guest x4, spare} per entry: a register that goes wrong between two
        block entries is then visible, which a trace of addresses alone cannot show. */
-    uint64_t trace_ring[64 * 4];
+    uint64_t trace_ring[256 * 4];
 
     struct HvMachine *m;
     uint32_t el;
@@ -181,6 +182,14 @@ typedef struct HvCpu {
     _Atomic int halted;      /* HvHaltReason; published across CPU and UI threads */
     int off;                 /* PSCI: powered off (a secondary not started yet, or CPU_OFF) until CPU_ON */
     int parked_off;          /* off, and its thread is waiting (so CPU_ON may reset it) */
+
+    /* What each helper call saw in the registers that keep turning up in a fault. Last in the
+       struct on purpose: translated code computes trace_idx's offset at compile time and assumes
+       the ring follows it, so nothing may be placed between the two. Recording here needs no
+       assembly — SAVE_X2_X29 has already put the guest's registers in the slots. */
+    uint32_t helper_hist_idx;
+    uint32_t helper_hist_pad;
+    struct { uint64_t pc, op, x4, x16, x30, x0; } helper_hist[64];
 } HvCpu;
 
 #define HV_CPU_X(n)        ((n) * 8)

@@ -143,7 +143,9 @@ static void avp_regs_create(HvVmapple *b, uint64_t ram_size) {
     AvpRegs *ctrr = calloc(1, sizeof *ctrr), *sealed = calloc(1, sizeof *sealed);
     b->ctrr = ctrr, b->sealed = sealed;
     ctrr->name = "avp-ctrr", sealed->name = "avp-sealed-registers";
-    ctrr->log = sealed->log = getenv("HV_AVP_LOG") != NULL;
+    /* Logged while diagnosing: these two devices are this port's own model (QEMU has neither), so
+       whether the kernel reads them, and what it reads, is worth seeing rather than assuming. */
+    ctrr->log = sealed->log = getenv("HV_AVP_LOG") != NULL || m->log >= 2;
     avp_put(ctrr, 0x00, 0x63747272, 4);
     avp_put(ctrr, 0x04, 1, 4);
     avp_put(ctrr, 0x0c, 14, 4);
@@ -266,6 +268,21 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     return deadline;
 }
 
+/* Line by line, so a message arrives whole. */
+static void vmapple_serial_out(void *opaque, uint8_t c) {
+    HvMachine *m = opaque;
+    static char line[400];
+    static size_t n;
+    if (c == '\r') return;
+    if (c == '\n') {
+        line[n] = 0;
+        if (m->log >= 2 && n) fprintf(stderr, "hengevm: serial: %s\n", line);
+        n = 0;
+        return;
+    }
+    if (n < sizeof line - 1) line[n++] = (char) c;
+}
+
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
@@ -351,6 +368,10 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->gic = hv_gicv3_create(m, VMAPPLE_GIC_DIST, VMAPPLE_GIC_REDIST);
     hv_machine_add_mmio(m, VMAPPLE_GIC_MSI, 0x10000, b, gic_msi_read, gic_msi_write, "gic-msi");
     b->uart = hv_pl011_create(m, b->gic, VMAPPLE_UART, 32 + VMAPPLE_IRQ_UART);
+    /* The firmware and the kernel both talk on this port: their own words about a boot that
+       stops are worth more than anything we can infer from the registers. */
+    b->uart->output = vmapple_serial_out;
+    b->uart->output_opaque = m;
     b->rtc = hv_pl031_create(m, b->gic, VMAPPLE_RTC, 32 + VMAPPLE_IRQ_RTC);
     b->gpio = hv_pl061_create(m, b->gic, VMAPPLE_GPIO, 32 + VMAPPLE_IRQ_GPIO);
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);

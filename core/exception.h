@@ -46,3 +46,12 @@ void hv_debug_args(HvCpu *cpu);
 int hv_check_interrupts(HvCpu *cpu);
 
 #endif
+
+/* The last exceptions delivered to the guest, oldest first at hv_exc_at & (N-1). */
+#define HV_EXC_RING 128
+typedef struct HvExcRec {
+    uint64_t elr, far, sp, esr;
+    uint32_t el, type;
+} HvExcRec;
+extern HvExcRec hv_exc_ring[HV_EXC_RING];
+extern uint32_t hv_exc_at;

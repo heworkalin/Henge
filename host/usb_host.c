@@ -47,10 +47,42 @@ int hv_usb_reset(HvVirtioUsb *d, int timeout_ms) {
     return ok ? 0 : HV_USB_EIO;
 }
 
+/*
+ * How many bytes one request to the guest may carry.
+ *
+ * The guest posts receive buffers of a fixed size (usbmuxd's 16 KiB), and a request larger than the
+ * buffer is silently cut to what fits — the caller still sees a completed transfer. Bulk OUT is
+ * split to this size for exactly that reason; control OUT was not, and a control transfer is what
+ * a DFU upload uses, so an oversized one would corrupt the image with nothing in the log to show
+ * for it.
+ */
+static int control_chunked(HvVirtioUsb *d, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
+                           uint16_t wIndex, void *data, uint16_t wLength, uint32_t room,
+                           int timeout_ms);
+
+static uint32_t guest_receive_bytes(void) {
+    static uint32_t bytes;
+    if (!bytes) bytes = getenv("HV_USB_OUT_CHUNK") ? (uint32_t)atoi(getenv("HV_USB_OUT_CHUNK")) : 16384u;
+    return bytes;
+}
+
 int hv_usb_control(HvVirtioUsb *d, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
                    void *data, uint16_t wLength, int timeout_ms) {
     int in = (bmRequestType & 0x80) != 0;
+    uint32_t room = guest_receive_bytes();
     uint32_t len = 8 + (in ? 0 : wLength);
+    if (!in && len > room) {
+        if (!getenv("HV_USB_CTRL_CHUNK")) {
+            /* Said out loud, and delivered the old way: splitting changes what the guest sees in
+               the middle of a restore, which is not something to change on a hunch. */
+            fprintf(stderr, "hengevm: usb: control OUT of %u bytes is larger than the guest's %u-byte "
+                            "receive buffer; it will be cut (set HV_USB_CTRL_CHUNK=1 to split it)\n",
+                    (unsigned) len, (unsigned) room);
+        } else {
+            return control_chunked(d, bmRequestType, bRequest, wValue, wIndex, data, wLength, room,
+                                   timeout_ms);
+        }
+    }
     uint8_t *req = malloc(len);
     if (!req) return HV_USB_EIO;
     req[0] = bmRequestType, req[1] = bRequest;
@@ -64,6 +96,37 @@ int hv_usb_control(HvVirtioUsb *d, uint8_t bmRequestType, uint8_t bRequest, uint
     r = wait_ep(d, 0, in ? data : NULL, in ? wLength : 0, timeout_ms);
     if (r < 0) return r;
     return in ? r : wLength;
+}
+
+/*
+ * A control OUT whose payload is larger than one request: the setup and the first slice go in the
+ * first request, the rest follow as further data requests on the same endpoint — the shape a real
+ * bus produces, and the shape the bulk path already uses.
+ */
+static int control_chunked(HvVirtioUsb *d, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
+                           uint16_t wIndex, void *data, uint16_t wLength, uint32_t room,
+                           int timeout_ms) {
+    const uint8_t *in = data;
+    uint32_t first = room > 8 ? room - 8 : 0;
+    uint32_t off = 0;
+    for (;;) {
+        uint32_t take = wLength - off < first ? wLength - off : first;
+        uint32_t len = 8 + take;
+        uint8_t *req = malloc(len);
+        if (!req) return HV_USB_EIO;
+        req[0] = bmRequestType, req[1] = bRequest;
+        memcpy(req + 2, &wValue, 2);
+        memcpy(req + 4, &wIndex, 2);
+        memcpy(req + 6, &wLength, 2);
+        if (take) memcpy(req + 8, in + off, take);
+        int r = hv_vusb_send(d, HV_VUSB_REQ_DATA, 0, req, len);
+        free(req);
+        if (r != 0) return HV_USB_EGONE;
+        off += take;
+        if (off >= wLength) break;
+        first = room;   /* every later request is all data */
+    }
+    return wLength;
 }
 
 int hv_usb_bulk(HvVirtioUsb *d, uint8_t ep, void *data, uint32_t len, int timeout_ms) {
