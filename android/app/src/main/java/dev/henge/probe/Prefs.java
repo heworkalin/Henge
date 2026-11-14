@@ -116,24 +116,47 @@ final class Prefs {
      * file replaced by an identical copy (same size, same timestamp) would be skipped — that is the
      * one case this cannot see, and it is not a case that happens by accident.
      */
+    /* One record per file, not one for the app: two images on disk both stay verified, and
+       switching between them does not re-read 16 GB each time. Older builds kept a single
+       record; it is read once and migrated into the per-file one. */
+    private static String verifiedKey(File f) {
+        return "ipsw.verified:" + f.getAbsolutePath();
+    }
+
     static boolean isVerified(Context c, File f) {
+        if (f == null || !f.exists()) return false;
         android.content.SharedPreferences p = sp(c);
-        return f != null && f.exists()
-                && f.getAbsolutePath().equals(p.getString("ipsw.verified.path", null))
+        String want = f.length() + ":" + f.lastModified();
+        String have = p.getString(verifiedKey(f), null);
+        if (want.equals(have)) return true;
+        /* The single record an older build wrote: adopt it for this file, then drop it. */
+        if (f.getAbsolutePath().equals(p.getString("ipsw.verified.path", null))
                 && f.length() == p.getLong("ipsw.verified.size", -1)
-                && f.lastModified() == p.getLong("ipsw.verified.mtime", -2);
+                && f.lastModified() == p.getLong("ipsw.verified.mtime", -2)) {
+            markVerified(c, f);
+            clearLegacyVerified(c);
+            return true;
+        }
+        return false;
     }
 
     static void markVerified(Context c, File f) {
         if (f == null || !f.exists()) return;
         sp(c).edit()
-                .putString("ipsw.verified.path", f.getAbsolutePath())
-                .putLong("ipsw.verified.size", f.length())
-                .putLong("ipsw.verified.mtime", f.lastModified())
+                .putString(verifiedKey(f), f.length() + ":" + f.lastModified())
                 .apply();
     }
 
-    static void clearVerified(Context c) {
+    /** Forgets that this file was ever checked: it has just been deleted for failing. */
+    static void clearVerified(Context c, File f) {
+        android.content.SharedPreferences.Editor e = sp(c).edit();
+        if (f != null) e.remove(verifiedKey(f));
+        e.apply();
+        clearLegacyVerified(c);
+    }
+
+    /** The single-slot record older builds wrote, so it does not linger as a false positive. */
+    static void clearLegacyVerified(Context c) {
         sp(c).edit()
                 .remove("ipsw.verified.path")
                 .remove("ipsw.verified.size")

@@ -255,7 +255,7 @@ final class InstallTab {
                             a.runOnUiThread(() -> showProgress(progress, bar,
                                     "已下载的镜像校验不通过，已删除，将重新下载"));
                             s0.delete();
-                            Prefs.clearVerified(a);
+                            Prefs.clearVerified(a, s0);
                             source = null;
                         } else {
                             /* The user's own file is theirs: it is not deleted. It is also not
@@ -301,7 +301,7 @@ final class InstallTab {
                     if (!verify(a, source, progress, bar, cancelled)) {
                         if (cancelled.get()) return;
                         source.delete();
-                        Prefs.clearVerified(a);
+                        Prefs.clearVerified(a, source);
                         a.runOnUiThread(() -> showProgress(progress, bar,
                                 "下载的镜像校验不通过，已删除，请重试"));
                         return;
