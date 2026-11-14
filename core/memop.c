@@ -391,11 +391,19 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                             fw_dumps++;
                             HvWalk cw;
                             hv_mmu_walk(cpu, pc, HV_ACC_EXEC, el, &cw);
-                            uint64_t cpa = cw.pa ? cw.pa : pc;
+                            /* No silent fallback: a failed walk used to look exactly like a
+                               successful one that translated to the same address, which is how a
+                               window of zeroes was accepted as the executing code. */
+                            uint64_t cpa = cw.fsc ? 0 : cw.pa;
+                            if (!cpa) {
+                                HvWalk rw2;
+                                hv_mmu_walk(cpu, pc, HV_ACC_READ, el, &rw2);
+                                if (!rw2.fsc) cpa = rw2.pa;
+                            }
                             uint32_t words[4] = {0, 0, 0, 0};
-                            hv_phys_read(cpu->m, cpa & ~3ull, words, sizeof words);
-                            fprintf(f, "  code pc %#llx -> pa %#llx  insn %08x %08x %08x %08x\n",
-                                    (unsigned long long) pc, (unsigned long long) cpa,
+                            if (cpa) hv_phys_read(cpu->m, cpa & ~3ull, words, sizeof words);
+                            fprintf(f, "  code pc %#llx -> pa %#llx (fsc %#x)  insn %08x %08x %08x %08x\n",
+                                    (unsigned long long) pc, (unsigned long long) cpa, cw.fsc,
                                     words[0], words[1], words[2], words[3]);
                             /* Once, the whole firmware text: 64 KB windows around a hit are
                                enough to see the loop but not the function that set it up. */
@@ -418,6 +426,30 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                                     }
                                 }
                                 free(txt);
+                            }
+                            /* What the registers point at, since guessing where the decoder's
+                               input lives has been wrong twice. Only the pointers that fall in
+                               guest RAM, and only for the first few hits. */
+                            static int reg_dumps;
+                            if (reg_dumps < 8) {
+                                reg_dumps++;
+                                for (int r = 0; r < 16; r++) {
+                                    uint64_t v = cpu->x[r];
+                                    if (v < 0x70000000ull || v >= 0x90000000ull) continue;
+                                    uint64_t page = v & ~0xfffull;
+                                    uint8_t *buf = malloc(4096);
+                                    if (!buf || hv_phys_read(cpu->m, page, buf, 4096) != 0) { free(buf); continue; }
+                                    char p6[512];
+                                    snprintf(p6, sizeof p6, "%s", wd);
+                                    char *sl6 = strrchr(p6, '/');
+                                    if (sl6) {
+                                        snprintf(sl6 + 1, sizeof p6 - (size_t)(sl6 + 1 - p6),
+                                                 "hit%02d-x%d.bin", reg_dumps, r);
+                                        FILE *gf = fopen(p6, "wb");
+                                        if (gf) { fwrite(buf, 1, 4096, gf); fclose(gf); }
+                                    }
+                                    free(buf);
+                                }
                             }
                             uint8_t *code = malloc(1u << 16);
                             uint64_t win = cpa & ~0xffffull;
