@@ -139,6 +139,9 @@ static void on_install_progress(int step, double progress, void *user) {
 /* HV_BLOCK_DUMP points at a file the engine writes every block to (see dispatch.c). */
 static int startup_dump_blocks(const char *workdir) {
     if (!workdir || !*workdir) return -1;
+    /* HENGE_NO_DUMP: on a host, where a run is one command and can be repeated, the per-block
+       dump and the watched address are gigabytes of I/O for a question that was already asked. */
+    if (getenv("HENGE_NO_DUMP")) return 0;
     static char path[512];
     snprintf(path, sizeof path, "%s/blocks.bin", workdir);
     setenv("HV_BLOCK_DUMP", path, 1);
