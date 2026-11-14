@@ -1533,6 +1533,17 @@ static int run_loop(HvCpu *cpu, int one) {
                                     }
                                 }
                             }
+                            /* arm64's boot_args carries no memory map: the component layout is
+                               device tree properties under /chosen/memory-map, {addr, size}. */
+                            {
+                                static int dt_done;
+                                if (!dt_done) {
+                                    dt_done = 1;
+                                    uint32_t m4 = 0;
+                                    (void) hv_phys_read(cpu->m, 0x78324000ull, &m4, 4);
+                                    fprintf(stderr, "hengevm: dt magic at 78324000 = %08x\n", m4);
+                                }
+                            }
                             fprintf(stderr, "hengevm: kf hit at pa %llx (first used: %llx)\n",
                                     (unsigned long long) pa, (unsigned long long) (m->kimage_pa ? m->kimage_pa : pa));
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
