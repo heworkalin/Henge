@@ -3,6 +3,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,6 +81,28 @@ static int kf_is_kernel(const uint8_t *h) {
         off += csz;
     }
     return 0;
+}
+
+/* 64 bytes of real entropy for the guest's boot seed. The host has it (>= getrandom(2) or
+   /dev/urandom); nothing in the guest can produce it. */
+static int derive_seed(uint8_t *out, size_t n) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    size_t got = 0;
+    if (fd >= 0) {
+        while (got < n) {
+            ssize_t r = read(fd, out + got, n - got);
+            if (r <= 0) break;
+            got += (size_t) r;
+        }
+        close(fd);
+    }
+    if (got == n) return 1;
+    uint64_t x = mach_absolute_time() ^ ((uint64_t) getpid() << 32) ^ (uint64_t) (uintptr_t) out;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        out[i] = (uint8_t) x;
+    }
+    return 1;
 }
 
 static uint64_t kf_dc_pa;   /* where __DATA_CONST starts, for the beat probe below */
@@ -1682,6 +1706,34 @@ static int run_loop(HvCpu *cpu, int one) {
                     fprintf(stderr, "hengevm: dc0 %llx %llx\n", (unsigned long long) dc[0],
                             (unsigned long long) dc[1]);
                 }
+                /* Stalled means the counter of retired instructions did not move at all since
+                   the last beat: the CPU is waiting for something, and what it is waiting for is
+                   decided by these fields. Printed once per stall, not once per second. */
+                {
+                    static uint64_t last_icount;
+                    static int stalled;
+                    if (cpu->icount == last_icount) {
+                        if (!stalled) {
+                            stalled = 1;
+                            fprintf(stderr, "hengevm: STALLED 1s at pc %llx el%u daif %x sp %llx "
+                                            "why %d halted %d off %d irq_line %d fiq_line %d "
+                                            "cntv_ctl %llx cntv_cval %llx cntp_ctl %llx cntp_cval %llx "
+                                            "now %llx x0 %llx x1 %llx x2 %llx x3 %llx\n",
+                                    (unsigned long long) cpu->pc, cpu->el, cpu->daif,
+                                    (unsigned long long) cpu->sp, cpu->exit_reason, cpu->halted,
+                                    cpu->off, cpu->pc_state->irq_line, cpu->pc_state->fiq_line,
+                                    (unsigned long long) cpu->cntv_ctl, (unsigned long long) cpu->cntv_cval,
+                                    (unsigned long long) cpu->cntp_ctl, (unsigned long long) cpu->cntp_cval,
+                                    (unsigned long long) mach_absolute_time(),
+                                    (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                                    (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3]);
+                            hv_pc_hist_dump(cpu);
+                        }
+                    } else {
+                        stalled = 0;
+                        last_icount = cpu->icount;
+                    }
+                }
                 fprintf(stderr, "hengevm: beat pc %llx el%u icount %llu blocks %llu why %d "
                                 "slow_mem %d memops %llu\n",
                         (unsigned long long) cpu->pc, cpu->el,
@@ -1829,6 +1881,38 @@ static int run_loop(HvCpu *cpu, int one) {
                                        linear map: physBase/virtBase turn it into a physical one. */
                                     if (q[12] > q[1]) {
                                         uint64_t dtpa = q[12] - q[1] + q[2];
+                                        /* /chosen/random-seed is what PE_get_random_seed() hands to
+                                           early_random_init(), and iBoot leaves it zeroed: every key
+                                           the boot derives then comes from a known constant. Fill it
+                                           from the host's own entropy instead -- the property is a
+                                           32-byte name field, a u32 length and the value. */
+                                        {
+                                            size_t cap = 256u << 10;
+                                            uint8_t *dt = malloc(cap);
+                                            int ok = dt != NULL;
+                                            for (size_t k = 0; ok && k < cap; k += (64u << 10))   /* phys_read is chunk-sized */
+                                                ok = hv_phys_read(m, dtpa + k, dt + k, 64u << 10) == 0;
+                                            if (ok) {
+                                                uint32_t filled = 0;
+                                                for (size_t k = 0; k + 36 <= cap; k++) {
+                                                    if (memcmp(dt + k, "random-seed", 12)) continue;
+                                                    uint32_t n = 0;
+                                                    memcpy(&n, dt + k + 32, 4);
+                                                    if (n < 64 || n > 256 || k + 36 + n > cap) continue;
+                                                    int zero = 1;
+                                                    for (uint32_t b = 0; b < n && zero; b++) zero = dt[k + 36 + b] == 0;
+                                                    if (!zero) continue;   /* already seeded: not ours to change */
+                                                    uint8_t seed[64];
+                                                    int got = derive_seed(seed, sizeof seed);
+                                                    if (!got) continue;
+                                                    for (uint32_t b = 0; b < n; b++) dt[k + 36 + b] = seed[b % sizeof seed];
+                                                    if (hv_phys_write(m, dtpa + k + 36, dt + k + 36, n) == 0) filled = n;
+                                                }
+                                                fprintf(stderr, "hengevm: random-seed: %u bytes from the %s\n",
+                                                        filled, "host");
+                                            }
+                                            free(dt);
+                                        }
                                         const char *where2 = getenv("HV_BLOCK_DUMP");
                                         char p2[512];
                                         if (where2 && *where2) {
