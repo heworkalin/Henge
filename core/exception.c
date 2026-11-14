@@ -282,6 +282,43 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                     if ((r % 6) == 0) fprintf(stderr, "\nhengevm:  ");
                     fprintf(stderr, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
                 }
+                /* Which zone the faulting code was allocating from: the caller loads the zone
+                   pointer from a kernel global, and a zone carries its own name, so the string
+                   says what kind of object this was without any symbol table. */
+                {
+                    uint64_t knob = 0xfffffe001c335440ull;
+                    HvWalk kw; uint64_t zone = 0;
+                    hv_mmu_walk(cpu, knob, HV_ACC_READ, 1, &kw);
+                    if (kw.fsc == 0 && hv_phys_read(cpu->m, kw.pa, &zone, 8) == 0) {
+                        fprintf(stderr, "\nhengevm:  zone global %llx -> %#llx\n",
+                                (unsigned long long) knob, (unsigned long long) zone);
+                        for (int k = 0; k < 24; k++) {
+                            HvWalk rw; uint64_t raw = 0;
+                            hv_mmu_walk(cpu, zone + (uint64_t) k * 8, HV_ACC_READ, 1, &rw);
+                            if (rw.fsc == 0 && hv_phys_read(cpu->m, rw.pa, &raw, 8) == 0)
+                                fprintf(stderr, "hengevm:   z[%02d] %016llx\n", k, (unsigned long long) raw);
+                        }
+                        for (int k = 0; k < 64; k++) {
+                            HvWalk zw; uint64_t p = 0;
+                            hv_mmu_walk(cpu, zone + (uint64_t) k * 8, HV_ACC_READ, 1, &zw);
+                            if (zw.fsc != 0 || hv_phys_read(cpu->m, zw.pa, &p, 8) != 0) continue;
+                            if (p < 0xfffffe0000000000ull || p > 0xffffffffffffffffull) continue;
+                            char txt[41];
+                            int ok = 1;
+                            for (int i = 0; i < 40; i += 8) {
+                                HvWalk tw; uint64_t w = 0;
+                                hv_mmu_walk(cpu, p + (uint64_t) i, HV_ACC_READ, 1, &tw);
+                                if (tw.fsc != 0 || hv_phys_read(cpu->m, tw.pa, &w, 8) != 0) { ok = 0; break; }
+                                memcpy(txt + i, &w, 8);
+                            }
+                            txt[40] = 0;
+                            for (int i = 0; i < 40 && ok; i++)
+                                if (txt[i] && (txt[i] < 0x20 || txt[i] > 0x7e)) ok = 0;
+                            if (ok && txt[0]) fprintf(stderr, "hengevm:   zone+%#04x -> %llx \"%s\"\n",
+                                                      k * 8, (unsigned long long) p, txt);
+                        }
+                    }
+                }
                 /* The block that faulted, word by word: the load that made the access is in it,
                    and so is whatever advanced the base register to the bad address. */
                 {
