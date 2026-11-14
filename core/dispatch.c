@@ -1469,12 +1469,16 @@ static int run_loop(HvCpu *cpu, int one) {
                             /* HV_NO_KFIX=1 skips the rebase. iBoot is supposed to have done it
                                already, and doing it twice adds the base twice; which of the two
                                is true for a given firmware is exactly what this switch is for. */
-                            /* Not ours to do: arm_init() calls kernel_collection_slide(), which
-                               rebases every segment of the collection from the same chains. A pass
-                               here makes the kernel's slide land on an already-rebased pointer
-                               (0x1d1645a0 -> 0x38c7c5a0) and the guest branches into nothing.
-                               HV_KFIX=1 runs it anyway, for comparison. */
-                            if (getenv("HV_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
+                            /* __DATA has to be rebased here: arm_init's early code (pc
+                               0x1d177058 on this kernel) reads pointers out of it before
+                               kernel_collection_slide() runs, and iBoot hands the image over with
+                               the raw chain words still in place -- the guest dereferenced
+                               0x00c000000379cf90, which is exactly the word the file holds at that
+                               slot. __DATA_CONST is the opposite case and kernel_fixups() skips
+                               it: the kernel rebases those itself, and doing it twice produced
+                               0x38c7c5a0 out of a valid 0x1d1645a0. HV_NO_KFIX=1 disables the
+                               whole pass for comparison. */
+                            if (!getenv("HV_NO_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
                             /* The moment worth keeping: the firmware has finished with the image
                                and the kernel has not run yet, so whatever is wrong in it is the
                                firmware's doing alone. */
