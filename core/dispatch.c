@@ -81,10 +81,16 @@ static int kf_is_kernel(const uint8_t *h) {
     return 0;
 }
 
+static uint64_t kf_dc_pa;   /* where __DATA_CONST starts, for the beat probe below */
+static uint64_t dc_last, dc_poll;
+static int hv_dc_probe = -1;   /* HV_DC_PROBE=1: report every change of the first __DATA_CONST word */
+
 static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
+    kf_dc_pa = image_pa + 0x6f8000;
     uint8_t hdr[4096];
     if (hv_phys_read(m, image_pa, hdr, sizeof hdr) != 0) return;
     uint32_t ncmds = kf_u32(hdr + 16), off = 32, csz_fix = 0, fix_off = 0, nseg = 0;
+    uint64_t lo = 0, hi = 0, text_va = 0;
     char segname[8][17];
     memset(segname, 0, sizeof segname);
     for (uint32_t c = 0; c < ncmds && off + 8 <= sizeof hdr; c++) {
@@ -94,6 +100,11 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
         if (cmd == 0x19 && nseg < 8) { /* LC_SEGMENT_64: the starts table is indexed in this order */
             memcpy(segname[nseg], hdr + off + 8, 16);
             segname[nseg][16] = 0;
+            /* The image's own span in the file's own terms, for the sanity check below. */
+            uint64_t sva = kf_u64(hdr + off + 24), svs = kf_u64(hdr + off + 32);
+            if (!nseg) text_va = sva;
+            if (!lo || sva < lo) lo = sva;
+            if (sva + svs > hi) hi = sva + svs;
             nseg++;
         }
         off += csz;
@@ -104,13 +115,20 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
     if (hv_phys_read(m, image_pa + fix_off, fx, csz_fix) != 0) { free(fx); return; }
     uint32_t starts = kf_u32(fx + 4);
     uint32_t segs_in_fix = kf_u32(fx + starts);
-    uint32_t applied = 0, already = 0, slots = 0;
+    uint32_t applied = 0, already = 0, outside = 0, slots = 0;
     uint32_t seg_applied[8] = {0}, seg_already[8] = {0};
     for (uint32_t s = 0; s < segs_in_fix; s++) {
-        /* __DATA_CONST is the kernel's own: its pass recomputes those slots from the value it finds
-           and does not skip one that is already a pointer, so rewriting them here applies the base
-           twice and the guest jumps into the middle of the image. Only __DATA is left to the loader. */
-        if (s < 8 && !strcmp(segname[s], "__DATA_CONST")) continue;
+        /* Both __DATA and __DATA_CONST have fixup chains and neither is rebased by the time the
+           kernel starts: a raw chain word left in __DATA_CONST was dereferenced as a string
+           pointer and the guest died in a data abort before it printed anything. The slot is only
+           rewritten when it does not already hold a pointer, so a pass that did run is not
+           applied twice. HV_NO_KFIX_DC=1 leaves __DATA_CONST alone for comparison. */
+        /* __DATA_CONST is left to the kernel: at icount ~57k the guest itself walks those chains
+           and adds the slide to whatever it finds there (pc 0x1d177750), which turns a slot this
+           pass had already rebased into base+pointer and the guest branches into nothing. iBoot
+           hands the image over with those slots still raw, which is what that kernel pass expects.
+           HV_KFIX_DC=1 forces the pass here, for comparison. */
+        if (s < 8 && !strcmp(segname[s], "__DATA_CONST") && !getenv("HV_KFIX_DC")) continue;
         uint32_t soff = kf_u32(fx + starts + 4 + 4 * s);
         if (!soff) continue;
         const uint8_t *sp = fx + starts + soff;
@@ -132,6 +150,12 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
                 uint32_t next = (uint32_t) ((v >> 51) & 0xfff);
                 slots++;
                 if (v >= 0xfffffe0000000000ull) { already++; if (s < 8) seg_already[s]++; } /* a pointer already: the loader got here */
+                else if (target >= hi - text_va) {
+                    /* A target past the end of the image is not a fixup: the walk ran into data
+                       that happens to look like a chain. Writing base+target would leave an
+                       address no segment covers, and the guest branches to it. Left alone. */
+                    outside++;
+                }
                 else {
                     uint64_t nv = image_va + target;
                     hv_phys_write(m, pa, &nv, 8);
@@ -145,6 +169,8 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
         }
     }
     free(fx);
+    hv_phys_read(m, kf_dc_pa, &dc_last, 8);
+    hv_dc_probe = getenv("HV_DC_PROBE") != NULL;
     /* Read back the first slots of __DATA_CONST: if they hold the base twice by the time the
        guest reaches them, something rebased on top of this pass. */
     uint64_t probe[4] = {0, 0, 0, 0};
@@ -157,8 +183,9 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
         if (sl) snprintf(sl + 1, sizeof p2 - (size_t) (sl + 1 - p2), "fixups.txt");
         FILE *f = fopen(p2, "w");
         if (f) {
-            fprintf(f, "image pa %llx va %llx\nslots %u applied %u already %u\n",
-                    (unsigned long long) image_pa, (unsigned long long) image_va, slots, applied, already);
+            fprintf(f, "image pa %llx va %llx\nslots %u applied %u already %u outside %u\n",
+                    (unsigned long long) image_pa, (unsigned long long) image_va, slots, applied,
+                    already, outside);
             fprintf(f, "dataconst[0..3] %#llx %#llx %#llx %#llx\n",
                     (unsigned long long) probe[0], (unsigned long long) probe[1],
                     (unsigned long long) probe[2], (unsigned long long) probe[3]);
@@ -1174,7 +1201,9 @@ static int run_loop(HvCpu *cpu, int one) {
     uint32_t chain_flags = 0;
     uint32_t last_reason = HV_EXIT_BRANCH;
     hv_self = cpu;
-    if (m->log >= 2) jit_fault_watch(m);
+    /* Always: a block the host refuses to run is a bug in the translator, and the only record of
+       which guest instruction produced it is written from this handler. It costs one sigaction. */
+    jit_fault_watch(m);
     {
         static int watch_set;
         if (!watch_set) {
@@ -1356,7 +1385,10 @@ static int run_loop(HvCpu *cpu, int one) {
             fw_rec[fw_n % FW_REC].x0 = cpu->x[0];
             fw_n++;
         }
-        if (m->log >= 2 && cpu->pc >= 0xfffffe0000000000ull && ktrace_n < KTRACE_MAX) {
+        /* The rebase of the kernel image is not a diagnostic: with it skipped the guest runs on
+           raw chained-fixup words and dies early, so it must not be tied to the log level. The
+           ktrace snapshots below stay behind log 2 — only the fixup runs in every configuration. */
+        if (cpu->pc >= 0xfffffe0000000000ull && (m->log >= 2 || !m->kimage_pa) && ktrace_n < KTRACE_MAX) {
             /* Did the firmware patch its own code before jumping? iBEC picks the kernel entry
                with a constant in an adrp/add pair at 0x748980c4; if that constant was rewritten
                at run time, the page holding it differs from what it held when first executed.
@@ -1639,6 +1671,12 @@ static int run_loop(HvCpu *cpu, int one) {
             uint64_t now = (uint64_t) ts.tv_sec;
             if (now != last_beat) {
                 last_beat = now;
+                if (kf_dc_pa) {
+                    uint64_t dc[2] = {0, 0};
+                    hv_phys_read(cpu->m, kf_dc_pa, dc, sizeof dc);
+                    fprintf(stderr, "hengevm: dc0 %llx %llx\n", (unsigned long long) dc[0],
+                            (unsigned long long) dc[1]);
+                }
                 fprintf(stderr, "hengevm: beat pc %llx el%u icount %llu blocks %llu why %d "
                                 "slow_mem %d memops %llu\n",
                         (unsigned long long) cpu->pc, cpu->el,
@@ -1885,6 +1923,30 @@ static int run_loop(HvCpu *cpu, int one) {
                 /* A guest that sits at one pc is waiting for an interrupt: whether it is taking
                    one is then decided by these, and each of them fails in a different way. */
                 if (cpu->pc == last_idle_pc) {
+                    /* A spin like this is where panic() ends, and the message it formatted sits in
+                       the stack this CPU is on. Scan it for printable runs: the console does not
+                       print it, so the stack is the only place it is written down. */
+                    if (cpu->el == 1 && getenv("HV_STACKSCAN")) {
+                        uint8_t page[256];
+                        int printed = 0;
+                        for (uint64_t at = cpu->sp; at < cpu->sp + 0x4000 && printed < 8; at += sizeof page) {
+                            HvWalk w;
+                            hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &w);
+                            if (w.fsc != 0 || hv_phys_read(cpu->m, w.pa, page, sizeof page) != 0) continue;
+                            int run = 0;
+                            for (unsigned k = 0; k < sizeof page; k++) {
+                                int ok = page[k] >= 0x20 && page[k] < 0x7f;
+                                if (ok) { run++; continue; }
+                                if (run >= 24) {
+                                    fprintf(stderr, "hengevm: stack %llx: %.*s\n",
+                                            (unsigned long long) (at + k - (unsigned) run), run,
+                                            (char *) page + k - run);
+                                    printed++;
+                                }
+                                run = 0;
+                            }
+                        }
+                    }
                     fprintf(stderr, "hengevm: idle daif %x irq_line %d fiq_line %d cntp_ctl %llx "
                                     "cntp_cval %llx now %llx cntv_ctl %llx cntv_cval %llx pc %llx\n",
                             cpu->daif, cpu->pc_state->irq_line, cpu->pc_state->fiq_line,
@@ -1905,44 +1967,18 @@ static int run_loop(HvCpu *cpu, int one) {
         if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= m->jit.used || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
             fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
-        /* Every change of the interrupt mask, with the block that made it: whether the guest ever
-           runs with interrupts enabled decides whether a pageable-memory fault can be handled at
-           all, and whether the mask we report is the guest's own. */
-        if (m->log >= 2 && cpu->icount < 8)
-            fprintf(stderr, "hengevm: block %llx daif %llx el %u icount %llu\n",
-                    (unsigned long long) cpu->pc, (unsigned long long) cpu->daif, cpu->el,
-                    (unsigned long long) cpu->icount);
-        if (m->log >= 2 && cpu->icount && (cpu->icount % 4000000ull) == 0) {
-            static uint64_t t0;
-            if (!t0) t0 = mach_absolute_time();
-            fprintf(stderr, "hengevm: alive icount %llu pc %llx daif %llx (%.0f ms)\n",
-                    (unsigned long long) cpu->icount, (unsigned long long) cpu->pc,
-                    (unsigned long long) cpu->daif,
-                    (double) (mach_absolute_time() - t0) / 24000000.0);
-        }
-        if ((cpu->daif & HV_PSTATE_I) == 0) {
-            static int saw;
-            if (!saw) { saw = 1;
-                fprintf(stderr, "hengevm: interrupts first enabled at block %llx (daif %llx, icount %llu)\n",
-                        (unsigned long long) cpu->pc, (unsigned long long) cpu->daif,
-                        (unsigned long long) cpu->icount); }
-        }
-        if (m->log >= 2) {
-            static uint64_t last_daif;
-            uint64_t now = cpu->daif & HV_PSTATE_DAIF;
-            if (now != last_daif) {
-                fprintf(stderr, "hengevm: daif %llx -> %llx after block %llx\n",
-                        (unsigned long long) last_daif, (unsigned long long) now,
-                        (unsigned long long) prev_pc);
-                last_daif = now;
+        /* Who rebases __DATA_CONST: printed the moment the first word changes, so the value the
+           loader wrote and the value the guest later reads are both on record. */
+        if (kf_dc_pa && hv_dc_probe && (++dc_poll & 0xf) == 0) {
+            uint64_t v = 0;
+            hv_phys_read(m, kf_dc_pa, &v, 8);
+            if (v != dc_last) {
+                fprintf(stderr, "hengevm: dc0 %llx -> %llx at pc %llx icount %llu\n",
+                        (unsigned long long) dc_last, (unsigned long long) v,
+                        (unsigned long long) cpu->pc, (unsigned long long) cpu->icount);
+                dc_last = v;
             }
         }
-        if (m->log_pc && cpu->pc == m->log_pc && m->log_pc_hits++ < 4000)
-            {
-                fprintf(stderr, "hengevm: logpc %llx el%u", (unsigned long long) cpu->pc, cpu->el);
-                for (int r = 0; r < 31; r++) fprintf(stderr, " x%d %llx", r, (unsigned long long) cpu->x[r]);
-                fprintf(stderr, "\n");
-            }
         hv_enter(cpu, b->code);
 
         /* An undefined instruction at EL1 is where the panic path traps to the debugger (the
