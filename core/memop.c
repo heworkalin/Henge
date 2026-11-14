@@ -380,7 +380,10 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                        payload wherever the firmware happens to have put it is the only way to
                        settle whether the bytes it decoded were the bytes that were sent. */
                     static int ram_done;
-                    if (!ram_done && getenv("HV_DUMP_RAM")) {
+                    /* At the kernel's first write, not at the firmware's: the component buffers
+                       are reused as each one arrives, and a dump taken earlier holds iBEC rather
+                       than the kernel collection that was the last thing sent. */
+                    if (!ram_done && getenv("HV_DUMP_RAM") && w == cpu->m->watch_va) {
                         ram_done = 1;
                         size_t n = (size_t) 512 << 20;
                         uint8_t *whole = malloc(n);
