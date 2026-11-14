@@ -207,7 +207,7 @@ final class InstallTab {
             if (installing[0]) {
                 cancelled.set(true);
                 action.setText("正在停止…");
-                InstallService.stop(a);
+                InstallService.requestStop(a);
                 return;
             }
             if (InstallService.running()) {
@@ -215,7 +215,7 @@ final class InstallTab {
                  * thread). End it and let the next tap start a fresh one; marking this screen as
                  * installing would make the next tap stop a run it never started. */
                 action.setText("正在停止上一次…");
-                InstallService.stop(a);
+                InstallService.requestStop(a);
                 return;
             }
 

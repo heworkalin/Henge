@@ -28,6 +28,12 @@ public class InstallService extends Service {
 
     /** Set once the service has actually gone foreground; guards against asking twice. */
     private static volatile boolean up;
+    /** Set once startForeground() has returned. Stopping before that is what makes the platform
+     *  take the process down ("bringing down service while still waiting for start foreground"). */
+    private static volatile boolean foregrounded;
+    private static volatile boolean pendingStop;
+    /** Asking to stop goes through the service, so the request is handled after it is foreground. */
+    static final String ACTION_STOP = "dev.henge.probe.INSTALL_STOP";
     /**
      * Which run the service is up for. A finished thread from an earlier attempt must not stop
      * the service a later attempt has just started: it would take the new run's foreground away
@@ -61,18 +67,34 @@ public class InstallService extends Service {
         return up;
     }
 
-    /** Stops the service, but only if its run is still this one. */
+    /**
+     * Stops the service, but only if its run is still this one, and never while the platform is
+     * still waiting to be told the service is foreground: that wait is what it punishes by ending
+     * the process, and the request can arrive before startForeground() has run.
+     */
     static void stop(Context c, int run) {
         if (!current(run)) {
             AppLog.i("安装服务: 运行 " + run + " 已被更新的运行取代，不停止服务");
             return;
         }
+        if (!foregrounded) {
+            pendingStop = true;
+            AppLog.i("安装服务: 尚未进入前台，停止请求留到进入前台之后");
+            return;
+        }
         c.stopService(new Intent(c, InstallService.class));
     }
 
-    /** Stops whatever run is current, for the screen's own "stop" button. */
-    static void stop(Context c) {
-        c.stopService(new Intent(c, InstallService.class));
+    /** The screen's "stop": goes through the service rather than around it. */
+    static void requestStop(Context c) {
+        if (!up) return;
+        if (!foregrounded) {
+            pendingStop = true;
+            return;
+        }
+        Intent intent = new Intent(c, InstallService.class);
+        intent.setAction(ACTION_STOP);
+        c.startService(intent);
     }
 
     @Override
@@ -93,12 +115,14 @@ public class InstallService extends Service {
             createChannel(this);
             startForeground(NOTIFY_ID, note("正在安装 macOS…", 0));
             up = true;
+            foregrounded = true;
             AppLog.i("安装服务: onCreate 已进入前台");
         } catch (Throwable t) {
             /* Swallowing this leaves the process on the platform's "started a foreground service
              * and never said so" timer, which ends the app a few seconds later. Say it failed and
              * go away instead of leaving that timer armed. */
             AppLog.w("安装服务: onCreate 进入前台失败", t);
+            foregrounded = false;
             finishForeground();
             stopSelf();
         }
@@ -114,7 +138,19 @@ public class InstallService extends Service {
             createChannel(this);
             startForeground(NOTIFY_ID, note("正在安装 macOS…", 0));
             up = true;
+            foregrounded = true;
             AppLog.i("安装服务: 已进入前台");
+            if (pendingStop) {
+                pendingStop = false;
+                AppLog.i("安装服务: 处理延迟的停止请求");
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+            if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+                AppLog.i("安装服务: 收到停止请求");
+                stopSelf();
+                return START_NOT_STICKY;
+            }
         } catch (Throwable t) {
             AppLog.w("安装服务: 进入前台失败", t);
             finishForeground();
@@ -126,6 +162,8 @@ public class InstallService extends Service {
     @Override
     public void onDestroy() {
         up = false;
+        foregrounded = false;
+        pendingStop = false;
         AppLog.i("安装服务: onDestroy");
         finishForeground();
         super.onDestroy();
