@@ -451,9 +451,11 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                                     words[0], words[1], words[2], words[3]);
                             /* Once, the whole firmware text: 64 KB windows around a hit are
                                enough to see the loop but not the function that set it up. */
-                            static int ibec_done;
-                            if (!ibec_done) {
-                                ibec_done = 1;
+                            /* Refreshed on every firmware hit, not once: the range is reused by
+                               each stage, and the code that matters is the last one loaded there. */
+                            static int ibec_dumps;
+                            if (ibec_dumps < 200) {
+                                ibec_dumps++;
                                 uint8_t *txt = malloc(4u << 20);
                                 if (txt && hv_phys_read(cpu->m, 0x70080000ull, txt, 4u << 20) == 0) {
                                     char p5[512];
