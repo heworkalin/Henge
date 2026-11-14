@@ -83,6 +83,9 @@ final class InstallTab {
         File dir = dir(a);
         Releases.Release[] chosen = {Releases.byBuild(Prefs.releaseBuild(a))};
         TextView[] marks = new TextView[Releases.ALL.length];
+        /* Filled in once the transfer section exists: choosing a version has to repaint what that
+           section says, or the last version's "failed" stays on screen as if it were this one's. */
+        final Runnable[] repaint = new Runnable[1];
 
         // What each row says on its right: the download's state, or that it is the one chosen.
         // Painted from one place so a change of mind cannot leave two rows marked.
@@ -95,7 +98,9 @@ final class InstallTab {
                 } else if (Releases.ipswFile(dir, r).exists()) {
                     marks[i].setText("已下载");
                 } else if (Releases.partFile(dir, r).exists()) {
-                    marks[i].setText("已下 " + AppLog.bytes(Releases.partFile(dir, r).length()));
+                    long got = Downloader.held(Releases.partFile(dir, r),
+                            new File(Releases.partFile(dir, r).getPath() + ".chunks"), r.bytes);
+                    marks[i].setText("已下 " + AppLog.bytes(got));
                 } else {
                     marks[i].setText(AppLog.bytes(r.bytes));
                 }
@@ -116,6 +121,7 @@ final class InstallTab {
                 if (!r.tested)
                     Toast.makeText(a, "实验性版本：本机没有测试过，可能装不上", Toast.LENGTH_SHORT).show();
                 paint.run();
+                if (repaint[0] != null) repaint[0].run();
             });
             if (i < Releases.ALL.length - 1) Lists.divider(a, releases);
         }
@@ -178,9 +184,12 @@ final class InstallTab {
                         + AppLog.bytes(ipsw.length()) + "，可以直接安装");
                 bar.setProgress(1000);
             } else if (part.exists()) {
-                int percent = (int) (part.length() * 100 / Math.max(1, r.bytes));
+                /* From the chunk marks, not the file's length: the file is pre-sized to the whole
+                   image, so its length would report a download that just started as complete. */
+                long got = Downloader.held(part, new File(part.getPath() + ".chunks"), r.bytes);
+                int percent = (int) (got * 100 / Math.max(1, r.bytes));
                 showProgress(progress, bar, "已下载 " + percent + "%（"
-                        + AppLog.bytes(part.length()) + " / " + AppLog.bytes(r.bytes)
+                        + AppLog.bytes(got) + " / " + AppLog.bytes(r.bytes)
                         + "）\n再次开始会从断点继续");
             } else {
                 showProgress(progress, bar, "尚未下载\n" + r.name + " · " + AppLog.bytes(r.bytes));
@@ -190,6 +199,9 @@ final class InstallTab {
         refreshWaiting.run();
 
         final boolean[] installing = {false};
+        /* Set when this screen asks for a download: until the service reports that it is running,
+           the state object still describes the previous attempt and must not be painted. */
+        final boolean[] starting = {false};
 
         /**
          * One button, four meanings, decided by the state on screen: download, stop the download,
@@ -204,10 +216,11 @@ final class InstallTab {
                 action.setText("正在停止…");
                 return;
             }
-            if (installing[0]) {
+            if (installing[0] || InstallService.running()) {
                 cancelled.set(true);
                 action.setText("正在停止…");
                 InstallService.requestStop(a);
+                Native.nativeInstallStop();
                 return;
             }
             if (InstallService.running())
@@ -228,6 +241,9 @@ final class InstallTab {
                 // alive when the user goes and does something else for an hour.
                 AppLog.i("下载: 请求服务下载 " + r.name);
                 Permissions.askForDownload(a);
+                showProgress(progress, bar, "准备下载 " + r.name + "\n" + AppLog.bytes(r.bytes));
+                bar.setProgress(0);
+                starting[0] = true;
                 DownloadService.start(a, r);
                 action.setText("停止");
                 return;
@@ -306,10 +322,28 @@ final class InstallTab {
 
         // The screen follows the service rather than the other way round: the download outlives
         // this view, so the view reads it instead of owning it.
+        final Runnable[] self = new Runnable[1];
         Runnable follow = () -> a.runOnUiThread(() -> {
-            if (installing[0]) return;
+            /* A tab that was rebuilt (a reload, a rotation) must stop listening: its views are
+               gone, and a listener left behind painted the old screen forever. */
+            if (!progress.isAttachedToWindow()) {
+                if (self[0] != null) DownloadService.unlisten(self[0]);
+                return;
+            }
+            if (installing[0] || InstallService.running()) return;
             DownloadService.State state = DownloadService.state();
             String phase = state.phase;
+            /* The download service holds one state for the whole app, so a state that names a
+               different build is the previous attempt's, not this one's. Showing it is what made
+               "choose another version" look like it had already failed. */
+            boolean mine = state.name == null || state.name.isEmpty()
+                    || state.name.equals(chosen[0].build);
+            if (!mine) phase = DownloadService.State.IDLE;
+            if (starting[0]) {
+                if (DownloadService.State.RUNNING.equals(phase)
+                        || DownloadService.State.CANCELLED.equals(phase)) starting[0] = false;
+                else return;   /* still the old state: leave "准备下载…" alone */
+            }
             if (DownloadService.State.RUNNING.equals(phase)) {
                 action.setText("停止");
                 int percent = state.total > 0 ? (int) (state.received * 100 / state.total) : 0;
@@ -318,7 +352,10 @@ final class InstallTab {
                         .append('\n')
                         .append(AppLog.bytes(state.received)).append(" / ")
                         .append(AppLog.bytes(state.total)).append("（").append(percent).append("%）");
-                if (state.speed > 0) {
+                if (state.stalled) {
+                    /* Frozen numbers with no explanation read as a frozen app; say what is known. */
+                    text.append("\n网络无响应，正在重试…（已收到的部分保留）");
+                } else if (state.speed > 0) {
                     text.append('\n').append(AppLog.bytes(state.speed)).append("/s");
                     if (state.etaMs > 0) text.append(" · 还需 ").append(AppLog.eta(state.etaMs));
                 } else {
@@ -340,6 +377,8 @@ final class InstallTab {
                 refreshWaiting.run();
             }
         });
+        self[0] = follow;
+        repaint[0] = follow;
         DownloadService.listen(follow);
         follow.run();
 

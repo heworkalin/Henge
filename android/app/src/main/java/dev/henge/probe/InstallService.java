@@ -161,6 +161,14 @@ public class InstallService extends Service {
 
     @Override
     public void onDestroy() {
+        /* The run belongs to this service: when it goes away, its CPUs go with it. A restore that
+         * failed leaves its guest spinning in a loop that never returns, and a second attempt can
+         * only build a machine once that one is told to stop. */
+        try {
+            Native.nativeInstallStop();
+        } catch (Throwable t) {
+            AppLog.w("安装服务: 停止引擎失败", t);
+        }
         up = false;
         foregrounded = false;
         pendingStop = false;

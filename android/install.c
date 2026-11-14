@@ -32,6 +32,7 @@
 #include <android/log.h>
 
 #include "dispatch.h"
+#include "disk.h"
 #include "install.h"
 #include "machine.h"
 #include "vmapple.h"
@@ -59,6 +60,7 @@ static int g_running;
 
 /* Defined in henge_vm.c: one machine at a time, so starting one means stopping the other. */
 void hv_android_vm_teardown(void);
+void hv_android_install_stop(void);
 int hv_android_install_running(void);
 
 static void say(char **cursor, char *end, const char *fmt, ...) {
@@ -101,8 +103,13 @@ int hv_android_make_disk(const char *path, uint64_t bytes) {
     return ok ? 0 : -1;
 }
 
+static void stop_cpus(void);
+
 static void on_install_progress(int step, double progress, void *user) {
     (void)user;
+    /* The restore is over: its guest (a panic, in a failed one) is spinning in a wfe loop that will
+       never end. Stopping the CPUs here is what lets the next attempt build a machine at all. */
+    if (step >= HV_INSTALL_DONE) stop_cpus();
     int previous = g_install_step;
     g_install_step = step;
     g_install_progress = progress;
@@ -131,7 +138,7 @@ static int startup_dump_blocks(const char *workdir) {
     setenv("HV_WATCH_VA", "fffffe001c4a7850", 1);
     /* The same record by physical address: the firmware builds the kernel image with the MMU off,
        so a write there is a write to this PA and never matches the kernel VA above. */
-    setenv("HV_WATCH_PA", "74507000", 1);
+    setenv("HV_WATCH_PA", "74507860", 1);
     return 0;
 }
 
@@ -177,8 +184,20 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     // second display with the same serial number, which is what an install started while a boot
     // was still up used to hit (a warning, then a display that had been destroyed underneath it).
     // Tearing the previous machine down first is the only ordering that is correct.
-    if (hv_android_install_running()) return -1;
+    if (g_running) {
+        if (g_install_step >= HV_INSTALL_DONE) {
+            /* Finished or failed: its CPUs are still looping in guest code, so say stop rather
+               than refuse. This is what "cannot install again after it failed" was. */
+            say(&cursor, end, "  previous run   : ended (step %d), stopping it\n", g_install_step);
+            hv_android_install_stop();
+        } else {
+            say(&cursor, end, "  previous run   : still running (step %d)\n", g_install_step);
+            return -1;
+        }
+    }
     hv_android_vm_teardown();
+    hv_disk_close(&g_disk);
+    hv_disk_close(&g_aux);
 
     memset(&g_machine, 0, sizeof g_machine);
     memset(&g_board, 0, sizeof g_board);
@@ -257,6 +276,23 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     }
     g_running = 1;
     return 0;
+}
+
+static void stop_cpus(void) {
+    if (!g_running) return;
+    for (int i = 0; i < HV_MAX_CPUS; i++)
+        __atomic_store_n(&g_cpus[i].exit_req, 1, __ATOMIC_RELAXED);
+    g_machine.stop = 1;
+}
+
+/* Ends the current run, if any: the CPUs return, the machine can be built again. */
+void hv_android_install_stop(void) {
+    if (!g_running) return;
+    stop_cpus();
+    /* The CPU threads return on their own; they are detached and only read this machine, so a
+       short wait is enough to know they are out of the way before the next memset below. */
+    for (int i = 0; i < 100 && g_running; i++) usleep(2000);
+    g_running = 0;   /* the next start memsets the machine, which clears its stop flag */
 }
 
 /* The last progress idevicerestore reported: step (0-…, or HV_INSTALL_DONE/FAILED) and 0..1. */

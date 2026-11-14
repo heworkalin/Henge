@@ -44,6 +44,41 @@ final class Downloader {
      *  back to a single stream instead of reporting a failure. */
     private static final String RANGES_REFUSED = "\u0000ranges-refused";
 
+    /**
+     * The connections that are open right now.
+     *
+     * Cancelling cannot be done with Thread.interrupt alone: a thread blocked reading a socket
+     * does not see the interrupt, and the read timeout is two minutes — long enough that "stop"
+     * looks broken. Closing the connection is what actually ends the read.
+     */
+    private static final java.util.List<HttpURLConnection> OPEN =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Ends every download in this process: the reads fail, the workers see `cancelled`. */
+    static void abort() {
+        for (HttpURLConnection c : OPEN) {
+            try {
+                c.disconnect();
+            } catch (Throwable ignored) {
+            }
+        }
+        OPEN.clear();
+    }
+
+    private static HttpURLConnection open(String url) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        OPEN.add(c);
+        return c;
+    }
+
+    private static void shut(HttpURLConnection c) {
+        OPEN.remove(c);
+        try {
+            c.disconnect();
+        } catch (Throwable ignored) {
+        }
+    }
+
     private Downloader() {
     }
 
@@ -109,7 +144,7 @@ final class Downloader {
      * server or the redirect chain will not play.
      */
     private static long probe(String url) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = open(url);
         try {
             Tls.apply(c);
             c.setInstanceFollowRedirects(true);
@@ -138,7 +173,7 @@ final class Downloader {
             }
             return 0;
         } finally {
-            c.disconnect();
+            shut(c);
         }
     }
 
@@ -177,29 +212,48 @@ final class Downloader {
         final String[] failure = {null};
         final Object failureLock = new Object();
 
+        /* Set when a chunk has failed for good: every worker stops instead of walking on to the
+           next chunk, which is what made a slow server look like a hang with no end. */
+        final AtomicBoolean stopped = new AtomicBoolean(false);
+
         Runnable worker = () -> {
-            while (!cancelled.get() && !refused.get()) {
+            while (!cancelled.get() && !refused.get() && !stopped.get()) {
                 int index = next.getAndIncrement();
                 if (index >= count) return;
                 if (done[index] == 1) continue;
                 long start = index * CHUNK;
                 long end = Math.min(total, start + CHUNK) - 1;
-                try {
-                    long wrote = fetchInto(url, part, start, end, held, total, progress, cancelled);
-                    if (wrote != end - start + 1) throw new IOException("段 " + index + " 只写到 " + wrote);
-                    synchronized (marksLock) {
-                        done[index] = 1;
-                        writeMarks(marks, done, index);
+                boolean got = false;
+                for (int attempt = 0; attempt < 3 && !cancelled.get() && !stopped.get(); attempt++) {
+                    try {
+                        long wrote = fetchInto(url, part, start, end, held, total, progress, cancelled);
+                        if (wrote != end - start + 1) throw new IOException("段 " + index + " 只写到 " + wrote);
+                        synchronized (marksLock) {
+                            done[index] = 1;
+                            writeMarks(marks, done, index);
+                        }
+                        got = true;
+                        break;
+                    } catch (RangesRefused e) {
+                        refused.set(true);
+                        return;
+                    } catch (Throwable t) {
+                        if (cancelled.get()) return;
+                        AppLog.i("下载: 段 " + index + " 第 " + (attempt + 1) + " 次失败: " + t);
+                        synchronized (failureLock) {
+                            failure[0] = t.toString();
+                        }
+                        try {
+                            Thread.sleep(1000L << attempt);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                     }
-                } catch (RangesRefused e) {
-                    refused.set(true);
+                }
+                if (!got) {
+                    stopped.set(true);
                     return;
-                } catch (Throwable t) {
-                    if (cancelled.get()) return;
-                    synchronized (failureLock) {
-                        if (failure[0] == null) failure[0] = t.toString();
-                    }
-                    AppLog.i("下载: 段 " + index + " 失败: " + t);
                 }
             }
         };
@@ -231,7 +285,7 @@ final class Downloader {
     private static long fetchInto(String url, File part, long start, long end, AtomicLong held,
                                   long total, Progress progress, AtomicBoolean cancelled)
             throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = open(url);
         try {
             Tls.apply(c);
             c.setInstanceFollowRedirects(true);
@@ -261,7 +315,7 @@ final class Downloader {
             }
             return at - start;
         } finally {
-            c.disconnect();
+            shut(c);
         }
     }
 
@@ -302,7 +356,7 @@ final class Downloader {
         }
         if (expected > 0 && have == expected) return null;
 
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = open(url);
         try {
             Tls.apply(c);
             c.setInstanceFollowRedirects(true);
@@ -342,7 +396,29 @@ final class Downloader {
             if (total > 0 && received < total) return "只收到 " + received + " / " + total + " 字节";
             return null;
         } finally {
-            c.disconnect();
+            shut(c);
+        }
+    }
+
+    /**
+     * How much of the image is really held, from the chunk marks rather than the file's length.
+     *
+     * The file is grown to the full size before the first byte is fetched (that is what makes each
+     * worker able to write at its own offset), so its length says nothing about progress — with it
+     * a download that had just started looked complete.
+     */
+    static long held(File part, File marks, long total) {
+        if (!part.exists()) return 0;
+        if (!marks.exists()) return 0;
+        try {
+            byte[] done = java.nio.file.Files.readAllBytes(marks.toPath());
+            long sum = 0;
+            int count = (int) ((total + CHUNK - 1) / CHUNK);
+            for (int i = 0; i < count && i < done.length; i++)
+                if (done[i] == 1) sum += chunkSize(i, total);
+            return sum;
+        } catch (Throwable t) {
+            return 0;
         }
     }
 

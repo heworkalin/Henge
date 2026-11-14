@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "cpu.h"
 #include "jit_region.h"
@@ -297,6 +298,10 @@ typedef struct HvMachine {
        count (days of uptime) macOS 12 took the user as idle for that long and put itself to sleep while
        still starting up: its window server never drew. */
     uint64_t cntvoff;
+    /* Set when the run is being replaced: every CPU returns from hv_run. A finished restore leaves
+       its guest spinning (a panic ends in a wfe loop), so a second attempt has to be able to say
+       "stop" to the first one instead of waiting for it to return on its own. */
+    volatile int stop;
 } HvMachine;
 
 static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
@@ -348,6 +353,7 @@ void hv_pc_hist_note(HvCpu *cpu);
 void hv_pc_hist_note_va(int index, uint64_t va);
 uint64_t hv_pc_hist_last(int index);
 void hv_pc_hist_dump(HvCpu *cpu);
+void hv_pc_hist_dump_path(HvCpu *cpu, FILE *f);
 void hv_pc_hist_dump_file(HvCpu *cpu);
 void hv_trace_ring_dump(HvCpu *cpu);
 void hv_helper_hist_dump(HvCpu *cpu);

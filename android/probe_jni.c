@@ -161,6 +161,8 @@ extern void hv_android_vm_teardown(void);
 /* Built by install.c: creating the two images, and the installer itself. */
 extern int hv_android_make_aux(const char *path);
 extern int hv_android_make_disk(const char *path, uint64_t bytes);
+extern void hv_android_install_stop(void);
+
 extern int hv_android_install_start(const char *rom, const char *disk, const char *aux,
                                     const char *ipsw, const char *workdir, int ram_mb, int ncpus,
                                     uint64_t ecid, const char *cache_dir, char *report, size_t cap);
@@ -264,6 +266,13 @@ Java_dev_henge_probe_Native_nativeInstallStart(JNIEnv *env, jclass clazz, jstrin
     jstring result = (*env)->NewStringUTF(env, out);
     free(out);
     return result;
+}
+
+/* Ends the running install: its CPUs stop and the machine can be built again. */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeInstallStop(JNIEnv *env, jclass clazz) {
+    (void)env, (void)clazz;
+    hv_android_install_stop();
 }
 
 /* "step 3 42% running" — the installer's own steps, from idevicerestore. */

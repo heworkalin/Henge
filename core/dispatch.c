@@ -1186,6 +1186,7 @@ static int run_loop(HvCpu *cpu, int one) {
     }
     unpark(cpu);
     for (;;) {
+        if (__atomic_load_n(&m->stop, __ATOMIC_RELAXED)) return HV_EXIT_HALT;
         if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) {
             stop_the_world(cpu);
             pending_chain = NULL;

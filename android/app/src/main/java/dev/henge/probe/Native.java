@@ -60,4 +60,7 @@ final class Native {
 
     /** idevicerestore's step, its percentage, and whether it is running, done or failed. */
     static native String nativeInstallStatus();
+
+    /** Ends the running install; the next attempt builds a fresh machine. */
+    static native void nativeInstallStop();
 }

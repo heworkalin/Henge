@@ -56,6 +56,8 @@ public class DownloadService extends Service {
         volatile long etaMs;
         /** The finished file, once there is one. */
         volatile File file;
+        /** True when bytes have stopped arriving long enough that "is it alive?" is a fair question. */
+        volatile boolean stalled;
     }
 
     private static final State STATE = new State();
@@ -95,7 +97,8 @@ public class DownloadService extends Service {
     }
 
     static boolean running() {
-        return STATE.phase.equals(State.RUNNING);
+        Thread w = worker;
+        return STATE.phase.equals(State.RUNNING) && w != null && w.isAlive();
     }
 
     /** Asks the service to download `release` into the app's own directory. */
@@ -148,7 +151,22 @@ public class DownloadService extends Service {
         createChannel(this);
 
         if (intent != null && ACTION_CANCEL.equals(intent.getAction())) {
+            /* Interrupt is not enough: the read that is holding the worker is inside a socket and
+               does not see it. Disconnecting is what makes it return — and the state is set here,
+               not in the worker, so the button and the notification change on the next frame. */
+            Downloader.abort();
             if (worker != null) worker.interrupt();
+            if (STATE.phase.equals(State.RUNNING)) {
+                STATE.phase = State.CANCELLED;
+                STATE.message = "已停止，可续传";
+                STATE.stalled = false;
+                AppLog.i("下载服务: 已停止");
+                notifyListeners();
+                NotificationManager nm0 = getSystemService(NotificationManager.class);
+                if (nm0 != null) nm0.cancel(NOTIFY_ID);
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            }
+            stopSelf();
             return START_NOT_STICKY;
         }
 
@@ -190,6 +208,8 @@ public class DownloadService extends Service {
         STATE.file = new File(vm, name + ".ipsw");
         notifyListeners();
 
+        lastBytesAt = android.os.SystemClock.elapsedRealtime();
+        watchForStalls();
         worker = new Thread(() -> {
             File part = new File(STATE.file.getPath() + ".part");
             final long[] lastReport = {0L};
@@ -202,6 +222,8 @@ public class DownloadService extends Service {
                     (received, total) -> {
                         // The counters are always current; the reporting is rationed.
                         STATE.received = received;
+                        STATE.stalled = false;
+                        lastBytesAt = android.os.SystemClock.elapsedRealtime();
                         if (total > 0) STATE.total = total;
                         long now = android.os.SystemClock.elapsedRealtime();
                         if (now - lastReport[0] < REPORT_INTERVAL_MS) return;
@@ -225,6 +247,7 @@ public class DownloadService extends Service {
                         notifyListeners();
                     },
                     cancelled);
+            STATE.stalled = false;
             if (cancelled.get() || Thread.currentThread().isInterrupted()) {
                 STATE.phase = State.CANCELLED;
                 STATE.message = "已停止，可续传";
@@ -253,6 +276,37 @@ public class DownloadService extends Service {
             stopSelf();
         }, "henge-download");
         worker.start();
+    }
+
+    /** When the last byte arrived, for the stall watchdog. */
+    private volatile long lastBytesAt;
+
+    /**
+     * Says so when bytes stop arriving.
+     *
+     * A CDN that stops answering, a radio that drops, a connection left open by a middlebox: all
+     * of them leave the counters frozen while the download is technically still running, and a
+     * frozen counter is indistinguishable from a frozen app. Nothing here prints a speed it did
+     * not measure — it only admits that nothing has been measured for a while.
+     */
+    private void watchForStalls() {
+        final android.os.Handler h = new android.os.Handler(getMainLooper());
+        final Runnable[] tick = new Runnable[1];
+        tick[0] = () -> {
+            if (!STATE.phase.equals(State.RUNNING)) return;
+            long quiet = android.os.SystemClock.elapsedRealtime() - lastBytesAt;
+            if (quiet > 5_000 && !STATE.stalled) {
+                STATE.stalled = true;
+                STATE.speed = 0;
+                STATE.etaMs = 0;
+                STATE.message = "网络无响应，正在重试…";
+                updateNotification("正在下载 " + STATE.name + "（等待网络）", 0, 0, true);
+                notifyListeners();
+                AppLog.i("下载服务: " + (quiet / 1000) + " 秒没有收到数据，等待中");
+            }
+            h.postDelayed(tick[0], 1000);
+        };
+        h.postDelayed(tick[0], 1000);
     }
 
     private void updateNotification(String text, int percent, long total, boolean indeterminate) {
