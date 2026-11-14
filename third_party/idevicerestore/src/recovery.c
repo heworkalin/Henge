@@ -625,9 +625,18 @@ int recovery_send_kernelcache(struct idevicerestore_client_t* client, plist_t bu
 	irecv_usb_control_transfer(client->recovery->client, 0x21, 1, 0, 0, 0, 0, 5000);
 
 	if (client->restore_boot_args) {
-		char setba[256];
+		char setba[512];
 		strcpy(setba, "setenv boot-args ");
 		strcat(setba, client->restore_boot_args);
+		/* HengeVM: HV_RESTORE_BOOT_ARGS also lands here, which is the command the kernel is
+		   actually booted with (the DFU stage's setenvnp is overwritten by this one). Its own
+		   note: "serial=3" puts the restore kernel's log on the UART. */
+		const char *extra = getenv("HV_RESTORE_BOOT_ARGS");
+		if (extra && *extra) {
+			strcat(setba, " ");
+			strncat(setba, extra, sizeof(setba) - strlen(setba) - 1);
+		}
+		logger(LL_INFO, "HengeVM: sending [%s]\n", setba);
 		recovery_error = irecv_send_command(client->recovery->client, setba);
 	}
 

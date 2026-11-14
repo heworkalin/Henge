@@ -15,6 +15,13 @@ limit=${2:-180}
 tries=${3:-4}
 cd "$ROOT" || exit 1
 
+# One at a time: every run owns work/ (the sparse disk, the aux image, the dumps), so two runs
+# share those files and silently corrupt each other's evidence.
+if pgrep -f "^$ROOT/build/host/host-install" >/dev/null; then
+    echo "another host-install is running; stop it first (pgrep -af host-install)" >&2
+    exit 1
+fi
+
 run_once() {
     rm -f work/disk.img work/aux.img
     env CURL_CA_BUNDLE="$ROOT/work/ca-bundle.pem" \

@@ -418,7 +418,43 @@ static void *monitor_thread(void *arg) {
            delivered, and only these say which of the gates is shut. */
         if (g_board.gic) {
             HvGicCpu *g = &g_board.gic->cpu[0];
-            fprintf(stderr, "hengevm: gic ppi27 en %u grp %u prio %02x pmr %02x igrpen1 %llu "
+            /* If the kernel panicked, its message is in guest RAM; the console is not saying
+           anything, so the memory is the only place to read it from. */
+        if (getenv("HENGE_DUMP_RAM_AT") && getenv("HENGE_DUMP_RAM_AT")[0] &&
+            samples == (uint64_t) atoi(getenv("HENGE_DUMP_RAM_AT")) / 2) {
+            const char *wd = getenv("HV_BLOCK_DUMP");
+            if (!wd || !*wd) wd = "/home/he/Henge/work";
+            fprintf(stderr, "hengevm: dump checkpoint at %.0fs into %s\n",
+                    (double) (mach_absolute_time() - t0) / 24000000.0, wd);
+            {
+                char dp[512];
+                snprintf(dp, sizeof dp, "%s", wd);
+                char *sl = strrchr(dp, '/');
+                if (sl) snprintf(sl + 1, sizeof dp - (size_t)(sl + 1 - dp), "ram_end.bin");
+                FILE *f = fopen(dp, "wb");
+                if (f) {
+                    size_t total = 0;
+                    for (int r = 0; r < g_machine.nram; r++) {
+                        HvRam *ram = &g_machine.ram[r];
+                        size_t n = ram->size;
+                        if (n > (192u << 20)) n = 192u << 20;   /* the interesting half */
+                        uint8_t *buf = malloc(1u << 20);
+                        for (size_t off = 0; off < n && buf; off += 1u << 20) {
+                            size_t chunk = n - off < (1u << 20) ? n - off : (1u << 20);
+                            if (hv_phys_read(&g_machine, ram->pa + off, buf, chunk) != 0) break;
+                            fwrite(buf, 1, chunk, f);
+                            total += chunk;
+                        }
+                        free(buf);
+                        if (total > (320u << 20)) break;
+                    }
+                    fclose(f);
+                    fprintf(stderr, "hengevm: dumped %zu bytes of RAM at %.0fs\n", total,
+                            (double) (mach_absolute_time() - t0) / 24000000.0);
+                }
+            }
+        }
+        fprintf(stderr, "hengevm: gic ppi27 en %u grp %u prio %02x pmr %02x igrpen1 %llu "
                             "ctlr %x line %d\n", g->enabled[27], g->group[27], g->priority[27],
                     (unsigned) (g->pmr & 0xff), (unsigned long long) g->igrpen1,
                     g_board.gic->ctlr, (int) g_machine.percpu[0].irq_line);
