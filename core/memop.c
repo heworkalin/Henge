@@ -9,6 +9,8 @@
 #include "machine.h"
 #include "mmu.h"
 
+static void ptw_note(HvCpu *cpu, uint64_t pa, uint64_t value, unsigned size, uint64_t pc, uint64_t va);
+
 /* Decoding follows the "Loads and Stores" encoding index of the Arm ARM. */
 
 static inline int64_t sext(uint64_t v, int bits) {
@@ -594,6 +596,11 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
             fprintf(stderr, "hengevm: watch: write %u bytes at %llx (pa %llx) value %llx pc %llx\n",
                     chunk, (unsigned long long) va, (unsigned long long) pa,
                     (unsigned long long) b[0], (unsigned long long) pc);
+        if (write) {
+            uint64_t v = 0;
+            for (uint32_t x = 0; x < chunk && x < 8; x++) v |= (uint64_t) b[x] << (8 * x);
+            ptw_note(cpu, pa, v, chunk, pc, va);
+        }
         if (hv_phys_ptr(cpu->m, pa, chunk)) {
             rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
         } else {
@@ -754,6 +761,22 @@ static void watch_store(HvCpu *cpu, uint64_t va, uint64_t v, unsigned len, uint6
     fclose(f);
 }
 
+/* Log a store that lands in a page the walk uses as a translation table. Page table entries are
+   installed through several paths (a plain store, an atomic exchange, a compare-and-swap, an
+   exclusive pair), and only logging all of them can say whether a missing entry was never written,
+   written and undone, or written somewhere else. */
+static void ptw_note(HvCpu *cpu, uint64_t pa, uint64_t value, unsigned size, uint64_t pc, uint64_t va) {
+    if (!cpu->m->ptw_log) return;
+    uint64_t page = pa & ~0xfffull;
+    for (uint32_t k = 0; k < cpu->m->ptw_n && k < 512; k++) {
+        if (cpu->m->ptw_pages[k] != page) continue;
+        fprintf(stderr, "hengevm: ptw %llx [%llu] = %016llx size %u pc %llx (va %llx)\n",
+                (unsigned long long) pa, (unsigned long long) ((pa - page) / 8),
+                (unsigned long long) value, size, (unsigned long long) pc, (unsigned long long) va);
+        return;
+    }
+}
+
 static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t pc) {
     int size = op->size;
     uint32_t bytes = 1u << size;
@@ -772,6 +795,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         } else {
             old = 0;
             if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
+            if (old == (s & mask)) ptw_note(cpu, pa, desired, bytes, pc, va);
             if (old == (s & mask) && hv_phys_write(cpu->m, pa, &desired, bytes)) goto external;
         }
         set_gpr(cpu, op->rs, old);
@@ -786,6 +810,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         old = 0;
         if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
         uint64_t n = atomic_result(op->atomic_op, size, old, s);
+        ptw_note(cpu, pa, n, bytes, pc, va);
         if (hv_phys_write(cpu->m, pa, &n, bytes)) goto external;
     }
     set_gpr(cpu, op->rt, old & mask);
@@ -822,6 +847,8 @@ static int do_casp(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t 
         o0 = le(buf, esize);
         o1 = le(buf + esize, esize);
         if (o0 == c0 && o1 == c1) {
+            ptw_note(cpu, pa, n0, esize, pc, va);
+            ptw_note(cpu, pa + esize, n1, esize, pc, va);
             if (hv_phys_write(cpu->m, pa, &n0, esize) || hv_phys_write(cpu->m, pa + esize, &n1, esize)) goto external;
         }
     }
@@ -858,6 +885,8 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
     if (cpu->excl_addr == va && cpu->excl_size == bytes) watch_store(cpu, va, n0, esize, pc, "exclusive");
     if (cpu->excl_addr == va && cpu->excl_size == bytes) {
         if (!host) {
+            ptw_note(cpu, pa, n0, esize, pc, va);
+            if (pair) ptw_note(cpu, pa + esize, n1, esize, pc, va);
             ok = !hv_phys_write(cpu->m, pa, &n0, esize) && (!pair || !hv_phys_write(cpu->m, pa + esize, &n1, esize));
         } else if (!pair) {
             uint64_t expect = cpu->excl_val[0];
@@ -943,6 +972,37 @@ static void pred_stat(HvCpu *cpu, const HvMemOp *op, uint64_t va, uint64_t pc, i
                 k_n ? 100.0 * k_reg / k_n : 0, k_n ? 100.0 * k_site / k_n : 0);
         n = reg_hit = site_hit = either = any_hit = sp_n = sp_hit = k_n = k_reg = k_site = 0;
     }
+}
+
+/* Page table pages, sampled and diffed: a slot that changes is a page table entry being
+   written, and the order of changes is the order the kernel installed them. Sampling costs a
+   few pages copied per interval and catches writes from every path, including the ones the
+   JIT emits directly into a translated block. */
+void hv_ptw_sample(HvMachine *m) {
+    if (!m->ptw_log || !m->ptw_n) return;
+    size_t page = 0x1000, total = (size_t) m->ptw_n * page;
+    if (!m->ptw_shadow) {
+        m->ptw_shadow = calloc(1, 512 * page);
+        if (!m->ptw_shadow) return;
+        total = 0; /* first sample: record everything, so the baseline is the real contents */
+    }
+    for (uint32_t k = 0; k < m->ptw_n && k < 512; k++) {
+        uint8_t now[0x1000];
+        if (hv_phys_read(m, m->ptw_pages[k], now, sizeof now) != 0) continue;
+        uint8_t *was = m->ptw_shadow + (size_t) k * page;
+        for (size_t off = 0; off < page; off += 8) {
+            uint64_t a, b;
+            memcpy(&a, was + off, 8);
+            memcpy(&b, now + off, 8);
+            if (a == b) continue;
+            fprintf(stderr, "hengevm: ptw %llx [%zu] %016llx -> %016llx (blocks %llu)\n",
+                    (unsigned long long) m->ptw_pages[k], off / 8,
+                    (unsigned long long) a, (unsigned long long) b,
+                    (unsigned long long) m->stats.blocks);
+            memcpy(was + off, &b, 8);
+        }
+    }
+    (void) total;
 }
 
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {

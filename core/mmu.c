@@ -99,6 +99,16 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
         }
         if (level < 3 && (desc & 2)) { /* table */
             base = desc & OA_MASK & ~((1ull << g) - 1);
+            if (cpu->m && cpu->m->ptw_log) {
+                HvMachine *m = cpu->m;
+                /* Sampled from here because it is the one path every access goes through; the
+                   block loop is bypassed by chaining, so counting there samples almost never. */
+                if (m->ptw_snap_every && ++m->ptw_walks % m->ptw_snap_every == 0) hv_ptw_sample(m);
+                uint64_t page = base & ~0xfffull;
+                uint32_t k = 0;
+                for (; k < m->ptw_n && k < 512; k++) if (m->ptw_pages[k] == page) break;
+                if (k == m->ptw_n && m->ptw_n < 512) m->ptw_pages[m->ptw_n++] = page;
+            }
             if (!hpd) {
                 pxn_table |= (desc >> 59) & 1;
                 uxn_table |= (desc >> 60) & 1;

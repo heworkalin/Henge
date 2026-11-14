@@ -19,7 +19,7 @@ env CURL_CA_BUNDLE="$ROOT/work/ca-bundle.pem" \
     ${HV_TRACE:+HV_TRACE=$HV_TRACE} ${HV_LOG:+HV_LOG=$HV_LOG} \
     "$ROOT/build/host/host-install" "$ROOT/work/AVPBooter.vmapple2.bin" \
     "$ROOT/android/ipsw/24G90.ipsw" "$ROOT/work" 4096 2 2>&1 |
-    grep -a --line-buffered -E "el1 data abort|hengevm:  |hengevm: block|executed from|exception type|^step|restore (failed|finished)|Error" > "$log" &
+    grep -a --line-buffered -E "el1 data abort|hengevm:  |hengevm: ptw |hengevm: block|executed from|exception type|^step|restore (failed|finished)|Error" > "$log" &
 pid=$!
 start=$(date +%s)
 while kill -0 "$pid" 2>/dev/null; do

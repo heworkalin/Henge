@@ -246,6 +246,17 @@ typedef struct HvMachine {
     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
     int gen_checks;
     int trace;           /* print every block entered */
+    /* Every page the MMU walk has followed as a translation table, and whether stores into
+       those pages should be logged. A page table entry that is missing when the kernel needs it
+       is either a write that never happened, one that was undone, or one that landed in a
+       different slot; logging the writes into the tables tells those three apart without
+       guessing which kernel function to break on. */
+    int ptw_log;
+    uint32_t ptw_n;
+    uint64_t ptw_pages[512];
+    uint8_t *ptw_shadow;         /* the same pages as last sampled: the diff is the write history */
+    uint32_t ptw_snap_every;     /* in walks; 0 = never */
+    uint32_t ptw_walks;
     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
     uint64_t switch_flush_pc[4]; /* HV_SWITCH_FLUSH=3: PCs of the TLBI VMALLE1s seen within 20 us of a TTBR0 change (xnu's pmap switch) */
@@ -356,6 +367,7 @@ void hv_pc_hist_dump(HvCpu *cpu);
 void hv_pc_hist_dump_path(HvCpu *cpu, FILE *f);
 void hv_pc_hist_dump_file(HvCpu *cpu);
 void hv_trace_ring_dump(HvCpu *cpu);
+void hv_ptw_sample(HvMachine *m);
 void hv_helper_hist_dump(HvCpu *cpu);
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 

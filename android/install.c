@@ -242,6 +242,16 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     /* HV_TRACE keeps the last 256 block entries (VA, x0, x4) so a fault can be read backwards;
        the per-block print stays at log 4, or tracing would be the noise it is meant to explain. */
     g_machine.trace = getenv("HV_TRACE") != NULL;
+    /* HV_PTW_LOG: record writes into pages the walk is using as translation tables, and
+       HV_SLOW_MEM: send every load and store through C so those writes are all visible. */
+    g_machine.ptw_log = getenv("HV_PTW_LOG") != NULL;
+    /* HV_PTW_SNAP: sample the tables every N blocks and keep the differences, which is the
+       write history of every entry without slowing the guest down to catch the stores. */
+    g_machine.ptw_snap_every = getenv("HV_PTW_SNAP") ? (uint32_t) atoi(getenv("HV_PTW_SNAP")) : 0;
+    if (g_machine.ptw_log)
+        fprintf(stderr, "hengevm: ptw log on, sampling every %u blocks\n", g_machine.ptw_snap_every);
+    /* slow_mem is switched on when the kernel starts, not here: the firmware's own boot does not
+       survive every access going through C, and its part of the run is not what is being read. */
     /*
      * Every translated block, written to the work directory: the guest words it came from and the
      * host words it became. A register that goes wrong in translated code cannot be explained from

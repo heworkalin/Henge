@@ -1378,6 +1378,7 @@ static int run_loop(HvCpu *cpu, int one) {
                             if (hv_phys_read(cpu->m, pa, h, sizeof h) != 0) continue;
                             if (!kf_is_kernel(h)) continue;
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
+                            if (getenv("HV_SLOW_MEM")) cpu->m->slow_mem = 1;
                             kernel_fixups(cpu->m, pa, pa + off_k);
                             /* The moment worth keeping: the firmware has finished with the image
                                and the kernel has not run yet, so whatever is wrong in it is the
@@ -1888,6 +1889,7 @@ static int run_loop(HvCpu *cpu, int one) {
         cpu->last_stub = 0;
         cpu->icount++;
         m->stats.blocks++;
+
         if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= m->jit.used || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
             fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
