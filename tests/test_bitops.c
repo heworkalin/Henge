@@ -99,6 +99,17 @@ static int run_one(const char *name, void *code_run, size_t off, size_t len, HvM
            (unsigned long long) cpu.x[10], (unsigned long long) cpu.x[11]);
     if (r != HV_EXIT_HALT) {
         hv_pc_hist_dump(&cpu);   /* which block was running when it went wrong */
+        {   /* The last exception transitions, with what the guest was doing. */
+            HvStats *st = &m->stats;
+            printf("  elchg: nelchg %u exceptions %llu\n", st->nelchg,
+                   (unsigned long long) m->stats.exceptions);
+            for (int k = 15; k >= 0; k--) {
+                uint32_t i = (st->nelchg - 1 - (uint32_t) k) & 15;
+                printf("  elchg: from %#llx spsr %#llx kind %u el %u esr %#llx\n",
+                       (unsigned long long) st->elchg[i].from, (unsigned long long) st->elchg[i].spsr,
+                       st->elchg[i].kind, st->elchg[i].el, (unsigned long long) st->elchg[i].to);
+            }
+        }
         printf("%s: dispatcher returned %d at pc %#llx (insn %08x) esr %#llx far %#llx\n", name, r,
                (unsigned long long) cpu.pc, cpu.exit_insn, (unsigned long long) cpu.esr_el1,
                (unsigned long long) cpu.far_el1);

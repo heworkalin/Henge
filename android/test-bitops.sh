@@ -62,12 +62,19 @@ cat > "$OUT/tid.c" <<'EOF'
 int pthread_gettid_np(pthread_t t) { (void)t; return 0; }
 EOF
 
+# A header change moves every struct offset, and an object built against the old layout is a
+# crash somewhere else with no compile error to point at it. Same rule as the install build.
+stale() {
+    [ -f "$1" ] || return 0
+    [ "$1" -nt "$2" ] || return 0
+    [ -n "$(find core host devices android/compat/include -name '*.h' -newer "$1" -print -quit 2>/dev/null)" ]
+}
 for f in core/*.c host/jit_region.c android/compat/compat_android.c; do
     o="$OUT/$(basename "$f" .c).o"
-    [ -f "$o" ] && [ "$o" -nt "$f" ] || $CC $CFLAGS -c "$f" -o "$o"
+    if stale "$o" "$f"; then $CC $CFLAGS -c "$f" -o "$o" || exit 1; fi
 done
-[ -f "$OUT/enter.o" ] || $CC -c host/enter.S -o "$OUT/enter.o"
-[ -f "$OUT/tid.o" ] || $CC $CFLAGS -c "$OUT/tid.c" -o "$OUT/tid.o"
+if stale "$OUT/enter.o" host/enter.S; then $CC -c host/enter.S -o "$OUT/enter.o" || exit 1; fi
+if stale "$OUT/tid.o" "$OUT/tid.c"; then $CC $CFLAGS -c "$OUT/tid.c" -o "$OUT/tid.o" || exit 1; fi
 
 $CC $CFLAGS tests/test_bitops.c "$OUT"/*.o -o "$OUT/test_bitops" -lpthread -lm -latomic
 exec "$OUT/test_bitops"
