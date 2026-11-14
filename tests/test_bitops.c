@@ -121,6 +121,46 @@ static int run_one(const char *name, void *code_run, size_t off, size_t len, HvM
     return diffs != 0;
 }
 
+/* One iteration: fill the operands the same way for both runs, run both, compare results. */
+static int fuzz_round(HvMachine *m, void *code_run, int round) {
+    static uint8_t want[8192] __attribute__((aligned(4096)));
+    uint64_t s = 0x9e3779b97f4a7c15ull * (uint64_t) (round + 1);
+    for (int i = 0; i < 0x400; i += 8) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        *(uint64_t *) (want + i) = s;
+    }
+    memset(want + 0x400, 0xcc, 768);
+    memcpy(out_buf, want, sizeof want);
+
+    void (*native)(void *) = (void (*)(void *)) ((uint8_t *) code_run + BITOPS_OFF);
+    native(want);
+
+    static HvCpu cpu;
+    hv_cpu_reset(&cpu, m);
+    cpu.cpacr_el1 = 3u << 20;
+    cpu.sp = (uint64_t)(uintptr_t) out_stack + sizeof out_stack - 256;
+    cpu.x[0] = (uint64_t)(uintptr_t) out_buf;
+    cpu.x[30] = (uint64_t)(uintptr_t) code_run + LANDING;
+    cpu.pc = (uint64_t)(uintptr_t) code_run + BITOPS_OFF;
+    m->stop_pc = (uint64_t)(uintptr_t) code_run + LANDING;
+    int r = hv_run(&cpu);
+    if (r != HV_EXIT_HALT) {
+        printf("fuzz %d: dispatcher returned %d at pc %#llx\n", round, r, (unsigned long long) cpu.pc);
+        return 1;
+    }
+    for (int i = 0; i < 768; i++) {
+        if (want[0x400 + i] != out_buf[0x400 + i]) {
+            uint64_t a, b;
+            memcpy(&a, want + 0x400 + (i & ~7), 8);
+            memcpy(&b, out_buf + 0x400 + (i & ~7), 8);
+            printf("fuzz %d: result +%d native %016llx jit %016llx\n", round, i & ~7,
+                   (unsigned long long) a, (unsigned long long) b);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     struct sigaction sa;
@@ -152,6 +192,13 @@ int main(void) {
     hv_machine_add_ram(&m, (uint64_t)(uintptr_t) out_stack, sizeof out_stack, out_stack, 0);
 
     int failed = 0;
+    /* Operands from the buffer: a thousand rounds is a thousand sets of values through the same
+       instruction sequence, and a round costs a few milliseconds. */
+    int rounds = getenv("ROUNDS") ? atoi(getenv("ROUNDS")) : 200;
+    int bad = 0;
+    for (int i = 0; i < rounds && bad < 5; i++) bad += fuzz_round(&m, code_run, i);
+    printf("fuzz: %d rounds, %d disagreements\n", rounds, bad);
+
     const char *only = getenv("ONLY");
     if (!only || !strcmp(only, "bitops"))
         failed += run_one("bitops", code_run, BITOPS_OFF, BITOPS_LEN, &m, 768);

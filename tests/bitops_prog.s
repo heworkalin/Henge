@@ -21,37 +21,25 @@ bitops_prog:
     stp     q10, q11, [sp, #112]
     stp     q12, q13, [sp, #144]
     stp     q14, q15, [sp, #176]
-    movz    x1, #0x1234, lsl #16
-    movk    x1, #0xabcd, lsl #48
-    movz    x2, #0x00ff
-    movk    x2, #0xff00, lsl #32
-    movz    x3, #0xffff
-    movz    x4, #1
-    /* Every register the program writes is seeded here first: a read-modify-write form like bfxil
-       would otherwise start from whatever the caller left behind, which is not a property of the
-       instruction being tested. */
-    movz    x5, #0x1111
-    movz    x6, #0x2222, lsl #16
-    movz    x7, #0x3333, lsl #16
-    movz    x8, #0x4444, lsl #32
-    movz    x9, #0x5555, lsl #32
-    movz    x10, #0x6666, lsl #48
-    movz    x11, #0x7777
-    movz    x12, #0x8888, lsl #16
-    movz    x13, #0x9999, lsl #32
-    movz    x14, #0xaaaa
-    movz    x15, #0xbbbb, lsl #16
-    movz    x16, #0xcccc, lsl #32
-    movz    x17, #0xdddd, lsl #48
-    movz    x18, #0xeeee, lsl #16
-    movz    x19, #0x0191
-    movz    x20, #0x0292, lsl #16
-    movz    x21, #0x0393, lsl #16
-    movz    x22, #0x0494, lsl #32
-    movz    x23, #0x0595, lsl #48
-    movz    x24, #0x0696, lsl #16
-    lsl     x5, x4, #37
-    orr     x5, x5, #0x7ff
+    // Operands come from the buffer, so the same program can be run over and over with different
+    // values: the identical bytes are loaded by the native run and by the JIT run.
+    add     x25, x0, #0x400
+    ldp     x1, x2, [x0]
+    ldp     x3, x4, [x0, #16]
+    ldp     x5, x6, [x0, #32]
+    ldp     x7, x8, [x0, #48]
+    ldp     x9, x10, [x0, #64]
+    ldp     x11, x12, [x0, #80]
+    ldp     x13, x14, [x0, #96]
+    ldp     x15, x16, [x0, #112]
+    ldp     x17, x18, [x0, #128]
+    ldp     x19, x20, [x0, #144]
+    ldp     x21, x22, [x0, #160]
+    ldp     x23, x24, [x0, #176]
+    ldp     q0, q1, [x0, #192]
+    ldp     q2, q3, [x0, #224]
+    ldp     q4, q5, [x0, #256]
+    ldp     q6, q7, [x0, #288]
     // bitfields
     ubfx    x6, x1, #3, #11
     sbfx    x7, x1, #17, #23
@@ -107,34 +95,34 @@ bitops_prog:
     sli     v30.8h, v2.8h, #5
     sri     v31.8h, v2.8h, #4
     // store everything
-    stp     x1, x2, [x0]
-    stp     x3, x4, [x0, #16]
-    stp     x5, x6, [x0, #32]
-    stp     x7, x8, [x0, #48]
-    stp     x9, x10, [x0, #64]
-    stp     x11, x12, [x0, #80]
-    stp     x13, x14, [x0, #96]
-    stp     x15, x16, [x0, #112]
-    stp     x17, x18, [x0, #128]
-    stp     x19, x20, [x0, #144]
-    stp     x21, x22, [x0, #160]
-    stp     x23, x24, [x0, #176]
-    stp     q0, q1, [x0, #192]
-    stp     q2, q3, [x0, #224]
-    stp     q4, q5, [x0, #256]
-    stp     q6, q7, [x0, #288]
-    stp     q8, q9, [x0, #320]
-    stp     q10, q11, [x0, #352]
-    stp     q12, q13, [x0, #384]
-    stp     q14, q15, [x0, #416]
-    stp     q16, q17, [x0, #448]
-    stp     q18, q19, [x0, #480]
-    stp     q20, q21, [x0, #512]
-    stp     q22, q23, [x0, #544]
-    stp     q24, q25, [x0, #576]
-    stp     q26, q27, [x0, #608]
-    stp     q28, q29, [x0, #640]
-    stp     q30, q31, [x0, #672]
+    stp     x1, x2, [x25]
+    stp     x3, x4, [x25, #16]
+    stp     x5, x6, [x25, #32]
+    stp     x7, x8, [x25, #48]
+    stp     x9, x10, [x25, #64]
+    stp     x11, x12, [x25, #80]
+    stp     x13, x14, [x25, #96]
+    stp     x15, x16, [x25, #112]
+    stp     x17, x18, [x25, #128]
+    stp     x19, x20, [x25, #144]
+    stp     x21, x22, [x25, #160]
+    stp     x23, x24, [x25, #176]
+    stp     q0, q1, [x25, #192]
+    stp     q2, q3, [x25, #224]
+    stp     q4, q5, [x25, #256]
+    stp     q6, q7, [x25, #288]
+    stp     q8, q9, [x25, #320]
+    stp     q10, q11, [x25, #352]
+    stp     q12, q13, [x25, #384]
+    stp     q14, q15, [x25, #416]
+    stp     q16, q17, [x25, #448]
+    stp     q18, q19, [x25, #480]
+    stp     q20, q21, [x25, #512]
+    stp     q22, q23, [x25, #544]
+    stp     q24, q25, [x25, #576]
+    stp     q26, q27, [x25, #608]
+    stp     q28, q29, [x25, #640]
+    stp     q30, q31, [x25, #672]
     ldp     x19, x20, [sp]
     ldp     x21, x22, [sp, #16]
     ldp     x23, x24, [sp, #32]
