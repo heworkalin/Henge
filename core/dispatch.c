@@ -1734,6 +1734,7 @@ static int run_loop(HvCpu *cpu, int one) {
                         last_icount = cpu->icount;
                     }
                 }
+                hv_mmio_hist_dump(cpu->m);
                 fprintf(stderr, "hengevm: beat pc %llx el%u icount %llu blocks %llu why %d "
                                 "slow_mem %d memops %llu\n",
                         (unsigned long long) cpu->pc, cpu->el,

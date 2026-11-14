@@ -552,6 +552,45 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
     return r->host + (pa - r->pa);
 }
 
+/* Where the guest actually looks. A poll loop that never sees its device become ready shows up
+   here as one register with a large read count and nothing written, which names the register block
+   that is not being modelled correctly -- the pc alone never does. */
+#define HV_MMIO_HIST 512
+static struct {
+    int dev;
+    uint64_t off;
+    uint64_t rd, wr;
+} g_mmio_hist[HV_MMIO_HIST];
+static int g_mmio_hist_n;
+
+static void mmio_hist_note(HvMachine *m, HvMmio *d, uint64_t pa, int is_write) {
+    int dev = (int) (d - m->mmio);
+    uint64_t off = pa - d->pa;
+    for (int i = 0; i < g_mmio_hist_n; i++) {
+        if (g_mmio_hist[i].dev == dev && g_mmio_hist[i].off == off) {
+            if (is_write) g_mmio_hist[i].wr++; else g_mmio_hist[i].rd++;
+            return;
+        }
+    }
+    if (g_mmio_hist_n >= HV_MMIO_HIST) return;
+    g_mmio_hist[g_mmio_hist_n].dev = dev;
+    g_mmio_hist[g_mmio_hist_n].off = off;
+    g_mmio_hist[g_mmio_hist_n].rd = is_write ? 0 : 1;
+    g_mmio_hist[g_mmio_hist_n].wr = is_write ? 1 : 0;
+    g_mmio_hist_n++;
+}
+
+void hv_mmio_hist_dump(HvMachine *m) {
+    if (!g_mmio_hist_n) return;
+    fprintf(stderr, "hengevm: mmio histogram (%d registers touched, read/write):\n", g_mmio_hist_n);
+    for (int i = 0; i < g_mmio_hist_n; i++) {
+        HvMmio *d = &m->mmio[g_mmio_hist[i].dev];
+        fprintf(stderr, "hengevm:   %-12s +%#06llx  r %llu  w %llu\n", d->name,
+                (unsigned long long) g_mmio_hist[i].off,
+                (unsigned long long) g_mmio_hist[i].rd, (unsigned long long) g_mmio_hist[i].wr);
+    }
+}
+
 /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
 int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
     void *p = hv_phys_ptr(m, pa, len);
@@ -565,6 +604,7 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
     uint64_t v = d->read ? d->read(d->opaque, pa - d->pa, len) : 0;
     if (!d->self_locked) hv_dev_unlock(m);
     memcpy(buf, &v, len);
+    mmio_hist_note(m, d, pa, 0);
     if (m->log >= 3)
         fprintf(stderr, "mmio read  %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
                 (unsigned long long)v, (unsigned long long)m->access_pc);
@@ -593,6 +633,7 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     if (!d || len > 8) return -1;
     uint64_t v = 0;
     memcpy(&v, buf, len);
+    mmio_hist_note(m, d, pa, 1);
     if (m->log >= 3)
         fprintf(stderr, "mmio write %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
                 (unsigned long long)v, (unsigned long long)m->access_pc);

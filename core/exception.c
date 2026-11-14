@@ -536,10 +536,28 @@ static int vmapple_hvc(HvCpu *cpu, uint32_t fn) {
         cpu->x[2] = 0x3a2b1c0d6e5d4c3bull;
         return 1;
     }
-    case 0xc3000005:   /* VCPU_WFK */
-    case 0xc3000006:   /* VCPU_KICK: our CPUs are host threads and wake on their own interrupts */
+    case 0xc3000006: { /* VCPU_KICK: the kernel released a ticket lock and wakes the vcpu that is
+                          waiting for that ticket (osfmk/arm64/lock_ticket_pv.c). The id is the
+                          topology's phys_id, which for us is the cpu index. */
+        uint64_t id = (uint32_t) cpu->x[1];
         cpu->x[0] = 0;
+        if (id < (uint64_t) cpu->m->ncpus) {
+            HvCpu *t = &cpu->m->cpus[id];
+            pthread_mutex_lock(&t->pc_state->wake_mu);
+            t->pc_state->wake_pending = 1;
+            pthread_cond_signal(&t->pc_state->wake_cv);
+            pthread_mutex_unlock(&t->pc_state->wake_mu);
+        }
         return 1;
+    }
+    case 0xc3000005:   /* VCPU_WFK: hw_lck_ticket_lock_wait_pv() halted this vcpu with interrupts
+                          disabled and expects to be parked until a kick or an interrupt arrives,
+                          then to get the mask it passed in x1 back. Handled as a WFI so the run
+                          loop parks with the machine lock released. */
+        cpu->x[0] = 0;
+        if (cpu->x[1]) cpu->daif &= ~HV_PSTATE_I;
+        else cpu->daif |= HV_PSTATE_I;
+        return 2;
     default:
         return 0;
     }
@@ -673,7 +691,13 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 hvc_n++;
             }
         }
-        if (!vmapple_hvc(cpu, (uint32_t) cpu->x[0])) cpu->x[0] = psci(cpu, cpu->x[0]);
+        int hv = vmapple_hvc(cpu, (uint32_t) cpu->x[0]);
+        if (hv == 2) {   /* the call parks this cpu: same exit as a WFI, and pc moves on */
+            cpu->pc = pc + 4;
+            cpu->exit_reason = HV_EXIT_WFI;
+            return 1;
+        }
+        if (!hv) cpu->x[0] = psci(cpu, cpu->x[0]);
         if (!cpu->halted && !cpu->off) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
         cpu->pc = pc + 4;
         cpu->exit_reason = cpu->halted ? HV_EXIT_HALT : HV_EXIT_BRANCH; /* CPU_OFF: the dispatcher parks it */
