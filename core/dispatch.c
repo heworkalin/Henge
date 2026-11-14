@@ -354,6 +354,11 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
     pthread_mutex_unlock(&mu);
 }
 
+/* Where the host time of one block entry goes. A guest that crawls while the process is busy has
+   its cost somewhere between resolving the pc and leaving the translated code again, and only these
+   three numbers can say which. */
+static uint64_t g_t_lookup, g_t_enter, g_n_lookup, g_n_enter;
+
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
@@ -1189,13 +1194,18 @@ static uint32_t fw_n;
 static uint64_t ktrace[KTRACE_MAX];
 static uint32_t ktrace_n;
 
+uint64_t g_t_biglock, g_t_run; /* wall time a cpu spends waiting for the machine lock */
+
 int hv_run(HvCpu *cpu) {
     if (cpu->pc_state) cpu->pc_state->thread = mach_thread_self();
+    uint64_t t0 = mach_absolute_time();
     hv_big_lock(cpu->m);
+    g_t_biglock += mach_absolute_time() - t0;
     hv_fp_enter(cpu);
     int r = run(cpu, 0);
     hv_fp_leave(cpu);
     hv_big_unlock(cpu->m);
+    g_t_run += mach_absolute_time() - t0;
     return r;
 }
 
@@ -1333,7 +1343,10 @@ static int run_loop(HvCpu *cpu, int one) {
         }
         last_fault = ~0ull;
         uint64_t flushes = m->stats.block_flushes;
+        uint64_t tl0 = mach_absolute_time();
         HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail);
+        g_t_lookup += mach_absolute_time() - tl0;
+        g_n_lookup++;
         /* A full flush while translating freed the slot the last exit came through,
            and new blocks may have it now: chaining it would rewrite one of theirs. */
         if (m->stats.block_flushes != flushes) pending_chain = NULL;
@@ -1753,6 +1766,19 @@ static int run_loop(HvCpu *cpu, int one) {
                 {
                     extern unsigned long long hv_hvc_count, hv_hvc_last_fn, hv_hvc_last_pc;
                     static unsigned long long was;
+                    if (g_t_run) {
+                        fprintf(stderr, "hengevm: lock %.1f%% of run wall time (waiting %.1f ms/s) | ",
+                                100.0 * (double) g_t_biglock / (double) g_t_run,
+                                (double) g_t_biglock / 24000.0);
+                        g_t_biglock = g_t_run = 0;
+                    }
+                    if (g_n_enter) {
+                        fprintf(stderr, "hengevm: per block: lookup %.0f ns, enter %.0f ns (%llu blocks) | ",
+                                (double) g_t_lookup / 24.0 / (double) g_n_lookup,
+                                (double) g_t_enter / 24.0 / (double) g_n_enter,
+                                (unsigned long long) g_n_enter);
+                        g_t_lookup = g_t_enter = g_n_lookup = g_n_enter = 0;
+                    }
                     fprintf(stderr, "hengevm: hvc/s %llu (total %llu, last fn %llx pc %llx) | ",
                             hv_hvc_count - was, hv_hvc_count,
                             (unsigned long long) hv_hvc_last_fn, (unsigned long long) hv_hvc_last_pc);
@@ -2094,7 +2120,12 @@ static int run_loop(HvCpu *cpu, int one) {
                 dc_last = v;
             }
         }
-        hv_enter(cpu, b->code);
+        {
+            uint64_t te0 = mach_absolute_time();
+            hv_enter(cpu, b->code);
+            g_t_enter += mach_absolute_time() - te0;
+            g_n_enter++;
+        }
 
         /* An undefined instruction at EL1 is where the panic path traps to the debugger (the
            brk-like word XNU uses): the message panic() formatted is still in the frames above,
