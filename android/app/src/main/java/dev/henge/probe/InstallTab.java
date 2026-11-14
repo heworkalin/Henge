@@ -334,8 +334,17 @@ final class InstallTab {
         }, "henge-pipeline").start();
 
         action.setOnClickListener(v -> {
-            /* One button. While anything of the pipeline is running it stops it — the download,
-               the verification or the install, whichever it has reached. */
+            /* One button, and what is running decides what a tap means. The pipeline outlives the
+               screen that started it and the download service outlives the whole activity, so this
+               screen's own stage says nothing about whether something is running -- reading it is
+               what made a running install impossible to stop after a screen change. */
+            if (PIPELINE.get() || InstallService.running()) {
+                cancelled.set(true);
+                setAction(action, "正在停止…");
+                InstallService.requestStop(a);
+                Native.nativeInstallStop();
+                return;
+            }
             if (stage[0].equals("download") || DownloadService.running()) {
                 cancelled.set(true);
                 setAction(action, "正在停止…");
@@ -529,6 +538,13 @@ final class InstallTab {
         action.setText(label);
     }
 
+    /* Every write to the progress text must leave the snapshot in step: a screen rebuilt while
+       this runs repaints the snapshot, and a direct setText leaves it a message behind. */
+    private static void say(TextView text, String message) {
+        lastText = message;
+        text.setText(message);
+    }
+
     private static void showProgress(TextView text, android.widget.ProgressBar bar, String message) {
         lastText = message;
         text.setText(message);
@@ -565,7 +581,7 @@ final class InstallTab {
         File aux = new File(dir, AUX_NAME);
         File work = new File(dir, "work");
 
-        a.runOnUiThread(() -> progress.setText("准备引导 ROM…"));
+        a.runOnUiThread(() -> say(progress, "准备引导 ROM…"));
         // The ROM is not in the IPSW — it is inside Apple's system image, which is why this is a
         // separate, small download. See BootRom.
         String problem = BootRom.prepare(dir);
@@ -589,7 +605,7 @@ final class InstallTab {
         }
         AppLog.i("安装: " + started.replace('\n', ' '));
         final String first = started;
-        a.runOnUiThread(() -> progress.setText(first));
+        a.runOnUiThread(() -> say(progress, first));
 
         while (true) {
             if (cancelled.get()) return "已取消";
@@ -601,7 +617,7 @@ final class InstallTab {
             }
             final String shown = state;
             a.runOnUiThread(() -> {
-                progress.setText(shown);
+                say(progress, shown);
                 // The notification says the same thing as the screen: a user who left the app to
                 // do something else for a while should not have to come back to find out.
                 InstallService.update(a, shown, percentOf(shown));
