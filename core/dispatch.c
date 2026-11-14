@@ -111,9 +111,14 @@ static int hv_dc_probe = -1;   /* HV_DC_PROBE=1: report every change of the firs
 
 static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
     kf_dc_pa = image_pa + 0x6f8000;
-    uint8_t hdr[4096];
+    /* 64 KB, not 4: a segment command carries its sections inline, and __DATA has enough of them
+       that the one listing __kalloc_var/__kalloc_type sits past 4 KB -- the parse stopped before
+       ever seeing the sections it is here to find. */
+    static uint8_t hdr[65536];
     if (hv_phys_read(m, image_pa, hdr, sizeof hdr) != 0) return;
     uint32_t ncmds = kf_u32(hdr + 16), off = 32, csz_fix = 0, fix_off = 0, nseg = 0;
+    uint64_t kalloc_lo[8], kalloc_hi[8];
+    uint32_t kalloc_secs = 0;
     uint64_t lo = 0, hi = 0, text_va = 0;
     char segname[8][17];
     memset(segname, 0, sizeof segname);
@@ -124,6 +129,25 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
         if (cmd == 0x19 && nseg < 8) { /* LC_SEGMENT_64: the starts table is indexed in this order */
             memcpy(segname[nseg], hdr + off + 8, 16);
             segname[nseg][16] = 0;
+            /* The kalloc type views are pointers the kernel slides itself, in
+               kalloc_type_slide() (osfmk/kern/kalloc.c): kt_sig_hdr, kt_sig_type and kt_name all
+               get vm_kernel_slide added, and kt_flags gets KT_SLID. A slot this pass rebased too
+               is then slid twice -- the name pointer becomes garbage and the flags lose the bits
+               kalloc_type_validate_flags() checks, which panics with "hasn't been rebuilt with
+               required xnu headers". Their ranges are collected here and skipped below. */
+            uint32_t nsects = kf_u32(hdr + off + 64);
+            uint64_t saddr = kf_u64(hdr + off + 24);
+            for (uint32_t sc = 0; sc < nsects && kalloc_secs < 8; sc++) {
+                const uint8_t *se = hdr + off + 72 + 80u * sc;
+                if (se + 80 > hdr + off + csz) break;
+                if (strstr((const char *) se, "kalloc")) {
+                    fprintf(stderr, "hengevm: kalloc section %.16s in %s\n", se, segname[nseg]);
+                }
+                if (strncmp((const char *) se, "__kalloc", 8)) continue;
+                kalloc_lo[kalloc_secs] = saddr + kf_u64(se + 32);
+                kalloc_hi[kalloc_secs] = kalloc_lo[kalloc_secs] + kf_u64(se + 40);
+                kalloc_secs++;
+            }
             /* The image's own span in the file's own terms, for the sanity check below. */
             uint64_t sva = kf_u64(hdr + off + 24), svs = kf_u64(hdr + off + 32);
             if (!nseg) text_va = sva;
@@ -139,7 +163,7 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
     if (hv_phys_read(m, image_pa + fix_off, fx, csz_fix) != 0) { free(fx); return; }
     uint32_t starts = kf_u32(fx + 4);
     uint32_t segs_in_fix = kf_u32(fx + starts);
-    uint32_t applied = 0, already = 0, outside = 0, slots = 0;
+    uint32_t applied = 0, already = 0, outside = 0, slots = 0, kalloc_skip = 0;
     uint32_t seg_applied[8] = {0}, seg_already[8] = {0};
     for (uint32_t s = 0; s < segs_in_fix; s++) {
         /* Both __DATA and __DATA_CONST have fixup chains and neither is rebased by the time the
@@ -168,12 +192,16 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
             uint64_t o = start;
             for (;;) {
                 uint64_t pa = image_pa + seg_off + (uint64_t) pg * psize + o;
-                uint64_t v = 0;
+                uint64_t sva2 = image_va + seg_off + (uint64_t) pg * psize + o, v = 0;
                 if (hv_phys_read(m, pa, &v, 8) != 0) break;
                 uint64_t target = v & 0x3fffffffull;
                 uint32_t next = (uint32_t) ((v >> 51) & 0xfff);
                 slots++;
-                if (v >= 0xfffffe0000000000ull) { already++; if (s < 8) seg_already[s]++; } /* a pointer already: the loader got here */
+                int kalloc_slot = 0;
+                for (uint32_t ks = 0; ks < kalloc_secs; ks++)
+                    if (sva2 >= kalloc_lo[ks] && sva2 < kalloc_hi[ks]) { kalloc_slot = 1; break; }
+                if (kalloc_slot) { kalloc_skip++; } /* the kernel slides these itself */
+                else if (v >= 0xfffffe0000000000ull) { already++; if (s < 8) seg_already[s]++; } /* a pointer already: the loader got here */
                 else if (target >= hi - text_va) {
                     /* A target past the end of the image is not a fixup: the walk ran into data
                        that happens to look like a chain. Writing base+target would leave an
@@ -207,9 +235,15 @@ static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
         if (sl) snprintf(sl + 1, sizeof p2 - (size_t) (sl + 1 - p2), "fixups.txt");
         FILE *f = fopen(p2, "w");
         if (f) {
-            fprintf(f, "image pa %llx va %llx\nslots %u applied %u already %u outside %u\n",
+            fprintf(f, "image pa %llx va %llx\nslots %u applied %u already %u outside %u "
+                    "kalloc_sections %u kalloc_skipped %u\n",
                     (unsigned long long) image_pa, (unsigned long long) image_va, slots, applied,
-                    already, outside);
+                    already, outside, kalloc_secs, kalloc_skip);
+            for (uint32_t sg = 0; sg < nseg && sg < 8; sg++)
+                fprintf(f, "  seg %u %s\n", sg, segname[sg]);
+            for (uint32_t ks = 0; ks < kalloc_secs; ks++)
+                fprintf(f, "  kalloc sec %#llx..%#llx\n", (unsigned long long) kalloc_lo[ks],
+                        (unsigned long long) kalloc_hi[ks]);
             fprintf(f, "dataconst[0..3] %#llx %#llx %#llx %#llx\n",
                     (unsigned long long) probe[0], (unsigned long long) probe[1],
                     (unsigned long long) probe[2], (unsigned long long) probe[3]);
