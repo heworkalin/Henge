@@ -146,6 +146,16 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                 HvWalk w4;
                 hv_mmu_walk(cpu, x26v + 0x794, HV_ACC_READ, 1, &w4);
                 (void) hv_phys_read(cpu->m, w4.pa, &glob, 4);
+                /* panic() records what it is about to report before it reports it: the cpu,
+                   the caller and the reason string, in globals around the base the panic
+                   printer loads with adrp. They are still there while the report is failing,
+                   and they are the only surviving account of why the kernel stopped. */
+                uint64_t pg = 0xfffffe001f22a000ull, gv[6];
+                for (int k = 0; k < 6; k++) {
+                    gv[k] = 0;
+                    hv_mmu_walk(cpu, pg + 0x790 + 8u * (uint64_t) k, HV_ACC_READ, 1, &w2);
+                    (void) hv_phys_read(cpu->m, w2.pa, &gv[k], 8);
+                }
                 uint64_t stack[12];
                 HvWalk w3;
                 for (int k = 0; k < 12; k++) {
@@ -168,9 +178,33 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                             (unsigned long long) cpu->x[25], (unsigned long long) cpu->x[27],
                             (unsigned long long) cpu->x[29], (unsigned long long) lr2);
                 if (n0 <= 4)
+                    fprintf(stderr, "hengevm:   panic globals 790 %llx 798 %llx 7a0 %llx "
+                                    "7a8 %llx 7b0 %llx 7b8 %llx\n",
+                            (unsigned long long) gv[0], (unsigned long long) gv[1],
+                            (unsigned long long) gv[2], (unsigned long long) gv[3],
+                            (unsigned long long) gv[4], (unsigned long long) gv[5]);
+                if (n0 <= 4)
                     fprintf(stderr, "hengevm:   x24 %llx x26 %llx glob794 %llx\n",
                             (unsigned long long) x24v, (unsigned long long) x26v,
                             (unsigned long long) (glob & 0xffffffffu));
+                if (n0 <= 4)
+                    for (int k = 0; k < 6; k++) {
+                        if ((gv[k] >> 48) != 0xffff || (gv[k] & 7)) continue;
+                        char msg[65];
+                        int j;
+                        for (j = 0; j < 64; j++) {
+                            uint64_t ch = 0;
+                            hv_mmu_walk(cpu, gv[k] + (uint64_t) j, HV_ACC_READ, 1, &w2);
+                            if (hv_phys_read(cpu->m, w2.pa, &ch, 1)) break;
+                            ch &= 0xff;
+                            if (!ch) break;
+                            msg[j] = (char) ((ch >= 32 && ch < 127) ? ch : '.');
+                        }
+                        msg[j] = 0;
+                        if (j > 2)
+                            fprintf(stderr, "hengevm:   glob+%x -> \"%s\"\n",
+                                    0x790 + 8 * k, msg);
+                    }
                 if (n0 <= 4)
                     fprintf(stderr, "hengevm:   stack %llx %llx %llx %llx %llx %llx "
                                     "%llx %llx %llx %llx %llx %llx\n",
