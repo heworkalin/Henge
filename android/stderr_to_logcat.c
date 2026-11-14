@@ -18,9 +18,40 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #define NATIVE_TAG "HENGENATIVE"
 #define LINE_MAX_BYTES 2048
+
+/*
+ * A boot under emulation prints far more than logcat will carry: tens of thousands of lines a
+ * second while a guest is translating, and Android's log daemon starts dropping by process quota
+ * long before that, which hides the lines that matter. So the engine's whole stream goes to a
+ * file, and logcat gets a rate-limited sample plus every line that looks like a milestone.
+ *
+ * The file is written where the app can pull it: HENGE_LOG_FILE, set from Java at startup.
+ */
+static char g_path[512];
+static FILE *g_file;
+static int g_rate = 120;          /* lines a second to logcat unless raised */
+static unsigned g_window_second;
+static int g_window_count;
+static unsigned long g_dropped;
+
+void hv_log_set_file(const char *path) {
+    if (!path) return;
+    snprintf(g_path, sizeof g_path, "%s", path);
+    if (!g_file) g_file = fopen(g_path, "a");
+}
+
+/* Lines that always survive the limiter: a restore that fails says so in one of these. */
+static int important(const char *line) {
+    static const char *const keys[] = {"panic", "error", "Error", "failed", "restore", "step",
+                                       "serial:", "halt", "exception", "Sending", "install"};
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
+        if (strstr(line, keys[i])) return 1;
+    return 0;
+}
 
 static int g_pipe[2] = {-1, -1};
 static pthread_t g_reader;
@@ -41,7 +72,34 @@ static void *reader(void *arg) {
             char c = buffer[i];
             if (c == '\n' || used == sizeof(line) - 1) {
                 line[used] = '\0';
-                if (used > 0) __android_log_write(ANDROID_LOG_INFO, NATIVE_TAG, line);
+                if (used > 0) {
+                    /* Everything to the file, in order and complete. */
+                    if (g_file) {
+                        fputs(line, g_file);
+                        fputc('\n', g_file);
+                        static int since_flush;
+                        if (++since_flush >= 64) { since_flush = 0; fflush(g_file); }
+                    }
+                    /* A sample to logcat, plus anything that reads like a milestone. */
+                    unsigned sec = (unsigned) time(NULL);
+                    if (sec != g_window_second) {
+                        if (g_dropped) {
+                            char note[128];
+                            snprintf(note, sizeof note, "(log: %lu lines kept out of logcat in the last second)",
+                                     g_dropped);
+                            __android_log_write(ANDROID_LOG_INFO, NATIVE_TAG, note);
+                            g_dropped = 0;
+                        }
+                        g_window_second = sec;
+                        g_window_count = 0;
+                    }
+                    if (important(line) || g_window_count < g_rate) {
+                        __android_log_write(ANDROID_LOG_INFO, NATIVE_TAG, line);
+                        g_window_count++;
+                    } else {
+                        g_dropped++;
+                    }
+                }
                 used = 0;
             } else if (c != '\r') {
                 line[used++] = c;
@@ -59,6 +117,14 @@ static void *reader(void *arg) {
  */
 int hv_android_capture_output(void) {
     if (g_started) return 0;
+    if (!g_path[0]) {
+        const char *p = getenv("HENGE_LOG_FILE");
+        if (p && *p) hv_log_set_file(p);
+    }
+    {
+        const char *r = getenv("HENGE_LOG_RATE");
+        if (r) { int v = atoi(r); if (v > 0) g_rate = v; }
+    }
     if (pipe(g_pipe) != 0) return -1;
     if (dup2(g_pipe[1], STDOUT_FILENO) < 0 || dup2(g_pipe[1], STDERR_FILENO) < 0) {
         close(g_pipe[0]);

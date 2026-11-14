@@ -39,6 +39,9 @@ final class Native {
     /** Stops the guest and joins its threads. Safe when nothing is running. */
     static native void nativeStop();
 
+    /** Everything the engine prints goes to this file; logcat only gets a rate-limited sample. */
+    static native void nativeSetLogFile(String path);
+
     /** Creates the root disk and the auxiliary storage if they are not there yet. */
     /**
      * Unpacks the boot ROM from one compressed block of Apple's restore image.

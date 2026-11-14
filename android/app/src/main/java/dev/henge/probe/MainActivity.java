@@ -40,6 +40,15 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         // Window theme and window background first: everything below draws on top.
         Theme.apply(this);
+        // 引擎输出统一落文件，logcat 只拿限速样本：一次启动的日志量远超 logcat 配额。
+        try {
+            java.io.File dir = new java.io.File(getFilesDir(), "vm");
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            Native.nativeSetLogFile(new java.io.File(dir, "henge.log").getAbsolutePath());
+        } catch (Throwable ignored) {
+            // 没有日志文件不该成为安装失败的理由
+        }
         AppLog.i("Macs: 打开");
 
         LinearLayout root = new LinearLayout(this);

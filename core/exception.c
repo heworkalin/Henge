@@ -499,6 +499,52 @@ static HvCpu *cpu_by_mpidr(HvMachine *m, uint64_t mpidr) {
 }
 
 /* PSCI 1.0. */
+/* vmapple's own hypercalls: the CPU service range (PAC keys) and the OEM service range (absolute
+   time offset, boot session UUID, vCPU kick). The kernel sets its PAC keys from assembly before it
+   can print anything, and that code spins on a non-zero return -- `cbnz x0, .` in pac_asm.h -- so a
+   call that comes back unsupported is a silent hang with no console output at all. HengeVM's PAC is
+   a no-op, so the key calls only have to report success.
+   Return values follow the firmware ABI the kernel checks: x0 >= 0 means success. */
+static int vmapple_hvc(HvCpu *cpu, uint32_t fn) {
+    switch (fn) {
+    /* The PAC keys (0xc100000x) are handled by psci() below: that block predates this one and
+       also fills in the default key ids, so there is only one implementation of them. */
+    case 0x8100ff01:   /* UID, CPU range */
+    case 0x8300ff01:   /* UID, OEM range: must equal VMAPPLE_HVC_UID or the kernel drops every
+                          OEM call as unavailable. Words are the UUID read back to front. */
+        cpu->x[0] = 0x9cbb6ebb;
+        cpu->x[1] = 0x9dc9d679;
+        cpu->x[2] = 0xaa624e1f;
+        cpu->x[3] = 0x3b878185;
+        return 1;
+    case 0x8100ff03:   /* REVISION: the OEM table needs major 1 */
+    case 0x8300ff03:
+        cpu->x[0] = 1;
+        cpu->x[1] = 0;
+        return 1;
+    case 0x8100feff:   /* FEATURES: supported, no flags */
+    case 0x8300feff:
+        cpu->x[0] = 0;
+        cpu->x[1] = 0;
+        return 1;
+    case 0xc3000003:   /* GET_MABS_OFFSET: x1 in and out. Our timebase is already virtual. */
+        cpu->x[0] = 0;
+        return 1;
+    case 0xc3000004: { /* GET_BOOTSESSIONUUID: reported, never used for anything the guest does */
+        cpu->x[0] = 0;
+        cpu->x[1] = 0x4f1a2c3d8b6e5d4cull;
+        cpu->x[2] = 0x3a2b1c0d6e5d4c3bull;
+        return 1;
+    }
+    case 0xc3000005:   /* VCPU_WFK */
+    case 0xc3000006:   /* VCPU_KICK: our CPUs are host threads and wake on their own interrupts */
+        cpu->x[0] = 0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     static int log = -1;
     if (log < 0) log = getenv("HV_PSCI_LOG") != NULL;
@@ -614,7 +660,20 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         return 1;
     }
     if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
-        cpu->x[0] = psci(cpu, cpu->x[0]);
+        {
+            /* Which hypercalls the kernel makes, in order: the PAC key setup is the first thing it
+               does, so an hvc list that starts later means the entry never got that far. */
+            static unsigned hvc_n;
+            if (hvc_n < 32) {
+                unsigned long long was = cpu->x[0];
+                cpu->x[0] = (uint64_t) was;
+                fprintf(stderr, "hengevm: hvc #%u fn %llx x1 %llx pc %llx el%u\n", hvc_n,
+                        (unsigned long long) (uint32_t) was, (unsigned long long) cpu->x[1],
+                        (unsigned long long) cpu->pc, cpu->el);
+                hvc_n++;
+            }
+        }
+        if (!vmapple_hvc(cpu, (uint32_t) cpu->x[0])) cpu->x[0] = psci(cpu, cpu->x[0]);
         if (!cpu->halted && !cpu->off) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
         cpu->pc = pc + 4;
         cpu->exit_reason = cpu->halted ? HV_EXIT_HALT : HV_EXIT_BRANCH; /* CPU_OFF: the dispatcher parks it */

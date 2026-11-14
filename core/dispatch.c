@@ -1414,7 +1414,12 @@ static int run_loop(HvCpu *cpu, int one) {
                             /* HV_NO_KFIX=1 skips the rebase. iBoot is supposed to have done it
                                already, and doing it twice adds the base twice; which of the two
                                is true for a given firmware is exactly what this switch is for. */
-                            if (!getenv("HV_NO_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
+                            /* Not ours to do: arm_init() calls kernel_collection_slide(), which
+                               rebases every segment of the collection from the same chains. A pass
+                               here makes the kernel's slide land on an already-rebased pointer
+                               (0x1d1645a0 -> 0x38c7c5a0) and the guest branches into nothing.
+                               HV_KFIX=1 runs it anyway, for comparison. */
+                            if (getenv("HV_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
                             /* The moment worth keeping: the firmware has finished with the image
                                and the kernel has not run yet, so whatever is wrong in it is the
                                firmware's doing alone. */

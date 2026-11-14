@@ -25,10 +25,6 @@ static void default_output(void *opaque, uint8_t c) {
 }
 
 static uint64_t pl011_read(void *opaque, uint64_t off, unsigned size) {
-    {   /* Is anyone talking to this port at all? Offsets and sizes, not values. */
-        static int n;
-        if (getenv("HENGE_UART_LOG") && n++ < 200) fprintf(stderr, "hengevm: uart read %llx off %#llx size %u\n", (unsigned long long) ((HvPl011 *) opaque)->pa, off, size);
-    }
     (void)size;
     HvPl011 *u = opaque;
     switch (off) {
@@ -61,10 +57,6 @@ static uint64_t pl011_read(void *opaque, uint64_t off, unsigned size) {
 }
 
 static void pl011_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
-    {
-        static int n;
-        if (getenv("HENGE_UART_LOG") && n++ < 200) fprintf(stderr, "hengevm: uart write %llx off %#llx size %u v %#llx\n", (unsigned long long) ((HvPl011 *) opaque)->pa, off, size, v);
-    }
     (void)size;
     HvPl011 *u = opaque;
     switch (off) {

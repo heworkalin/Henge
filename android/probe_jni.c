@@ -25,8 +25,10 @@
 
 #include "bootrom.h"
 
-/* Declared in stderr_to_logcat.c: everything the vendored restore stack prints becomes logcat. */
+/* Declared in stderr_to_logcat.c: the engine's whole stream goes to this file, and a rate-limited
+   sample of it plus every milestone goes to logcat. */
 int hv_android_capture_output(void);
+void hv_log_set_file(const char *path);
 
 #include <android/api-level.h>
 
@@ -203,6 +205,16 @@ Java_dev_henge_probe_Native_nativeBoot(JNIEnv *env, jclass clazz, jstring rom, j
     jstring result = (*env)->NewStringUTF(env, out);
     free(out);
     return result;
+}
+
+/* Where the engine's log goes. Called from Java as soon as the app starts: the file is the record
+   an install is diagnosed from, logcat only carries what fits. */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeSetLogFile(JNIEnv *env, jclass clazz, jstring path) {
+    (void)clazz;
+    if (!path) return;
+    const char *p = (*env)->GetStringUTFChars(env, path, NULL);
+    if (p) { hv_log_set_file(p); (*env)->ReleaseStringUTFChars(env, path, p); }
 }
 
 JNIEXPORT void JNICALL

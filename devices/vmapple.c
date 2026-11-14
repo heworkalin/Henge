@@ -261,12 +261,6 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
 
 /* Devices and the GIC are shared by the CPUs: one at a time. */
 static uint64_t tick(HvMachine *m, HvCpu *cpu) {
-    {   /* Is the tick — where timers and devices are serviced — being called at all? */
-        static unsigned long long calls;
-        calls++;
-        if (calls % 1000 == 0 || calls < 3)
-            fprintf(stderr, "hengevm: tick %llu (cpu %u)\n", calls, cpu->index);
-    }
     if (cpu->index != 0) return hv_timer_update(((HvVmapple *)m->tick_opaque)->gic, cpu); /* its own timer: the GIC's lock only */
     hv_dev_lock(m);
     uint64_t deadline = tick_locked(m, cpu);

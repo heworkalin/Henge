@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include <android/log.h>
+#include <mach/mach_time.h>
 
 #include "dispatch.h"
 #include "mmu.h"
