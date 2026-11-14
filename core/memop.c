@@ -355,7 +355,32 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                         for (int r = 0; r < 16; r++)
                             fprintf(f, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
                         fprintf(f, "\n");
-                        /* The firmware's own code, around the instruction that did the store.
+                        /* The compressed stream the firmware is decoding, once per run: what the
+                       guest actually received is the only way to tell a decoder that is wrong from
+                       bytes that never arrived. The decoder's input pointer sits near 0x8EBF0000
+                       and the payload is 21 MB, so this window covers it. */
+                    static int recv_done;
+                    if (!recv_done) {
+                        recv_done = 1;
+                        size_t n = (size_t) 32 << 20;
+                        uint8_t *rec = malloc(n);
+                        if (rec && hv_phys_read(cpu->m, 0x8E000000ull, rec, (unsigned) n) == 0) {
+                            char p4[512];
+                            snprintf(p4, sizeof p4, "%s", wd);
+                            char *sl4 = strrchr(p4, '/');
+                            if (sl4) {
+                                snprintf(sl4 + 1, sizeof p4 - (size_t)(sl4 + 1 - p4), "recv.bin");
+                                FILE *rf = fopen(p4, "wb");
+                                if (rf) {
+                                    fwrite(rec, 1, n, rf);
+                                    fclose(rf);
+                                    fprintf(f, "  recv window 0x8e000000..0x90000000 written\n");
+                                }
+                            }
+                        }
+                        free(rec);
+                    }
+                    /* The firmware's own code, around the instruction that did the store.
                            The pc is a virtual address — the firmware does run with its MMU on —
                            so it is translated first; reading a physical window at the pc itself
                            is what made earlier dumps disassemble to something else entirely. */
