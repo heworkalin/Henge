@@ -244,6 +244,7 @@ final class InstallTab {
                 showProgress(progress, bar, "准备下载 " + r.name + "\n" + AppLog.bytes(r.bytes));
                 bar.setProgress(0);
                 starting[0] = true;
+                AppLog.i("下载: 已请求，等待服务开始");
                 DownloadService.start(a, r);
                 action.setText("停止");
                 return;
@@ -323,11 +324,17 @@ final class InstallTab {
         // The screen follows the service rather than the other way round: the download outlives
         // this view, so the view reads it instead of owning it.
         final Runnable[] self = new Runnable[1];
+        final boolean[] everAttached = {false};
         Runnable follow = () -> a.runOnUiThread(() -> {
             /* A tab that was rebuilt (a reload, a rotation) must stop listening: its views are
-               gone, and a listener left behind painted the old screen forever. */
-            if (!progress.isAttachedToWindow()) {
+               gone. Only after it has been on screen once, though: the first callback can arrive
+               before the view is attached, and unsubscribing then left the screen dead. */
+            if (progress.isAttachedToWindow()) {
+                everAttached[0] = true;
+            } else if (everAttached[0]) {
                 if (self[0] != null) DownloadService.unlisten(self[0]);
+                return;
+            } else {
                 return;
             }
             if (installing[0] || InstallService.running()) return;
@@ -381,6 +388,22 @@ final class InstallTab {
         repaint[0] = follow;
         DownloadService.listen(follow);
         follow.run();
+
+        /*
+         * The screen also reads the state on its own, twice a second.
+         *
+         * Relying only on the service's callbacks means one lost or throttled callback freezes the
+         * whole screen with the download running underneath, which is exactly how "it says
+         * preparing and then nothing ever changes" happened. A timer cannot be lost.
+         */
+        final android.os.Handler ticker = new android.os.Handler(a.getMainLooper());
+        Runnable[] tick = new Runnable[1];
+        tick[0] = () -> {
+            if (!progress.isAttachedToWindow()) return;   /* the view is gone: stop the timer */
+            follow.run();
+            ticker.postDelayed(tick[0], 500);
+        };
+        ticker.postDelayed(tick[0], 500);
 
 
         return root;

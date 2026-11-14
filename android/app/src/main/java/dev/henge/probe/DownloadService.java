@@ -206,6 +206,7 @@ public class DownloadService extends Service {
         STATE.etaMs = 0;
         STATE.message = "";
         STATE.file = new File(vm, name + ".ipsw");
+        AppLog.i("下载服务: 开始 " + name + "（" + AppLog.bytes(bytes) + "）");
         notifyListeners();
 
         lastBytesAt = android.os.SystemClock.elapsedRealtime();
@@ -218,6 +219,7 @@ public class DownloadService extends Service {
             // worse than none.
             final long[] lastBytes = {0L};
             final long[] lastAt = {0L};
+            final long[] lastLog = {0L};
             String problem = Downloader.run(url, part, STATE.file, bytes,
                     (received, total) -> {
                         // The counters are always current; the reporting is rationed.
@@ -243,6 +245,12 @@ public class DownloadService extends Service {
                                 ? (STATE.total - received) * 1000L / STATE.speed : 0;
                         int percent = STATE.total > 0
                                 ? (int) (received * 100 / STATE.total) : 0;
+                        if (now - lastLog[0] >= 5000) {
+                            lastLog[0] = now;
+                            AppLog.i("下载服务: " + percent + "%（" + AppLog.bytes(received)
+                                    + " / " + AppLog.bytes(STATE.total) + "）"
+                                    + (STATE.speed > 0 ? " " + AppLog.bytes(STATE.speed) + "/s" : ""));
+                        }
                         updateNotification("正在下载 " + name, percent, STATE.total, false);
                         notifyListeners();
                     },
