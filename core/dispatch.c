@@ -80,56 +80,6 @@ static int kf_is_kernel(const uint8_t *h) {
     return 0;
 }
 
-/* The chains as they stand now: how many slots still hold an encoded entry. A pointer that is
-   still encoded is one nothing rebased, and the guest uses it as an address. */
-static void kernel_fixup_audit(HvMachine *m, uint64_t image_pa, FILE *f) {
-    uint8_t hdr[4096];
-    if (hv_phys_read(m, image_pa, hdr, sizeof hdr) != 0) return;
-    uint32_t ncmds = kf_u32(hdr + 16), off = 32, csz_fix = 0, fix_off = 0;
-    for (uint32_t c = 0; c < ncmds && off + 8 <= sizeof hdr; c++) {
-        uint32_t cmd = kf_u32(hdr + off), csz = kf_u32(hdr + off + 4);
-        if (csz < 8 || off + csz > sizeof hdr) break;
-        if (cmd == 0x80000034) { fix_off = kf_u32(hdr + off + 8); csz_fix = kf_u32(hdr + off + 12); }
-        off += csz;
-    }
-    if (!csz_fix || csz_fix > (8u << 20)) return;
-    uint8_t *fx = malloc(csz_fix);
-    if (!fx) return;
-    if (hv_phys_read(m, image_pa + fix_off, fx, csz_fix) != 0) { free(fx); return; }
-    uint32_t starts = kf_u32(fx + 4), nseg = kf_u32(fx + starts);
-    for (uint32_t s = 0; s < nseg; s++) {
-        uint32_t soff = kf_u32(fx + starts + 4 + 4 * s);
-        if (!soff) continue;
-        const uint8_t *sp = fx + starts + soff;
-        uint16_t psize = kf_u16(sp + 4), pfmt = kf_u16(sp + 6), pages = kf_u16(sp + 20);
-        uint64_t seg_off = kf_u64(sp + 8);
-        if (pfmt != 8 || !psize) continue;
-        uint32_t total = 0, encoded = 0;
-        for (uint16_t pg = 0; pg < pages; pg++) {
-            uint16_t start = kf_u16(sp + 22 + 2 * pg);
-            if (start == 0xffff) continue;
-            uint64_t o = start;
-            for (;;) {
-                uint64_t pa = image_pa + seg_off + (uint64_t) pg * psize + o, v = 0;
-                if (hv_phys_read(m, pa, &v, 8) != 0) break;
-                uint32_t next = (uint32_t)((v >> 51) & 0xfff);
-                total++;
-                if (v < 0xfffffe0000000000ull && v >= 0x10000ull) {
-                    if (encoded < 6)
-                        fprintf(f, "seg%u still encoded pa %#llx value %#llx\n", s,
-                                (unsigned long long) pa, (unsigned long long) v);
-                    encoded++;
-                }
-                if (!next) break;
-                o += (uint64_t) next * 4;
-                if (o >= psize) break;
-            }
-        }
-        fprintf(f, "audit seg%u: %u slots, %u still encoded\n", s, total, encoded);
-    }
-    free(fx);
-}
-
 static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
     uint8_t hdr[4096];
     if (hv_phys_read(m, image_pa, hdr, sizeof hdr) != 0) return;
@@ -1224,6 +1174,14 @@ static int run_loop(HvCpu *cpu, int one) {
     uint32_t last_reason = HV_EXIT_BRANCH;
     hv_self = cpu;
     if (m->log >= 2) jit_fault_watch(m);
+    {
+        static int watch_set;
+        if (!watch_set) {
+            watch_set = 1;
+            const char *wv = getenv("HV_WATCH_VA");
+            if (wv && *wv) m->watch_va = strtoull(wv, NULL, 16);
+        }
+    }
     unpark(cpu);
     for (;;) {
         if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) {
@@ -1384,27 +1342,6 @@ static int run_loop(HvCpu *cpu, int one) {
            actually did, and where it departed from what it should have done. */
         static int boot_args_fixed;
         if (m->log >= 2 && cpu->pc < 0xfffffe0000000000ull) {
-            /* First execution ever in the page that decides the kernel entry: this is the
-               firmware's own code as loaded, before anything could have rewritten it. */
-            static int fw_page_a;
-            if (!fw_page_a && (cpu->pc & ~0xfffull) == 0x74898000ull) {
-                fw_page_a = 1;
-                const char *wd2 = getenv("HV_BLOCK_DUMP");
-                if (wd2 && *wd2) {
-                    char pa2[512];
-                    snprintf(pa2, sizeof pa2, "%s", wd2);
-                    char *sl6 = strrchr(pa2, '/');
-                    if (sl6) {
-                        snprintf(sl6 + 1, sizeof pa2 - (size_t)(sl6 + 1 - pa2), "fwcode_a.bin");
-                        FILE *af = fopen(pa2, "wb");
-                        if (af) {
-                            uint8_t pg[4096];
-                            if (hv_phys_read(m, 0x74898000ull, pg, sizeof pg) == 0) fwrite(pg, 1, sizeof pg, af);
-                            fclose(af);
-                        }
-                    }
-                }
-            }
             /* What the firmware had in the registers that decide the kernel entry, just before it
                jumps: x20 holds the link-time entry, x22/x23 the relocation delta, x30 the target. */
             fw_rec[fw_n % FW_REC].pc = cpu->pc;
@@ -1420,26 +1357,6 @@ static int run_loop(HvCpu *cpu, int one) {
                with a constant in an adrp/add pair at 0x748980c4; if that constant was rewritten
                at run time, the page holding it differs from what it held when first executed.
                Snapshot the page both times and compare offline. */
-            {
-                static int page_a;
-                if (ktrace_n == 0) {
-                    const char *wd1 = getenv("HV_BLOCK_DUMP");
-                    if (wd1 && *wd1 && !page_a) {
-                        char pb[512];
-                        snprintf(pb, sizeof pb, "%s", wd1);
-                        char *sl5 = strrchr(pb, '/');
-                        if (sl5) {
-                            snprintf(sl5 + 1, sizeof pb - (size_t)(sl5 + 1 - pb), "fwcode_b.bin");
-                            FILE *bf = fopen(pb, "wb");
-                            if (bf) {
-                                uint8_t pg[4096];
-                                if (hv_phys_read(cpu->m, 0x74898000ull, pg, sizeof pg) == 0) fwrite(pg, 1, sizeof pg, bf);
-                                fclose(bf);
-                            }
-                        }
-                    }
-                }
-            }
             /* To a file, not to stderr: at the moment the kernel starts, the stderr pipe loses
                output (every probe that printed here went missing while the file writes worked). */
             if (ktrace_n == 0) {
@@ -1962,6 +1879,22 @@ static int run_loop(HvCpu *cpu, int one) {
             m->trap_dumped = 1;
             const char *wd3 = getenv("HV_BLOCK_DUMP");
             if (wd3 && *wd3) {
+                /* The path into the trap: the panic frame is not reachable from the SP the vector
+                   runs on, but the blocks that ran are, and the call that started this is one of
+                   the last few. */
+                char pp[512];
+                snprintf(pp, sizeof pp, "%s", wd3);
+                char *sl9 = strrchr(pp, '/');
+                if (sl9) {
+                    snprintf(sl9 + 1, sizeof pp - (size_t)(sl9 + 1 - pp), "trap_path.txt");
+                    FILE *pf = fopen(pp, "w");
+                    if (pf) {
+                        hv_pc_hist_dump_path(cpu, pf);
+                        fclose(pf);
+                    }
+                }
+            }
+            if (wd3 && *wd3) {
                 char tp[512];
                 snprintf(tp, sizeof tp, "%s", wd3);
                 char *sl3 = strrchr(tp, '/');
@@ -1975,6 +1908,18 @@ static int run_loop(HvCpu *cpu, int one) {
                             fprintf(tf, "dataconst now: %#llx %#llx %#llx %#llx\n",
                                     (unsigned long long) sl4[0], (unsigned long long) sl4[1],
                                     (unsigned long long) sl4[2], (unsigned long long) sl4[3]);
+                            /* The watched record: its physical home and what it holds now, which is
+                               the value the guest will read next. */
+                            if (cpu->m->watch_va) {
+                                HvWalk w5;
+                                uint64_t v5 = 0;
+                                memset(&w5, 0, sizeof w5);
+                                hv_mmu_walk(cpu, cpu->m->watch_va, HV_ACC_READ, 1, &w5);
+                                if (!w5.fsc) hv_phys_read(cpu->m, w5.pa, &v5, 8);
+                                fprintf(tf, "watched %#llx -> pa %#llx value %#llx\n",
+                                        (unsigned long long) cpu->m->watch_va, (unsigned long long) w5.pa,
+                                        (unsigned long long) v5);
+                            }
                         }
                         fprintf(tf, "elr %#llx esr %#x far %#llx sp %#llx\n",
                                 (unsigned long long) cpu->elr_el1, cpu->esr_el1,
@@ -2079,141 +2024,10 @@ void hv_pc_hist_dump_file(HvCpu *cpu) {
         hv_walk_dbg = f;
         hv_mmu_walk(cpu, far, HV_ACC_WRITE, 1, &w);
         hv_walk_dbg = NULL;
-        /* The neighbours: one read-only page in an otherwise writable region means the kernel was
-           mid-update; a whole read-only region means a region-wide protection hit the stack. */
-        for (int i = -4; i <= 4; i++) {
-            HvWalk n;
-            uint64_t va = (far & ~0x3fffull) + (uint64_t) i * 0x4000ull;
-            memset(&n, 0, sizeof n);
-            hv_mmu_walk(cpu, va, HV_ACC_WRITE, 1, &n);
-            fprintf(f, "near %#llx fsc %#x pa %#llx r%u w%u block %#llx\n",
-                    (unsigned long long) va, n.fsc, (unsigned long long) n.pa, n.r, n.w,
-                    (unsigned long long) n.block_size);
-        }
         fprintf(f, "walk far %#llx: fsc %#x pa %#llx block %#llx r%u w%u x%u attr %#x pstate_extra %#llx (PAN %d)\n",
                 (unsigned long long) far, w.fsc, (unsigned long long) w.pa,
                 (unsigned long long) w.block_size, w.r, w.w, w.x, w.attr,
                 (unsigned long long) cpu->pstate_extra, (cpu->pstate_extra & HV_PSTATE_PAN) ? 1 : 0);
-    }
-    /* The two segments the fixups live in, as they stand: with the original chain data from the
-       image, comparing slot by slot says which ones are still encoded (the chain itself cannot be
-       re-walked after the fixups, because the next offsets live in the slots that were rewritten). */
-    if (cpu->m->kimage_pa) {
-        const char *wd4 = getenv("HV_BLOCK_DUMP");
-        uint8_t h4[4096];
-        if (wd4 && *wd4 && hv_phys_read(cpu->m, cpu->m->kimage_pa, h4, sizeof h4) == 0) {
-            uint32_t n4 = kf_u32(h4 + 16), o4 = 32;
-            for (uint32_t c = 0; c < n4 && o4 + 72 <= sizeof h4; c++) {
-                uint32_t cmd = kf_u32(h4 + o4), csz = kf_u32(h4 + o4 + 4);
-                if (csz < 8 || o4 + csz > sizeof h4) break;
-                if (cmd == 0x19) {
-                    const char *nm = (const char *) h4 + o4 + 8;
-                    uint64_t vmaddr = kf_u64(h4 + o4 + 24), fsz = kf_u64(h4 + o4 + 48);
-                    if ((!strcmp(nm, "__DATA_CONST") || !strcmp(nm, "__DATA")) && fsz && fsz < (32u << 20)) {
-                        char sp2[512];
-                        snprintf(sp2, sizeof sp2, "%s", wd4);
-                        char *sl5 = strrchr(sp2, '/');
-                        if (sl5) {
-                            snprintf(sl5 + 1, sizeof sp2 - (size_t)(sl5 + 1 - sp2), "seg_%s.bin", nm[2] == 'D' && nm[7] == 'C' ? "dataconst" : "data");
-                            FILE *sf2 = fopen(sp2, "wb");
-                            if (sf2) {
-                                static uint8_t b4[65536];
-                                for (uint64_t z = 0; z < fsz; z += sizeof b4) {
-                                    if (hv_phys_read(cpu->m, cpu->m->kimage_pa + (vmaddr - 0xfffffe0007004000ull) + z, b4, sizeof b4) != 0)
-                                        memset(b4, 0, sizeof b4);
-                                    fwrite(b4, 1, sizeof b4, sf2);
-                                }
-                                fclose(sf2);
-                                fprintf(f, "dumped %s (%#llx bytes) -> %s\n", nm, (unsigned long long) fsz, sp2);
-                            }
-                        }
-                    }
-                }
-                o4 += csz;
-            }
-        }
-    }
-    /* Where an unfixed chained-fixup entry ended up: the panic's own print path died on one, so
-       finding its slot says which region nobody rebased. */
-    {
-        uint64_t needle = 0x20000000935144ull;
-        int hits = 0;
-        for (uint64_t pa = 0x70000000ull; pa < 0xf0000000ull && hits < 8; pa += 0x1000) {
-            uint64_t v;
-            if (hv_phys_read(cpu->m, pa, &v, 8) != 0) continue;
-            if (v != needle) continue;
-            fprintf(f, "unfixed slot pa %#llx value %#llx\n", (unsigned long long) pa, (unsigned long long) v);
-            hits++;
-        }
-        /* Siblings: any entry with the same shape in the pages those slots were in. */
-        for (uint64_t pa = 0x70000000ull; pa < 0xf0000000ull && hits < 40; pa += 0x1000) {
-            static uint8_t pg[4096];
-            if (hv_phys_read(cpu->m, pa, pg, sizeof pg) != 0) continue;
-            for (int i = 0; i + 8 <= 4096; i += 8) {
-                uint64_t v;
-                memcpy(&v, pg + i, 8);
-                if ((v >> 51) > 0xfffull || (v & 0x3fffffffull) > 0x2000000ull) continue;
-                if (v >> 63) continue;
-                if (v < 0x10000ull) continue;
-                fprintf(f, "fixup-like pa %#llx value %#llx\n", (unsigned long long) (pa + i), (unsigned long long) v);
-                hits++;
-                if (hits >= 40) break;
-            }
-        }
-    }
-    /* The stack, because that is where panic() formats its text (a local buffer), and the print
-       path that was supposed to show it is the thing that broke. */
-    {
-        const char *wd2 = getenv("HV_BLOCK_DUMP");
-        if (wd2 && *wd2) {
-            char sp_path[512];
-            snprintf(sp_path, sizeof sp_path, "%s", wd2);
-            char *sl2 = strrchr(sp_path, '/');
-            if (sl2) {
-                snprintf(sl2 + 1, sizeof sp_path - (size_t)(sl2 + 1 - sp_path), "stack.bin");
-                HvWalk sw;
-                memset(&sw, 0, sizeof sw);
-                hv_mmu_walk(cpu, cpu->sp, HV_ACC_READ, 1, &sw);
-                uint64_t from = (sw.pa & ~0x3fffull) - 0x8000, n2 = 0x20000;
-                if (sw.fsc) from = 0;
-                FILE *sf = fopen(sp_path, "wb");
-                if (sf) {
-                    static uint8_t buf2[65536];
-                    for (uint64_t o = 0; o < n2; o += sizeof buf2) {
-                        if (hv_phys_read(cpu->m, from + o, buf2, sizeof buf2) != 0) memset(buf2, 0, sizeof buf2);
-                        fwrite(buf2, 1, sizeof buf2, sf);
-                    }
-                    fclose(sf);
-                    fprintf(f, "stack %#llx..%#llx -> stack.bin\n",
-                            (unsigned long long) from, (unsigned long long) (from + n2));
-                }
-            }
-        }
-    }
-    /* The message the kernel formatted before it stopped: a panic writes its text into RAM and
-       then prints it, and when the printing path itself goes wrong the text is all that is left. */
-    {
-        static const char *const needles[] = {"kalloc_type_view(", "from kext(", "panic(", "assertion failed"};
-        for (unsigned k = 0; k < sizeof needles / sizeof needles[0]; k++) {
-            size_t nl = strlen(needles[k]);
-            int hits = 0;
-            for (uint64_t pa = 0; pa < (1ull << 32) && hits < 3; pa += (1u << 20)) {
-                const char *base = hv_phys_ptr(cpu->m, pa, 1u << 20);
-                if (!base) continue;
-                for (uint32_t o = 0; o + nl + 120 < (1u << 20); o++) {
-                    if (memcmp(base + o, needles[k], nl)) continue;
-                    char text[161];
-                    memcpy(text, base + o, 160);
-                    text[160] = 0;
-                    for (int i = 0; i < 160; i++)
-                        if ((unsigned char) text[i] < 0x20 && text[i] != '\n') text[i] = ' ';
-                    fprintf(f, "ram \"%s\" pa %#llx: %.150s\n", needles[k],
-                            (unsigned long long) (pa + o), text);
-                    hits++;
-                    break;
-                }
-            }
-        }
     }
     /* Every exception the guest took recently, oldest first: the halt reports the last one, and
        what walked the stack into its guard page was usually one of the earlier ones. */
@@ -2230,6 +2044,13 @@ void hv_pc_hist_dump_file(HvCpu *cpu) {
     for (uint32_t n = 0; n < PC_HIST; n++)
         fprintf(f, "%llx\n", (unsigned long long) pc_hist[cpu->index][(at + n) & (PC_HIST - 1)]);
     fclose(f);
+}
+
+void hv_pc_hist_dump_path(HvCpu *cpu, FILE *f) {
+    if (!cpu || cpu->index >= HV_MAX_CPUS) return;
+    uint32_t at = pc_hist_at[cpu->index];
+    for (uint32_t n = 0; n < PC_HIST; n++)
+        fprintf(f, "%llx\n", (unsigned long long) pc_hist[cpu->index][(at + n) & (PC_HIST - 1)]);
 }
 
 void hv_pc_hist_dump(HvCpu *cpu) {
