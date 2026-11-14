@@ -216,6 +216,7 @@ final class InstallTab {
          * sends the pipeline to the download rather than the installer.
          */
         Runnable pipeline = () -> new Thread(() -> {
+            PIPELINE.set(true);
             Releases.Release r = chosen[0];
             File downloaded = Releases.ipswFile(dir, r);
             String localPath = Prefs.localIpsw(a);
@@ -305,7 +306,7 @@ final class InstallTab {
                 /* 5. Install what verified. */
                 stage[0] = "install";
                 a.runOnUiThread(() -> {
-                    action.setText("停止安装");
+                    setAction(action, "停止安装");
                     showProgress(progress, bar, "准备安装…");
                 });
                 int run = InstallService.start(a);
@@ -313,7 +314,7 @@ final class InstallTab {
                 InstallService.stop(a, run);
                 if (stage[0].equals("install")) stage[0] = "idle";
                 final String o = outcome;
-                a.runOnUiThread(() -> action.setText("下载并安装"));
+                a.runOnUiThread(() -> setAction(action, "下载并安装"));
                 a.runOnUiThread(() -> {
                     if (o == null) showProgress(progress, bar, "安装完成。回到 Macs 页按「启动」。");
                     else if ("已取消".equals(o)) showProgress(progress, bar, "已停止。");
@@ -324,6 +325,7 @@ final class InstallTab {
                 a.runOnUiThread(() -> showProgress(progress, bar, "出错: " + t));
             } finally {
                 stage[0] = "idle";
+                PIPELINE.set(false);
             }
         }, "henge-pipeline").start();
 
@@ -332,24 +334,24 @@ final class InstallTab {
                the verification or the install, whichever it has reached. */
             if (stage[0].equals("download") || DownloadService.running()) {
                 cancelled.set(true);
-                action.setText("正在停止…");
+                setAction(action, "正在停止…");
                 DownloadService.cancel(a);
                 return;
             }
             if (stage[0].equals("verify")) {
                 cancelled.set(true);
-                action.setText("正在停止…");
+                setAction(action, "正在停止…");
                 return;
             }
             if (stage[0].equals("install") || InstallService.running()) {
                 cancelled.set(true);
-                action.setText("正在停止…");
+                setAction(action, "正在停止…");
                 InstallService.requestStop(a);
                 Native.nativeInstallStop();
                 return;
             }
             cancelled.set(false);
-            action.setText("停止");
+            setAction(action, "停止");
             pipeline.run();
         });
 
@@ -368,6 +370,15 @@ final class InstallTab {
                 if (self[0] != null) DownloadService.unlisten(self[0]);
                 return;
             } else {
+                return;
+            }
+            /* A pipeline started by another screen is still running: it owns the progress text,
+               the bar and the button, so paint those and stop here. Without this the idle branch
+               below repainted "nothing is happening" over a running install. */
+            if (PIPELINE.get()) {
+                if (lastText != null) progress.setText(lastText);
+                if (lastBar >= 0) bar.setProgress(lastBar);
+                if (lastAction != null) setAction(action, lastAction);
                 return;
             }
             /* This screen is an Activity field, the service is not: after the app has been in the
@@ -397,7 +408,7 @@ final class InstallTab {
                     || state.name.equals(chosen[0].build);
             if (!mine) phase = DownloadService.State.IDLE;
             if (DownloadService.State.RUNNING.equals(phase)) {
-                action.setText("停止");
+                setAction(action, "停止");
                 int percent = state.total > 0 ? (int) (state.received * 100 / state.total) : 0;
                 bar.setProgress(percent * 10);
                 StringBuilder text = new StringBuilder("正在下载 ").append(state.name)
@@ -415,20 +426,20 @@ final class InstallTab {
                 }
                 progress.setText(text.toString());
             } else if (DownloadService.State.DONE.equals(phase)) {
-                action.setText("安装");
+                setAction(action, "安装");
                 bar.setProgress(1000);
                 progress.setText("已下载 " + state.name + "\n点「安装」开始写入磁盘");
             } else if (DownloadService.State.FAILED.equals(phase)) {
-                action.setText("重试");
+                setAction(action, "重试");
                 String why = state.message == null ? "" : state.message.trim();
                 if (why.isEmpty()) why = "原因未知，详情见设置里的日志";
                 showProgress(progress, bar, "下载失败: " + why + "\n已下载的部分会保留，重试会从断点继续");
                 bar.setProgress(1000 * (int) (state.total > 0 ? state.received * 1000 / state.total : 0) / 100);
             } else if (DownloadService.State.CANCELLED.equals(phase)) {
-                action.setText("继续下载");
+                setAction(action, "继续下载");
                 progress.setText("已停止，已下载的部分会保留\n" + state.message);
             } else {
-                action.setText("下载并安装");
+                setAction(action, "下载并安装");
                 refreshWaiting.run();
             }
         });
@@ -453,6 +464,10 @@ final class InstallTab {
         };
         ticker.postDelayed(tick[0], 500);
 
+
+        /* The button label lives outside the view as well, so a screen built while a pipeline is
+           running shows "stop" rather than "download and install". */
+        if (PIPELINE.get() && lastAction != null) setAction(action, lastAction);
 
         return root;
     }
@@ -497,6 +512,18 @@ final class InstallTab {
        the install had stopped. */
     private static volatile String lastText;
     private static volatile int lastBar = -1;
+    private static volatile String lastAction;
+    /* The pipeline outlives the screen that started it: it is a thread of the app, not of this
+       view. While it runs, it owns what the screen says, and a rebuilt screen renders from these
+       statics instead of falling through to "nothing is happening". */
+    private static final java.util.concurrent.atomic.AtomicBoolean PIPELINE =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /* One place that sets the button, so its label survives a screen change too. */
+    private static void setAction(android.widget.Button action, String label) {
+        lastAction = label;
+        setAction(action, label);
+    }
 
     private static void showProgress(TextView text, android.widget.ProgressBar bar, String message) {
         lastText = message;
