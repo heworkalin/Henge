@@ -346,6 +346,33 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                         fprintf(f, "\n");
                         fclose(f);
                     }
+                    /* The firmware's own code, once: its addresses are physical (the MMU is off
+                       while it runs), so what writes the watched slot can be disassembled from
+                       this alone, without another run. */
+                    /* Refreshed on every hit, not once: the address range is reused by each
+                       firmware stage in turn, so a dump taken at the first hit holds iBSS while the
+                       code that matters belongs to iBEC, loaded over it later. */
+                    static int fw_dumps;
+                    if (fw_dumps < 64) {
+                        fw_dumps++;
+                        uint8_t *code = malloc(1u << 20);
+                        if (code && hv_phys_read(cpu->m, 0x70080000ull, code, 1u << 20) == 0) {
+                            char p3[512];
+                            snprintf(p3, sizeof p3, "%s", wd);
+                            char *sl3 = strrchr(p3, '/');
+                            if (sl3) {
+                                snprintf(sl3 + 1, sizeof p3 - (size_t)(sl3 + 1 - p3), "fwcode.bin");
+                                FILE *cf = fopen(p3, "wb");
+                                if (cf) {
+                                    fwrite(code, 1, 1u << 20, cf);
+                                    fclose(cf);
+                                    fprintf(f, "code dumped at pa 0x70080000, hit pc %#llx callersite %#llx\n",
+                                            (unsigned long long) pc, (unsigned long long) cpu->x[30]);
+                                }
+                            }
+                        }
+                        free(code);
+                    }
                 }
             }
         }
