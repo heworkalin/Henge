@@ -412,9 +412,15 @@ final class InstallTab {
                     stage[0] = "download";
                 }
             }
-            /* Download progress belongs to the screen only while the pipeline is in its download
-               stage; in every other stage the pipeline itself says what is happening. */
-            if (!"download".equals(stage[0])) return;
+            /* Not our stage: either the pipeline is between stages (then the branch above owns
+               the screen) or nothing is running at all -- and in that second case the screen has
+               to say what a tap would do now, or it keeps the last thing painted, which after a
+               stop is "正在停止…" forever. */
+            if (!"download".equals(stage[0])) {
+                setAction(action, "下载并安装");
+                refreshWaiting.run();
+                return;
+            }
             DownloadService.State state = DownloadService.state();
             String phase = state.phase;
             /* The download service holds one state for the whole app, so a state that names a
