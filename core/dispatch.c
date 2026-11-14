@@ -1549,6 +1549,13 @@ static int run_loop(HvCpu *cpu, int one) {
                                            earlier. */
                                         {
                                             static uint8_t b4[4096];
+                                            uint32_t hw[64];
+                                            if (hv_phys_read(cpu->m, 0x78323c00ull, hw, sizeof hw) == 0)
+                                                for (int k = 0; k < 64; k++)
+                                                    fprintf(stderr, "hengevm: h%04x %08x\n", k * 4, hw[k]);
+                                        }
+                                        {
+                                            static uint8_t b4[4096];
                                             for (uint64_t q2 = 0x78300000ull; q2 < 0x78340000ull; q2 += 0x1000) {
                                                 if (hv_phys_read(cpu->m, q2, b4, sizeof b4) != 0) continue;
                                                 for (unsigned i = 0; i + 4 < sizeof b4; i++)
