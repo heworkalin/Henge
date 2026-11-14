@@ -82,6 +82,19 @@ public class DownloadService extends Service {
      */
     private static final AtomicBoolean CANCEL = new AtomicBoolean(false);
 
+    /**
+     * Identifies the run that owns the state.
+     *
+     * A stopped download does not stop instantly: four threads have to notice, and each of them
+     * used to write its own conclusion (cancelled, failed, incomplete) into the shared state on the
+     * way out. A new attempt started in that window had its "running" overwritten a second later
+     * by the previous run's goodbye, which is what "it fails at 0% the moment I press download"
+     * was. A run may only speak while it is the current one.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger RUNS =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static volatile int runId;
+
     /** The current state; the same object every time, so a reader sees it move. */
     static State state() {
         return STATE;
@@ -164,6 +177,7 @@ public class DownloadService extends Service {
                does not see it. Disconnecting is what makes it return — and the state is set here,
                not in the worker, so the button and the notification change on the next frame. */
             CANCEL.set(true);
+            runId = RUNS.incrementAndGet();   /* the run being stopped may not write any more */
             Downloader.abort();
             if (worker != null) worker.interrupt();
             if (STATE.phase.equals(State.RUNNING)) {
@@ -208,6 +222,8 @@ public class DownloadService extends Service {
         final File vm = new File(getExternalFilesDir(null), "vm");
         CANCEL.set(false);
         final AtomicBoolean cancelled = CANCEL;
+        final int id = RUNS.incrementAndGet();
+        runId = id;
 
         STATE.phase = State.RUNNING;
         STATE.name = name;
@@ -234,6 +250,7 @@ public class DownloadService extends Service {
             String problem = Downloader.run(url, part, STATE.file, bytes,
                     (received, total) -> {
                         // The counters are always current; the reporting is rationed.
+                        if (runId != id) return;
                         STATE.received = received;
                         STATE.stalled = false;
                         lastBytesAt = android.os.SystemClock.elapsedRealtime();
@@ -266,6 +283,11 @@ public class DownloadService extends Service {
                         notifyListeners();
                     },
                     cancelled);
+            if (runId != id) {
+                /* A newer attempt owns the state now: this run's outcome is not news. */
+                AppLog.i("下载服务: 运行 " + id + " 已结束（已有更新的运行）");
+                return;
+            }
             STATE.stalled = false;
             if (cancelled.get() || Thread.currentThread().isInterrupted()) {
                 STATE.phase = State.CANCELLED;

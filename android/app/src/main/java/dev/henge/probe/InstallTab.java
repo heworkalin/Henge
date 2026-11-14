@@ -375,7 +375,10 @@ final class InstallTab {
                 progress.setText("已下载 " + state.name + "\n点「安装」开始写入磁盘");
             } else if (DownloadService.State.FAILED.equals(phase)) {
                 action.setText("重试");
-                progress.setText("下载失败: " + state.message);
+                String why = state.message == null ? "" : state.message.trim();
+                if (why.isEmpty()) why = "原因未知，详情见设置里的日志";
+                showProgress(progress, bar, "下载失败: " + why + "\n已下载的部分会保留，重试会从断点继续");
+                bar.setProgress(1000 * (int) (state.total > 0 ? state.received * 1000 / state.total : 0) / 100);
             } else if (DownloadService.State.CANCELLED.equals(phase)) {
                 action.setText("继续下载");
                 progress.setText("已停止，已下载的部分会保留\n" + state.message);
