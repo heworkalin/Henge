@@ -107,7 +107,9 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
            the access, because "fault at pc X" alone does not say whether the guest wandered into
            bad code or used a bad pointer from good code. The page PC is in is mapped, so it can be
            read through the same walk the TLB uses. */
-        if (type == HV_EXC_SYNC && ((esr >> 26) & 0x3f) == 0x24) {
+        /* 0x24 is a data abort from EL0, 0x25 from EL1: an early-boot kernel fault is the
+               second, and it is the one worth seeing. */
+        if (type == HV_EXC_SYNC && (((esr >> 26) & 0x3f) == 0x24 || ((esr >> 26) & 0x3f) == 0x25)) {
             HvWalk w;
             hv_mmu_walk(cpu, ret, HV_ACC_READ, 1, &w);
             uint32_t insn = 0;
@@ -120,6 +122,65 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                         esr, (unsigned long long) far, (unsigned long long) ret, cpu->el,
                         w.fsc == 0, (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[2],
                         (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[16]);
+            /* A level-0 translation fault is almost always a bad pointer rather than bad code:
+               the registers at the fault are the arguments the caller passed, and x30 says who
+               the caller was -- which is the only thing that turns "somewhere a pointer went
+               wrong" into a place to look. */
+            if ((w.fsc == 0 || (w.fsc & 0x3c) == 0x04) && cpu->m->log >= 2) {
+                /* The caller of the function that faulted: x30 is inside it, and [x29+8] is the
+                   saved return address of its caller. Without it a fault inside a formatter says
+                   nothing about who asked for the formatting. */
+                uint64_t lr2 = 0;
+                HvWalk w2;
+                if (cpu->x[29]) {
+                    hv_mmu_walk(cpu, cpu->x[29] + 8, HV_ACC_READ, 1, &w2);
+                    (void) hv_phys_read(cpu->m, w2.pa, &lr2, 8);
+                }
+                /* The varargs of a printf live on the stack, and a %s whose argument was never
+                   passed reads one of these slots: the stack around sp says what the formatter
+                   was actually given, which the registers at the fault no longer do. */
+                /* The panic path reads its "caller" from a global and its reason from the
+                   argument list; both are what the message would have said, and the message is
+                   the only thing that says why the kernel stopped. */
+                uint64_t caller2 = 0, x24v = cpu->x[24], x26v = cpu->x[26], glob = 0;
+                HvWalk w4;
+                hv_mmu_walk(cpu, x26v + 0x794, HV_ACC_READ, 1, &w4);
+                (void) hv_phys_read(cpu->m, w4.pa, &glob, 4);
+                uint64_t stack[12];
+                HvWalk w3;
+                for (int k = 0; k < 12; k++) {
+                    stack[k] = 0;
+                    hv_mmu_walk(cpu, cpu->sp + 8u * (uint64_t) k, HV_ACC_READ, 1, &w3);
+                    (void) hv_phys_read(cpu->m, w3.pa, &stack[k], 8);
+                }
+                static int n0;
+                if (n0++ < 4)
+                    fprintf(stderr, "hengevm: lvl0 fault fsc %x far %llx pc %llx lr %llx "
+                                    "x0 %llx x1 %llx x2 %llx x3 %llx x4 %llx x5 %llx x6 %llx "
+                                    "x7 %llx x19 %llx x20 %llx x25 %llx x27 %llx x29 %llx caller %llx\n",
+                            (unsigned) w.fsc, (unsigned long long) far, (unsigned long long) ret,
+                            (unsigned long long) cpu->x[30],
+                            (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                            (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3],
+                            (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[5],
+                            (unsigned long long) cpu->x[6], (unsigned long long) cpu->x[7],
+                            (unsigned long long) cpu->x[19], (unsigned long long) cpu->x[20],
+                            (unsigned long long) cpu->x[25], (unsigned long long) cpu->x[27],
+                            (unsigned long long) cpu->x[29], (unsigned long long) lr2);
+                if (n0 <= 4)
+                    fprintf(stderr, "hengevm:   x24 %llx x26 %llx glob794 %llx\n",
+                            (unsigned long long) x24v, (unsigned long long) x26v,
+                            (unsigned long long) (glob & 0xffffffffu));
+                if (n0 <= 4)
+                    fprintf(stderr, "hengevm:   stack %llx %llx %llx %llx %llx %llx "
+                                    "%llx %llx %llx %llx %llx %llx\n",
+                            (unsigned long long) stack[0], (unsigned long long) stack[1],
+                            (unsigned long long) stack[2], (unsigned long long) stack[3],
+                            (unsigned long long) stack[4], (unsigned long long) stack[5],
+                            (unsigned long long) stack[6], (unsigned long long) stack[7],
+                            (unsigned long long) stack[8], (unsigned long long) stack[9],
+                            (unsigned long long) stack[10], (unsigned long long) stack[11]);
+            }
             if (w.fsc == 0 && hv_phys_read(cpu->m, w.pa, &insn, 4) == 0) {
                 snprintf(extra, sizeof extra, " insn %08x", insn);
                 /*
