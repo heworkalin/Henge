@@ -2191,20 +2191,24 @@ static int run_loop(HvCpu *cpu, int one) {
                printed: the high half is always 0xfffffe00 for the kernel image. */
             uint64_t plow = (uint32_t) cpu->pc;
             if (pc_lo && pc_n < 6 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
-                uint64_t wx = 0, nm = 0;
+                uint64_t wx = 0, nm = 0, slid = 0;
                 HvWalk wpc;
                 pc_n++;
                 hv_mmu_walk(cpu, cpu->x[21] + 0x48, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &wx, 4);
                 hv_mmu_walk(cpu, cpu->x[21] + 0x10, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &nm, 8);
+                hv_mmu_walk(cpu, cpu->x[26] + 0x8c0, HV_ACC_READ, 1, &wpc);
+                (void) hv_phys_read(m, wpc.pa, &slid, 8);
                 fprintf(stderr, "hengevm: pchk pc %llx x0 %llx x1 %llx x21 %llx x23 %llx "
-                                "w27 %llx flags48 %llx name10 %llx icount %llu\n",
+                                "w27 %llx flags48 %llx name10 %llx x8 %llx x9 %llx x10 %llx x26 %llx slide %llx icount %llu\n",
                         (unsigned long long) cpu->pc, (unsigned long long) cpu->x[0],
                         (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[21],
                         (unsigned long long) cpu->x[23], (unsigned long long) cpu->x[27],
                         (unsigned long long) (wx & 0xffffffffu), (unsigned long long) nm,
-                        (unsigned long long) cpu->icount);
+                        (unsigned long long) cpu->x[8], (unsigned long long) cpu->x[9],
+                        (unsigned long long) cpu->x[10], (unsigned long long) cpu->x[26],
+                        (unsigned long long) slid, (unsigned long long) cpu->icount);
             }
         }
         if (g_timing) {
