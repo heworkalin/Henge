@@ -165,3 +165,38 @@ PAC strip 宽度、OEM/PV-lock hypercall、UI 状态失联若干、按文件记�
   不要在它上面调内核；跑它会产出 200+ MB 日志。
 - UI：`InstallTab` 的状态应彻底收敛为单一 `Pipeline.State`（版本号 + 单一渲染函数），
   现在虽已用静态快照+广播收口，但仍是多 writer 结构。
+
+## 11. 设备上跑 CLI（首选调试方式，1 分钟一轮）
+
+内核/引擎的调参、探针、对照实验**不要走 APK**。把安装器编译成 Android CLI，推到
+`/data/local/tmp` 直接跑：bionic、真机 CPU、4 KB 页，**并且没有 proot 的 ptrace 干扰**
+（glibc 宿主上出现的 SIGSEGV 在 bionic 上不出现，实测过）。
+
+```bash
+# 1. 编译（约 1 分钟）。API 28 起才有 aligned_alloc / pthread_gettid_np；
+#    ZLIB 必须有，libhengerestore 用 gzread。
+ZLIB=1 API=28 ./tools/build-install-android.sh
+
+# 2. 推送
+adb -s 127.0.0.1:5555 push build/andcli/host-install /data/local/tmp/henge/
+
+# 3. 跑（参数顺序：booter ipsw 工作目录 RAM_MB log）
+adb shell "cd /data/local/tmp/henge && chmod 755 host-install && \
+  ./host-install AVPBooter.vmapple2.bin /data/local/tmp/ipsw/24G90.ipsw workN 4096 2 > run.log 2>&1"
+```
+
+要点：
+
+- **每次换一个新的 `workN` 目录**。同一个目录被占用时会直接退出并打印
+  `another installer is using workN`。用完的目录记得删（`aux.img` 30 MB、`dc-*.bin` 各 6 MB）。
+- **参数少一个会静默跑错**：给 `workN 3` 会把 3 当成 RAM=3 MB，机器建不起来但不报错。
+- IPSW 已放在设备上：`/data/local/tmp/ipsw/24G90.ipsw`（16 GB，别重复推）。
+- booter 必须一起推：`build/andcli/host-install` 只带代码，booter 是独立文件。
+- 依赖（只需一次，已备好）：
+  - `work/andcli/curl/lib/libcurl.a` —— curl 8.23.0 静态，`--with-openssl`，无其他依赖
+  - `work/andcli/ossl/lib/libssl.a|libcrypto.a` —— openssl 3.0.15，`android-arm64` 配置
+  - 三者都是用 NDK `aarch64-linux-android26-clang` 编的 bionic 库；**宿主 glibc 的 openssl
+    拿来链会报 `__errno` / `__FD_SET_chk` 未定义**，别混用
+- 日志直接 `adb shell grep`，不用 `run-as`（`/data/local/tmp` 对 shell 可读）。
+
+设备侧常用环境变量同第 5 节；`HV_LOG=3` 会产出千万行级日志，只在定位到具体 pc 时短跑。
