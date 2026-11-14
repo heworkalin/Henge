@@ -295,9 +295,11 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
        firmware runs with the MMU off, where a watched VA is the PA of whatever it is building. */
     int watched = write && w && ((w ^ va) & ~0xfffull) == 0;
     if (write && !watched && cpu->m->watch_pa) {
+        /* Address granular here: the page is only what forces the slow path, and a whole page of
+           zero fill (and then the image being copied in) would bury the one store worth seeing. */
         HvWalk ww;
         hv_mmu_walk(cpu, va, HV_ACC_WRITE, el, &ww);
-        if ((ww.pa & ~0xfffull) == (cpu->m->watch_pa & ~0xfffull)) {
+        if ((ww.pa & ~0xfffull) == (cpu->m->watch_pa & ~0xfffull) && cpu->m->watch_pa - va < len) {
             watched = 1;
             w = cpu->m->watch_pa;
         }
@@ -332,10 +334,16 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                     FILE *f = fopen(p2, "a");
                     if (f) {
                         cap++;
-                        fprintf(f, "store %u at %#llx = %s pc %#llx x30 %#llx x0 %#llx x1 %#llx x2 %#llx\n",
-                                len, (unsigned long long) va, val, (unsigned long long) pc,
-                                (unsigned long long) cpu->x[30], (unsigned long long) cpu->x[0],
-                                (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[2]);
+                        fprintf(f, "store %u at %#llx (%s) = %s pc %#llx x30 %#llx\n",
+                                len, (unsigned long long) va,
+                                w == cpu->m->watch_va ? "va" : "pa", val, (unsigned long long) pc,
+                                (unsigned long long) cpu->x[30]);
+                        /* Every register, because the value came from one of them: the code that
+                           writes it usually loaded it from a buffer several instructions earlier. */
+                        fprintf(f, "  regs:");
+                        for (int r = 0; r < 16; r++)
+                            fprintf(f, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
+                        fprintf(f, "\n");
                         fclose(f);
                     }
                 }
