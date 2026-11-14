@@ -554,3 +554,8 @@ fffffe001cfaaea4: bl  0xd78b10             ; memmove(新分配的指针, 源, 0x
 
 所以问题不在"我们读错了表"：故障那一刻 guest 的表的确实没有这一条。
 下一步要问的是分配器的映射步骤为什么没落下这条 PTE。
+
+## 已排除项与现存假设
+
+排查过程中关掉的门、留下的两条假设、以及所有诊断开关和本地跑安装的方法，整理在
+[`kernel-boot-exclusions.md`](kernel-boot-exclusions.md)。动手前先看那份，避免重复走老路。
