@@ -367,6 +367,18 @@ final class InstallTab {
             } else {
                 return;
             }
+            /* This screen is an Activity field, the service is not: after the app has been in the
+               background the stage here is "idle" again while the download is still running, and
+               the early return below then drew "not downloading" over a download that was going
+               on. When nothing of our own is in flight, the service's state is the truth. */
+            if ("idle".equals(stage[0])) {
+                DownloadService.State now = DownloadService.state();
+                boolean sameBuild = now.name == null || now.name.isEmpty()
+                        || now.name.equals(chosen[0].build);
+                if (sameBuild && !DownloadService.State.IDLE.equals(now.phase)) {
+                    stage[0] = "download";
+                }
+            }
             /* Download progress belongs to the screen only while the pipeline is in its download
                stage; in every other stage the pipeline itself says what is happening. */
             if (!"download".equals(stage[0])) return;
