@@ -1947,7 +1947,12 @@ static int run_loop(HvCpu *cpu, int one) {
                                            the boot derives then comes from a known constant. Fill it
                                            from the host's own entropy instead -- the property is a
                                            32-byte name field, a u32 length and the value. */
-                                        {
+                                        /* Off by default: the value decides early_random(), which
+                                           decides the physmap slide, so a fresh seed per run makes
+                                           two runs differ in ways that are hard to compare. The
+                                           zeros iBoot leaves behind are reproducible; HENGE_RANDOM_SEED=1
+                                           turns the host's entropy back on. */
+                                        if (getenv("HENGE_RANDOM_SEED")) {
                                             size_t cap = 256u << 10;
                                             uint8_t *dt = malloc(cap);
                                             int ok = dt != NULL;
@@ -2076,25 +2081,33 @@ static int run_loop(HvCpu *cpu, int one) {
                     /* A spin like this is where panic() ends, and the message it formatted sits in
                        the stack this CPU is on. Scan it for printable runs: the console does not
                        print it, so the stack is the only place it is written down. */
-                    if (cpu->el == 1 && getenv("HV_STACKSCAN")) {
-                        uint8_t page[256];
-                        int printed = 0;
-                        for (uint64_t at = cpu->sp; at < cpu->sp + 0x4000 && printed < 8; at += sizeof page) {
+                    /* A panic formats its message into the stack it was raised on, and the console
+                       is not up yet this early, so the stack is the only place the words exist.
+                       Runs once per site at log 2 (the device default), or always with HV_STACKSCAN. */
+                    static int stack_scans;
+                    /* Only where there is a stack to read: the first stall of a run happens while
+                       the guest is still at its reset vector with sp == 0. The panic message is
+                       formatted into this stack and the console is not up yet, so the bytes are
+                       dumped raw -- a filter for long printable runs finds nothing when the frame
+                       in between is not text. */
+                    if (cpu->el == 1 && cpu->sp > 0xfffffe0010000000ull &&
+                        (getenv("HV_STACKSCAN") || (cpu->m->log >= 2 && stack_scans < 2))) {
+                        stack_scans++;
+                        uint64_t from = (cpu->sp - 0x800) & ~0xfull, to = from + 0x3000;
+                        fprintf(stderr, "hengevm: stack dump %d: pc %llx sp %llx, %#llx..%#llx\n",
+                                stack_scans, (unsigned long long) cpu->pc, (unsigned long long) cpu->sp,
+                                (unsigned long long) from, (unsigned long long) to);
+                        for (uint64_t at = from; at < to; at += 64) {
+                            uint8_t page[64];
                             HvWalk w;
                             hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &w);
                             if (w.fsc != 0 || hv_phys_read(cpu->m, w.pa, page, sizeof page) != 0) continue;
-                            int run = 0;
-                            for (unsigned k = 0; k < sizeof page; k++) {
-                                int ok = page[k] >= 0x20 && page[k] < 0x7f;
-                                if (ok) { run++; continue; }
-                                if (run >= 24) {
-                                    fprintf(stderr, "hengevm: stack %llx: %.*s\n",
-                                            (unsigned long long) (at + k - (unsigned) run), run,
-                                            (char *) page + k - run);
-                                    printed++;
-                                }
-                                run = 0;
-                            }
+                            fprintf(stderr, "hengevm: %llx |", (unsigned long long) at);
+                            for (unsigned k = 0; k < 64; k++) fprintf(stderr, " %02x", page[k]);
+                            fprintf(stderr, " |");
+                            for (unsigned k = 0; k < 64; k++)
+                                fputc(page[k] >= 0x20 && page[k] < 0x7f ? page[k] : '.', stderr);
+                            fprintf(stderr, "|\n");
                         }
                     }
                     fprintf(stderr, "hengevm: idle daif %x irq_line %d fiq_line %d cntp_ctl %llx "

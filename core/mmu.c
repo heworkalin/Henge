@@ -155,7 +155,28 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
         }
         if ((sctlr >> 19) & 1 && !read_only && (el == 0 ? el0_access : 1)) out->x = 0; /* WXN */
         int ok = acc == HV_ACC_READ ? out->r : acc == HV_ACC_WRITE ? out->w : out->x;
-        if (!ok) out->fsc = HV_FSC_PERMISSION(level);
+        if (!ok) {
+            out->fsc = HV_FSC_PERMISSION(level);
+            /* A write the walk refuses on a page the guest believes is its own stack: either the
+               guest mapped it read-only, or this engine dropped the write permission itself when
+               the page was taken for code. The descriptor, the inherited AP and the code-page flag
+               tell the two apart. */
+            static int logged;
+            if (cpu->m && cpu->m->log >= 2 && logged < 8 && acc == HV_ACC_WRITE) {
+                logged++;
+                HvRam *r = hv_ram_lookup(cpu->m, out->pa);
+                int code = 0;
+                if (r) {
+                    uint64_t pg = (out->pa - r->pa) >> HV_TLB_PAGE_BITS;
+                    if (pg < r->npages) code = __atomic_load_n(&r->code_pages[pg], __ATOMIC_RELAXED);
+                }
+                fprintf(stderr, "hengevm: perm fault pc %llx va %llx pa %llx L%d desc %llx "
+                                "ap %d ap_table %d ro %d code_page %d\n",
+                        (unsigned long long) cpu->m->access_pc, (unsigned long long) va,
+                        (unsigned long long) out->pa, level, (unsigned long long) desc, ap, ap_table,
+                        read_only, code);
+            }
+        }
         return;
     }
 }
