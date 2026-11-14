@@ -351,9 +351,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                         for (int r = 0; r < 16; r++)
                             fprintf(f, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
                         fprintf(f, "\n");
-                        fclose(f);
-                    }
-                    /* The firmware's own code, around the instruction that did the store.
+                        /* The firmware's own code, around the instruction that did the store.
                        The pc is a virtual address — the firmware does run with its MMU on — so it
                        is translated first; reading a physical window at the pc itself is what made
                        earlier dumps disassemble to something else entirely. */
@@ -387,6 +385,8 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                             }
                         }
                         free(code);
+                        fflush(f);
+                        fclose(f);
                     }
                 }
             }
