@@ -1,6 +1,8 @@
 package dev.henge.probe;
 
 import android.content.Context;
+
+import java.io.File;
 import android.content.SharedPreferences;
 
 /**
@@ -40,7 +42,7 @@ final class Prefs {
 
     private static android.content.SharedPreferences.Editor edit(Context c) {
         revision++;
-        return edit(c);
+        return sp(c).edit();
     }
 
     private static SharedPreferences sp(Context c) {
@@ -104,6 +106,39 @@ final class Prefs {
 
     static void setHideControls(Context c, boolean hide) {
         edit(c).putBoolean("display.hideControls", hide).apply();
+    }
+
+    /**
+     * Whether this exact file has already passed the integrity check.
+     *
+     * Keyed by path, length and modification time: a 16 GB read per install would make every
+     * attempt slower than the install itself, and any change to the file changes one of those. A
+     * file replaced by an identical copy (same size, same timestamp) would be skipped — that is the
+     * one case this cannot see, and it is not a case that happens by accident.
+     */
+    static boolean isVerified(Context c, File f) {
+        android.content.SharedPreferences p = sp(c);
+        return f != null && f.exists()
+                && f.getAbsolutePath().equals(p.getString("ipsw.verified.path", null))
+                && f.length() == p.getLong("ipsw.verified.size", -1)
+                && f.lastModified() == p.getLong("ipsw.verified.mtime", -2);
+    }
+
+    static void markVerified(Context c, File f) {
+        if (f == null || !f.exists()) return;
+        sp(c).edit()
+                .putString("ipsw.verified.path", f.getAbsolutePath())
+                .putLong("ipsw.verified.size", f.length())
+                .putLong("ipsw.verified.mtime", f.lastModified())
+                .apply();
+    }
+
+    static void clearVerified(Context c) {
+        sp(c).edit()
+                .remove("ipsw.verified.path")
+                .remove("ipsw.verified.size")
+                .remove("ipsw.verified.mtime")
+                .apply();
     }
 
     /** An IPSW the user brought in themselves; used instead of downloading when set. */

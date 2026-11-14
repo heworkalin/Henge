@@ -204,12 +204,17 @@ final class InstallTab {
                 action.setText("正在停止…");
                 return;
             }
-            if (installing[0] || InstallService.running()) {
-                /* The service outlives this screen, so a second tap must stop the run that is
-                 * actually happening rather than start another one beside it. */
-                installing[0] = true;
+            if (installing[0]) {
                 cancelled.set(true);
                 action.setText("正在停止…");
+                InstallService.stop(a);
+                return;
+            }
+            if (InstallService.running()) {
+                /* A run this screen is not following (the previous attempt's service outlived its
+                 * thread). End it and let the next tap start a fresh one; marking this screen as
+                 * installing would make the next tap stop a run it never started. */
+                action.setText("正在停止上一次…");
                 InstallService.stop(a);
                 return;
             }
@@ -236,7 +241,7 @@ final class InstallTab {
             action.setText("停止安装");
             final boolean ours = (localFile == null);   // downloaded by this app, so it may be re-fetched
             // A restore is the one operation where being reclaimed costs an hour.
-            InstallService.start(a);
+            final int run = InstallService.start(a);
             new Thread(() -> {
                 /*
                  * Check the image before touching the machine. Nothing downstream does: libzip
@@ -275,7 +280,7 @@ final class InstallTab {
                         return;
                     }
                     installing[0] = false;
-                    InstallService.stop(a);
+                    InstallService.stop(a, run);
                     a.runOnUiThread(() -> {
                         action.setText("下载并安装");
                         showProgress(progress, bar, "镜像校验失败，请检查这个文件或重新下载\n" + why);
@@ -285,7 +290,7 @@ final class InstallTab {
                 if (check != null) Prefs.markVerified(a, source);
                 String outcome = install(a, dir, source, progress, cancelled);
                 installing[0] = false;
-                InstallService.stop(a);
+                InstallService.stop(a, run);
                 a.runOnUiThread(() -> {
                     action.setText("下载并安装");
                     if (outcome == null) {

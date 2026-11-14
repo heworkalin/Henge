@@ -28,15 +28,31 @@ public class InstallService extends Service {
 
     /** Set once the service has actually gone foreground; guards against asking twice. */
     private static volatile boolean up;
+    /**
+     * Which run the service is up for. A finished thread from an earlier attempt must not stop
+     * the service a later attempt has just started: it would take the new run's foreground away
+     * and the platform would then end the process for starting a foreground service and never
+     * entering the foreground, which is what a "tap again and it crashes" looked like.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger generation =
+            new java.util.concurrent.atomic.AtomicInteger();
 
-    static void start(Context c) {
+    /** Starts the service and returns the id of this run (see {@link #generation}). */
+    static int start(Context c) {
         /* No "already up" short-circuit: the flag only says an instance exists, and after a failed
          * run the instance can be on its way out while the screen still believes it is running.
          * A second start command is harmless (onStartCommand re-enters the foreground), while a
          * skipped one leaves the caller doing a restore with no foreground service behind it. */
+        int g = generation.incrementAndGet();
         Intent intent = new Intent(c, InstallService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) c.startForegroundService(intent);
         else c.startService(intent);
+        return g;
+    }
+
+    /** Whether the run that was handed this id is still the current one. */
+    static boolean current(int run) {
+        return generation.get() == run;
     }
 
     /** Whether an install service is up: the screen's button state is derived from this rather
@@ -45,6 +61,16 @@ public class InstallService extends Service {
         return up;
     }
 
+    /** Stops the service, but only if its run is still this one. */
+    static void stop(Context c, int run) {
+        if (!current(run)) {
+            AppLog.i("安装服务: 运行 " + run + " 已被更新的运行取代，不停止服务");
+            return;
+        }
+        c.stopService(new Intent(c, InstallService.class));
+    }
+
+    /** Stops whatever run is current, for the screen's own "stop" button. */
     static void stop(Context c) {
         c.stopService(new Intent(c, InstallService.class));
     }
