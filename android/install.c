@@ -245,6 +245,7 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     /* HV_PTW_LOG: record writes into pages the walk is using as translation tables, and
        HV_SLOW_MEM: send every load and store through C so those writes are all visible. */
     g_machine.ptw_log = getenv("HV_PTW_LOG") != NULL;
+    g_machine.log_pc = getenv("HV_LOGPC") ? strtoull(getenv("HV_LOGPC"), NULL, 16) : 0;
     /* HV_PTW_SNAP: sample the tables every N blocks and keep the differences, which is the
        write history of every entry without slowing the guest down to catch the stores. */
     g_machine.ptw_snap_every = getenv("HV_PTW_SNAP") ? (uint32_t) atoi(getenv("HV_PTW_SNAP")) : 0;

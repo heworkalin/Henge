@@ -98,6 +98,7 @@ static int run_one(const char *name, void *code_run, size_t off, size_t len, HvM
            (unsigned long long) cpu.far_el1, (unsigned long long) cpu.x[9],
            (unsigned long long) cpu.x[10], (unsigned long long) cpu.x[11]);
     if (r != HV_EXIT_HALT) {
+        hv_pc_hist_dump(&cpu);   /* which block was running when it went wrong */
         printf("%s: dispatcher returned %d at pc %#llx (insn %08x) esr %#llx far %#llx\n", name, r,
                (unsigned long long) cpu.pc, cpu.exit_insn, (unsigned long long) cpu.esr_el1,
                (unsigned long long) cpu.far_el1);
@@ -204,6 +205,8 @@ int main(void) {
         failed += run_one("bitops", code_run, BITOPS_OFF, BITOPS_LEN, &m, 768);
     if (!only || !strcmp(only, "memops"))
         failed += run_one("memops", code_run, MEMOPS_OFF, MEMOPS_LEN, &m, OUT_BYTES);
-    printf("%d of 2 programs differ\n", failed);
+    if (!only || !strcmp(only, "mathops"))
+        failed += run_one("mathops", code_run, MATHOPS_OFF, MATHOPS_LEN, &m, 25 * 8);
+    printf("%d of 3 programs differ\n", failed);
     return failed != 0;
 }

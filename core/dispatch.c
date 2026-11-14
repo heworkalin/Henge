@@ -1893,6 +1893,12 @@ static int run_loop(HvCpu *cpu, int one) {
         if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= m->jit.used || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
             fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
+        if (m->log_pc && cpu->pc == m->log_pc && m->log_pc_hits++ < 4000)
+            fprintf(stderr, "hengevm: logpc %llx el%u x0 %llx x1 %llx x2 %llx x3 %llx x19 %llx x24 %llx\n",
+                    (unsigned long long) cpu->pc, cpu->el, (unsigned long long) cpu->x[0],
+                    (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[2],
+                    (unsigned long long) cpu->x[3], (unsigned long long) cpu->x[19],
+                    (unsigned long long) cpu->x[24]);
         hv_enter(cpu, b->code);
 
         /* An undefined instruction at EL1 is where the panic path traps to the debugger (the

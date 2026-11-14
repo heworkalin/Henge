@@ -212,3 +212,98 @@ memops_prog:
     add     sp, sp, #32
     ret
     .size   memops_prog, .-memops_prog
+
+// Multiply, divide, carry and conditional compare: the arithmetic an allocator uses to turn a
+// size and an index into an address. Cheap to get subtly wrong, and a wrong address is exactly
+// what a missing page table entry would look like from the outside.
+//
+// Operands come from [x0] like the program above, results go to [x0+0x400]; a division by zero
+// and INT_MIN / -1 are both in the operand mix on purpose, since those are the cases an emulator
+// is most likely to answer differently from hardware.
+    .text
+    .globl  mathops_prog
+    .type   mathops_prog, %function
+mathops_prog:
+    stp     x19, x20, [sp, #-32]!
+    stp     x21, x22, [sp, #16]
+    add     x25, x0, #0x400
+    ldp     x1, x2, [x0]
+    ldp     x3, x4, [x0, #16]
+    ldp     x5, x6, [x0, #32]
+    ldp     x7, x8, [x0, #48]
+
+    mul     x9, x1, x2
+    str     x9, [x25], #8
+    madd    x9, x1, x2, x3
+    str     x9, [x25], #8
+    msub    x9, x1, x2, x3
+    str     x9, [x25], #8
+    mneg    x9, x1, x2
+    str     x9, [x25], #8
+    smulh   x9, x1, x2
+    str     x9, [x25], #8
+    umulh   x9, x1, x2
+    str     x9, [x25], #8
+    smull   x9, w1, w2
+    str     x9, [x25], #8
+    umull   x9, w1, w2
+    str     x9, [x25], #8
+    smaddl  x9, w1, w2, x3
+    str     x9, [x25], #8
+    umaddl  x9, w1, w2, x3
+    str     x9, [x25], #8
+    smsubl  x9, w1, w2, x3
+    str     x9, [x25], #8
+    umsubl  x9, w1, w2, x3
+    str     x9, [x25], #8
+    sdiv    x9, x1, x2
+    str     x9, [x25], #8
+    udiv    x9, x1, x2
+    str     x9, [x25], #8
+    sdiv    w9, w1, w2
+    uxtw    x9, w9
+    str     x9, [x25], #8
+    udiv    w9, w1, w2
+    uxtw    x9, w9
+    str     x9, [x25], #8
+    mul     w9, w1, w2
+    uxtw    x9, w9
+    str     x9, [x25], #8
+
+    adds    x9, x1, x2
+    adc     x10, x3, x4
+    str     x10, [x25], #8
+    subs    x9, x1, x2
+    sbc     x10, x3, x4
+    str     x10, [x25], #8
+    adds    x9, x1, x2
+    adcs    x10, x3, x4
+    str     x10, [x25], #8
+    cmp     x1, x2
+    ngc     x9, x3
+    str     x9, [x25], #8
+
+    lslv    x9, x1, x2
+    str     x9, [x25], #8
+    lsrv    x9, x1, x2
+    str     x9, [x25], #8
+    asrv    x9, x1, x2
+    str     x9, [x25], #8
+    rorv    x9, x1, x2
+    str     x9, [x25], #8
+
+    cmp     x1, x2
+    ccmp    x3, x4, #0x5, ne
+    cset    x9, eq
+    str     x9, [x25], #8
+    sxtw    x9, w2
+    str     x9, [x25], #8
+    uxtw    x9, w2
+    str     x9, [x25], #8
+    sxtb    x9, w4
+    str     x9, [x25], #8
+
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #32
+    ret
+    .size   mathops_prog, .-mathops_prog

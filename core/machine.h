@@ -251,9 +251,12 @@ typedef struct HvMachine {
        is either a write that never happened, one that was undone, or one that landed in a
        different slot; logging the writes into the tables tells those three apart without
        guessing which kernel function to break on. */
+    uint64_t log_pc;             /* HV_LOGPC: print the registers when a block starts here */
+    uint64_t log_pc_hits;
     int ptw_log;
     uint32_t ptw_n;
     uint64_t ptw_pages[512];
+    uint64_t ptw_win[512];       /* the 2 MB VA window each table page serves */
     uint8_t *ptw_shadow;         /* the same pages as last sampled: the diff is the write history */
     uint32_t ptw_snap_every;     /* in walks; 0 = never */
     uint32_t ptw_walks;

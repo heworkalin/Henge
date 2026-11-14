@@ -107,7 +107,10 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
                 uint64_t page = base & ~0xfffull;
                 uint32_t k = 0;
                 for (; k < m->ptw_n && k < 512; k++) if (m->ptw_pages[k] == page) break;
-                if (k == m->ptw_n && m->ptw_n < 512) m->ptw_pages[m->ptw_n++] = page;
+                if (k == m->ptw_n && m->ptw_n < 512) {
+                    m->ptw_win[m->ptw_n] = va & ~((1ull << 21) - 1);
+                    m->ptw_pages[m->ptw_n++] = page;
+                }
             }
             if (!hpd) {
                 pxn_table |= (desc >> 59) & 1;

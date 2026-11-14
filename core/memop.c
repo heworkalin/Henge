@@ -995,9 +995,10 @@ void hv_ptw_sample(HvMachine *m) {
             memcpy(&a, was + off, 8);
             memcpy(&b, now + off, 8);
             if (a == b) continue;
-            fprintf(stderr, "hengevm: ptw %llx [%zu] %016llx -> %016llx (blocks %llu)\n",
+            fprintf(stderr, "hengevm: ptw %llx [%zu] %016llx -> %016llx va %llx (blocks %llu)\n",
                     (unsigned long long) m->ptw_pages[k], off / 8,
                     (unsigned long long) a, (unsigned long long) b,
+                    (unsigned long long) (m->ptw_win[k] + (uint64_t) (off >> 3) * 0x1000ull),
                     (unsigned long long) m->stats.blocks);
             memcpy(was + off, &b, 8);
         }
