@@ -385,7 +385,9 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                            so it is translated first; reading a physical window at the pc itself
                            is what made earlier dumps disassemble to something else entirely. */
                         static int fw_dumps;
-                        if (fw_dumps < 64) {
+                        /* Only the firmware's own stores: the kernel hits number in the hundreds and
+                           used up the window budget before the decoder ever ran. */
+                        if (fw_dumps < 256 && w != cpu->m->watch_va) {
                             fw_dumps++;
                             HvWalk cw;
                             hv_mmu_walk(cpu, pc, HV_ACC_EXEC, el, &cw);
@@ -395,6 +397,28 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                             fprintf(f, "  code pc %#llx -> pa %#llx  insn %08x %08x %08x %08x\n",
                                     (unsigned long long) pc, (unsigned long long) cpa,
                                     words[0], words[1], words[2], words[3]);
+                            /* Once, the whole firmware text: 64 KB windows around a hit are
+                               enough to see the loop but not the function that set it up. */
+                            static int ibec_done;
+                            if (!ibec_done) {
+                                ibec_done = 1;
+                                uint8_t *txt = malloc(4u << 20);
+                                if (txt && hv_phys_read(cpu->m, 0x70080000ull, txt, 4u << 20) == 0) {
+                                    char p5[512];
+                                    snprintf(p5, sizeof p5, "%s", wd);
+                                    char *sl5 = strrchr(p5, '/');
+                                    if (sl5) {
+                                        snprintf(sl5 + 1, sizeof p5 - (size_t)(sl5 + 1 - p5), "ibec.bin");
+                                        FILE *tf = fopen(p5, "wb");
+                                        if (tf) {
+                                            fwrite(txt, 1, 4u << 20, tf);
+                                            fclose(tf);
+                                            fprintf(f, "  ibec text pa 0x70080000..0x70480000 written\n");
+                                        }
+                                    }
+                                }
+                                free(txt);
+                            }
                             uint8_t *code = malloc(1u << 16);
                             uint64_t win = cpa & ~0xffffull;
                             if (code && hv_phys_read(cpu->m, win, code, 1u << 16) == 0) {
