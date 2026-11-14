@@ -499,6 +499,8 @@ static HvCpu *cpu_by_mpidr(HvMachine *m, uint64_t mpidr) {
 }
 
 /* PSCI 1.0. */
+unsigned long long hv_hvc_count, hv_hvc_last_fn, hv_hvc_last_pc;
+
 /* vmapple's own hypercalls: the CPU service range (PAC keys) and the OEM service range (absolute
    time offset, boot session UUID, vCPU kick). The kernel sets its PAC keys from assembly before it
    can print anything, and that code spins on a non-zero return -- `cbnz x0, .` in pac_asm.h -- so a
@@ -677,7 +679,10 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         hv_take_exception(cpu, HV_EXC_SYNC, HV_EC_SVC64 << 26 | 1u << 25 | imm16, 0, 0, pc + 4);
         return 1;
     }
-    if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
+    if (opc == 0 && ll == 2 && cpu->el == 1) {
+        hv_hvc_count++;
+        hv_hvc_last_fn = (uint32_t) cpu->x[0];
+        hv_hvc_last_pc = pc; /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
         {
             /* Which hypercalls the kernel makes, in order: the PAC key setup is the first thing it
                does, so an hvc list that starts later means the entry never got that far. */

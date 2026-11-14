@@ -458,7 +458,21 @@ flush:
    microsecond). A request for this CPU (an interrupt, a TLBI) ends the wait, and
    so does a short timeout, so its timer and devices are seen to. Without a
    monitor to watch it leaves at once, as before. HV_WFE_SPIN: always that. */
+/* Where the guest waits. A guest that stops making progress is almost always parked at one of
+   these, and which one says who it is waiting for. One line per distinct site. */
+static void wait_site(HvCpu *cpu, uint64_t pc, const char *what) {
+    static uint64_t seen[24];
+    static int n;
+    for (int i = 0; i < n; i++) if (seen[i] == pc) return;
+    if (n < 24) {
+        seen[n++] = pc;
+        fprintf(stderr, "hengevm: %s site #%d at pc %llx el%u daif %x\n", what, n,
+                (unsigned long long) pc, cpu->el, cpu->daif);
+    }
+}
+
 static uint32_t wfe(HvCpu *cpu) {
+    if (cpu->m->log >= 1 || 1) wait_site(cpu, cpu->pc, "wfe");
     static int spin = -1;
     if (spin < 0) spin = getenv("HV_WFE_SPIN") != NULL;
     uint64_t va = cpu->excl_addr;
@@ -674,6 +688,7 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
         cpu->excl_addr = ~0ull;
         return 0;
     case HV_OP_WFI:
+        wait_site(cpu, info->pc, "wfi");
         cpu->pc = info->pc + 4;
         cpu->exit_reason = HV_EXIT_WFI;
         return 1;
@@ -1735,6 +1750,16 @@ static int run_loop(HvCpu *cpu, int one) {
                     }
                 }
                 hv_mmio_hist_dump(cpu->m);
+                {
+                    extern unsigned long long hv_hvc_count, hv_hvc_last_fn, hv_hvc_last_pc;
+                    static unsigned long long was;
+                    fprintf(stderr, "hengevm: hvc/s %llu (total %llu, last fn %llx pc %llx) | ",
+                            hv_hvc_count - was, hv_hvc_count,
+                            (unsigned long long) hv_hvc_last_fn, (unsigned long long) hv_hvc_last_pc);
+                    was = hv_hvc_count;
+                }
+                fprintf(stderr, "hengevm: gen %u nblocks %d used %llu | ", m->jit_gen, m->nblocks,
+                        (unsigned long long) m->jit.used);
                 fprintf(stderr, "hengevm: beat pc %llx el%u icount %llu blocks %llu why %d "
                                 "slow_mem %d memops %llu\n",
                         (unsigned long long) cpu->pc, cpu->el,
