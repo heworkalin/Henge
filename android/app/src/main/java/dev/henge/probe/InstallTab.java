@@ -156,6 +156,9 @@ final class InstallTab {
         bar.setProgressTintList(android.content.res.ColorStateList.valueOf(Theme.primary(a)));
         bar.setProgressBackgroundTintList(
                 android.content.res.ColorStateList.valueOf(Theme.withAlpha(Theme.primary(a), 0.18f)));
+        /* What this screen showed before it was rebuilt. */
+        if (lastText != null) progress.setText(lastText);
+        if (lastBar >= 0) bar.setProgress(lastBar);
         LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(a, 6));
         barLp.setMargins(Ui.dp(a, 16), 0, Ui.dp(a, 16), Ui.dp(a, 8));
@@ -375,7 +378,10 @@ final class InstallTab {
                 DownloadService.State now = DownloadService.state();
                 boolean sameBuild = now.name == null || now.name.isEmpty()
                         || now.name.equals(chosen[0].build);
-                if (sameBuild && !DownloadService.State.IDLE.equals(now.phase)) {
+                /* Only a download that is actually running: the action button means "stop"
+                   whenever this stage is "download", so adopting it for a finished download
+                   turned the "安装" button into a cancel and the tap came back as a failure. */
+                if (sameBuild && DownloadService.State.RUNNING.equals(now.phase)) {
                     stage[0] = "download";
                 }
             }
@@ -485,7 +491,15 @@ final class InstallTab {
     }
 
     /** Sets the state line and, when it carries a percentage, the bar under it. */
+    /* The last thing this screen said. The pipeline runs on a thread of its own and keeps writing
+       through views that a screen change has already thrown away, so the message is kept here as
+       well and a rebuilt screen paints it again -- otherwise switching away and back looked like
+       the install had stopped. */
+    private static volatile String lastText;
+    private static volatile int lastBar = -1;
+
     private static void showProgress(TextView text, android.widget.ProgressBar bar, String message) {
+        lastText = message;
         text.setText(message);
         java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile("(\\d{1,3})%").matcher(message);
@@ -494,6 +508,7 @@ final class InstallTab {
         } else if (message.contains("完成")) {
             bar.setProgress(1000);
         }
+        lastBar = bar.getProgress();
     }
 
     private static String localLabel(Activity a) {
