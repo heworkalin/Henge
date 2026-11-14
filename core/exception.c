@@ -57,6 +57,34 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
        its own vector with no log of how leaves nothing to go on. */
     /* Not the SVCs: a user process making syscalls says nothing, and there is enough of that to
        fill any limit and hide the one exception that matters. */
+    /* The last syscalls a stalled userland made say what it was doing when it stopped; a file,
+       because there are tens of thousands of them and stderr at this rate buries everything. */
+    if (type == HV_EXC_SYNC && ((esr >> 26) == 0x15) && cpu->el == 0) {
+        static FILE *sf;
+        static int opened;
+        if (!opened) {
+            opened = 1;
+            const char *p = getenv("HENGE_SYSCALL_LOG");
+            if (p && *p) sf = fopen(p, "w");
+        }
+        /* open() carries its path in x0: the last one before a stall names the file the process
+           was waiting on. */
+        char path[160] = "";
+        if (sf && cpu->x[16] == 5 && cpu->x[0]) {
+            int n = 0;
+            for (; n < 127; n++) {
+                HvWalk w; uint8_t ch = 0;
+                hv_mmu_walk(cpu, cpu->x[0] + (uint64_t) n, HV_ACC_READ, 0, &w);
+                if (w.fsc != 0 || hv_phys_read(cpu->m, w.pa, &ch, 1) != 0 || ch == 0) break;
+                path[n] = (char) ch;
+            }
+            path[n] = 0;
+        }
+        if (sf) fprintf(sf, "%llu x16 %llu x0 %llx x1 %llx x2 %llx x3 %llx %s\n",
+                        (unsigned long long) cpu->icount, (unsigned long long) cpu->x[16],
+                        (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                        (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3], path);
+    }
     if (cpu->m->log >= 2 && (type != HV_EXC_SYNC || (esr >> 26) != 0x15) &&
         cpu->m->stats.exceptions + cpu->m->stats.interrupts < 4096)
         fprintf(stderr, "hengevm: take %s esr %08x far %llx at pc %llx el%u vector %llx\n",

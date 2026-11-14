@@ -282,7 +282,9 @@ static void vmapple_serial_out(void *opaque, uint8_t c) {
     if (c == '\r') return;
     if (c == '\n') {
         line[n] = 0;
-        if (m->log >= 2 && n) fprintf(stderr, "hengevm: serial: %s\n", line);
+        /* log 1, not 2: the port's own words are the cheapest evidence there is, and log 2
+           floods the log with per-helper lines that hide them. */
+        if (m->log >= 1 && n) fprintf(stderr, "hengevm: serial: %s\n", line);
         n = 0;
         return;
     }

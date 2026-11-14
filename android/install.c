@@ -194,14 +194,6 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     }
     if (cache_dir && *cache_dir) setenv("XDG_CACHE_HOME", cache_dir, 1);
 
-    if (hv_disk_open(&g_disk, disk, 0, 0) != 0) {
-        say(&cursor, end, "  root disk      : FAILED to open %s (%s)\n", disk, strerror(errno));
-        return -1;
-    }
-    if (hv_disk_open(&g_aux, aux, 16384, 0) != 0) {
-        say(&cursor, end, "  auxiliary      : FAILED to open %s (%s)\n", aux, strerror(errno));
-        return -1;
-    }
 
     // One machine per process, and the graphics device says so: reims-vgpu refuses to create a
     // second display with the same serial number, which is what an install started while a boot
@@ -218,9 +210,23 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
             return -1;
         }
     }
+    /* Before the disks are opened, not after: the teardown closes them, and a machine built on
+       descriptors that have just been closed answers every disk request with EBADF. */
     hv_android_vm_teardown();
     hv_disk_close(&g_disk);
     hv_disk_close(&g_aux);
+
+    if (hv_disk_open(&g_disk, disk, 0, 0) != 0) {
+        say(&cursor, end, "  root disk      : FAILED to open %s (%s)\n", disk, strerror(errno));
+        return -1;
+    }
+    if (getenv("HENGE_DISK_LOG"))
+        fprintf(stderr, "hengevm: disks root fd %d size %#llx, aux fd %d size %#llx\n",
+                g_disk.fd, (unsigned long long) g_disk.size, g_aux.fd, (unsigned long long) g_aux.size);
+    if (hv_disk_open(&g_aux, aux, 16384, 0) != 0) {
+        say(&cursor, end, "  auxiliary      : FAILED to open %s (%s)\n", aux, strerror(errno));
+        return -1;
+    }
 
     memset(&g_machine, 0, sizeof g_machine);
     memset(&g_board, 0, sizeof g_board);
@@ -353,7 +359,9 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
         if (pthread_create(&t, NULL, cpu_thread, &g_board.cpu[i]) == 0) pthread_detach(t);
     }
     g_running = 1;
-    {
+    /* HENGE_KICKER=0 turns it off for a comparison run; on by default because without it the
+       guest gets a timer only when a block happens to end. */
+    if (!getenv("HENGE_KICKER") || atoi(getenv("HENGE_KICKER")) != 0) {
         pthread_t kt;
         if (pthread_create(&kt, NULL, kicker_thread, NULL) == 0) pthread_detach(kt);
     }

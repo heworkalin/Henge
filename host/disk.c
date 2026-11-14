@@ -3,6 +3,7 @@
 #endif
 
 #include <errno.h>
+#include <stdio.h>
 #include "../core/machine.h"
 #include "disk.h"
 
@@ -51,6 +52,9 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
 }
 
 void hv_disk_close(HvDisk *d) {
+    if (getenv("HENGE_DISK_LOG"))
+        fprintf(stderr, "hengevm: disk close fd %d wfd %d size %#llx\n", d->fd, d->wfd,
+                (unsigned long long) d->size);
     if (d->fd >= 0) close(d->fd);
     if (d->wfd >= 0) close(d->wfd);
     d->fd = d->wfd = -1;

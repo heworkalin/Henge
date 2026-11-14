@@ -1,3 +1,6 @@
+#include <errno.h>
+#include <string.h>
+
 #include "bdif.h"
 
 #include <stdio.h>
@@ -170,7 +173,14 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
             void *buf = hv_phys_ptr(b->m, req[1].addr, req[1].len);
             uint64_t at = (uint64_t)sector[2] * 512;
             if (buf && req[1].flags == DATA_FLAGS_READ) {
+                errno = 0;
                 if (hv_disk_read(disk, at, buf, req[1].len) == 0) ret = 0, hv_dma_written(b->m, req[1].addr, req[1].len);
+                else {
+                    int e = errno;
+                    fprintf(stderr, "bdif: read failed at %#llx len %u errno %d (%s) size %#llx\n",
+                            (unsigned long long) at, req[1].len, e, strerror(e),
+                            (unsigned long long) disk->size);
+                }
             } else if (buf && req[1].flags == DATA_FLAGS_WRITE) {
                 if (hv_disk_write(disk, at, buf, req[1].len) == 0) ret = 0;
             }
@@ -179,8 +189,14 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
     if (b->m->log >= 2 || ret) {
         uint32_t sector[4] = {0};
         hv_phys_read(b->m, req[0].addr, sector, sizeof sector);
-        fprintf(stderr, "bdif %s: sector %u len %u flags %x -> %s\n", disk == b->aux ? "aux" : "root", sector[2],
-                req[1].len, req[1].flags, ret ? "failed" : "ok");
+        /* Why it failed matters: a buffer the guest handed us outside its RAM, a sector past the
+           end of the image, and a read error are three different bugs. */
+        void *dbg = hv_phys_ptr(b->m, req[1].addr, req[1].len);
+        fprintf(stderr, "bdif %s: sector %u len %u flags %x -> %s (cmd_len %u buf %s at %#llx "
+                        "image %#llx)\n", disk == b->aux ? "aux" : "root", sector[2],
+                req[1].len, req[1].flags, ret ? "failed" : "ok", req[0].len,
+                dbg ? "ok" : "OUTSIDE", (unsigned long long) req[1].addr,
+                (unsigned long long) (disk ? disk->size : 0));
     }
     hv_phys_write(b->m, req[2].addr, &ret, 1);
 }

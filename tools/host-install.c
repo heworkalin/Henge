@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -75,6 +76,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no commpage: counter reads will use the helper path\n");
 
     mkdir(work, 0700);
+    /* One installer per work directory: two share the sparse disk, the aux image and every
+       dump, so a second one silently corrupts the first one's evidence. */
+    {
+        char lock[640];
+        snprintf(lock, sizeof lock, "%s/.lock", work);
+        int lfd = open(lock, O_RDWR | O_CREAT, 0600);
+        if (lfd < 0 || flock(lfd, LOCK_EX | LOCK_NB) != 0) {
+            fprintf(stderr, "another installer is using %s; stop it first "
+                            "(pgrep -af host-install)\n", work);
+            return 1;
+        }
+    }
     char disk[512], aux[512];
     snprintf(disk, sizeof disk, "%s/disk.img", work);
     snprintf(aux, sizeof aux, "%s/aux.img", work);

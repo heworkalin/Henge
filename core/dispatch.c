@@ -1379,6 +1379,10 @@ static int run_loop(HvCpu *cpu, int one) {
                             if (!kf_is_kernel(h)) continue;
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
                             if (getenv("HV_SLOW_MEM")) cpu->m->slow_mem = 1;
+                            /* HV_NO_KFIX=1 skips the rebase. iBoot is supposed to have done it
+                               already, and doing it twice adds the base twice; which of the two
+                               is true for a given firmware is exactly what this switch is for. */
+                            if (!getenv("HV_NO_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
                             /* The moment worth keeping: the firmware has finished with the image
                                and the kernel has not run yet, so whatever is wrong in it is the
                                firmware's doing alone. */
