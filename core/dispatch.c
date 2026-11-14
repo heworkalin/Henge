@@ -358,6 +358,8 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
    its cost somewhere between resolving the pc and leaving the translated code again, and only these
    three numbers can say which. */
 static uint64_t g_t_lookup, g_t_enter, g_n_lookup, g_n_enter;
+static int g_timing = -1;   /* HV_BLOCKTIME=1: sample the cost of one block. Off: two counter
+                               reads per block are a measurable part of the block itself. */
 
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
@@ -477,7 +479,7 @@ static void wait_site(HvCpu *cpu, uint64_t pc, const char *what) {
 }
 
 static uint32_t wfe(HvCpu *cpu) {
-    if (cpu->m->log >= 1 || 1) wait_site(cpu, cpu->pc, "wfe");
+    if (cpu->m->log >= 1) wait_site(cpu, cpu->pc, "wfe");
     static int spin = -1;
     if (spin < 0) spin = getenv("HV_WFE_SPIN") != NULL;
     uint64_t va = cpu->excl_addr;
@@ -1197,6 +1199,7 @@ static uint32_t ktrace_n;
 uint64_t g_t_biglock, g_t_run; /* wall time a cpu spends waiting for the machine lock */
 
 int hv_run(HvCpu *cpu) {
+    if (g_timing < 0) g_timing = getenv("HV_BLOCKTIME") != NULL;
     if (cpu->pc_state) cpu->pc_state->thread = mach_thread_self();
     uint64_t t0 = mach_absolute_time();
     hv_big_lock(cpu->m);
@@ -1343,10 +1346,10 @@ static int run_loop(HvCpu *cpu, int one) {
         }
         last_fault = ~0ull;
         uint64_t flushes = m->stats.block_flushes;
-        uint64_t tl0 = mach_absolute_time();
+        uint64_t tl0 = 0;
+        if (g_timing) tl0 = mach_absolute_time();
         HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail);
-        g_t_lookup += mach_absolute_time() - tl0;
-        g_n_lookup++;
+        if (g_timing) { g_t_lookup += mach_absolute_time() - tl0; g_n_lookup++; }
         /* A full flush while translating freed the slot the last exit came through,
            and new blocks may have it now: chaining it would rewrite one of theirs. */
         if (m->stats.block_flushes != flushes) pending_chain = NULL;
@@ -1569,10 +1572,11 @@ static int run_loop(HvCpu *cpu, int one) {
                     }
                 }
             }
-            if (!m->slow_mem) {
-                m->slow_mem = 1;
-                __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);  /* re-translate with it */
-            }
+            /* Nothing here may turn diagnostics on by itself: this used to set slow_mem for every
+               run from the moment the kernel started, which sends every load and store of the
+               guest through the C path and re-translates everything -- the guest then retires
+               about a thousand blocks a second with the host busy the whole time. slow_mem stays
+               an opt-in (HV_SLOW_MEM) as it is upstream. */
         }
         /*
          * A register the block changed without its own instructions changing it: the block's entry
@@ -1763,6 +1767,7 @@ static int run_loop(HvCpu *cpu, int one) {
                     }
                 }
                 hv_mmio_hist_dump(cpu->m);
+                if (cpu->index == 0) print_stats(cpu, 1);   /* the engine counts its own time; ask for it */
                 {
                     extern unsigned long long hv_hvc_count, hv_hvc_last_fn, hv_hvc_last_pc;
                     static unsigned long long was;
@@ -2120,11 +2125,13 @@ static int run_loop(HvCpu *cpu, int one) {
                 dc_last = v;
             }
         }
-        {
+        if (g_timing) {
             uint64_t te0 = mach_absolute_time();
             hv_enter(cpu, b->code);
             g_t_enter += mach_absolute_time() - te0;
             g_n_enter++;
+        } else {
+            hv_enter(cpu, b->code);
         }
 
         /* An undefined instruction at EL1 is where the panic path traps to the debugger (the

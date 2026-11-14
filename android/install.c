@@ -252,6 +252,9 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
        a restore that panics in firmware needs: the moment before the panic matters more than the
        panic, and the guest only reports the last one. */
     g_machine.log = getenv("HV_LOG") ? atoi(getenv("HV_LOG")) : 2;
+    /* The engine counts where its own time goes (translate, device-lock waits, wfe waits) but only
+       prints it when a sampling interval is set, and nothing ever set one. */
+    g_machine.stats_interval = getenv("HV_STATS") ? strtoull(getenv("HV_STATS"), NULL, 10) : 0;
     /* HV_TRACE keeps the last 256 block entries (VA, x0, x4) so a fault can be read backwards;
        the per-block print stays at log 4, or tracing would be the noise it is meant to explain. */
     g_machine.trace = getenv("HV_TRACE") != NULL;
