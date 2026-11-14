@@ -169,7 +169,6 @@ final class InstallTab {
         buttons.setPadding(pad, Ui.dp(a, 8), pad, Ui.dp(a, 12));
         final AtomicBoolean cancelled = new AtomicBoolean(false);
         final boolean[] busy = {false};
-        final Downloader.Progress[] sink = new Downloader.Progress[1];
         final android.widget.Button action = Ui.primaryButton(a, "下载并安装", () -> { });
         buttons.addView(action, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -198,128 +197,155 @@ final class InstallTab {
         };
         refreshWaiting.run();
 
-        final boolean[] installing = {false};
-        /* Set when this screen asks for a download: until the service reports that it is running,
-           the state object still describes the previous attempt and must not be painted. */
-        final boolean[] starting = {false};
+        /* What the pipeline is doing right now. One button starts it and one button stops it,
+           wherever it has got to: checking, downloading, verifying, installing. */
+        final String[] stage = {"idle"};
 
         /**
-         * One button, four meanings, decided by the state on screen: download, stop the download,
-         * install what is already here, or stop the install.
+         * The whole path from "an image on Apple's server" to "macOS installed", in the order the
+         * parts make sense in:
+         *
+         *   look for an image already here → verify it → (only if there is none, or it does not
+         *   verify) download it → verify what arrived → install it
+         *
+         * Verifying before deciding is the point: an image that is already on the disk and passes
+         * gets installed without a byte of network traffic, and one that does not pass is what
+         * sends the pipeline to the download rather than the installer.
          */
-        action.setOnClickListener(v -> {
+        Runnable pipeline = () -> new Thread(() -> {
             Releases.Release r = chosen[0];
-            File ipsw = Releases.ipswFile(dir, r);
+            File downloaded = Releases.ipswFile(dir, r);
+            String localPath = Prefs.localIpsw(a);
+            File local = localPath == null ? null : new File(localPath);
 
-            if (DownloadService.running()) {
+            Runnable say = null;
+            try {
+                /* 1. What is already here, the user's own file first. */
+                File source = null;
+                boolean ours = false;
+                if (local != null && local.exists() && local.length() > (1L << 30)) {
+                    source = local;
+                } else if (downloaded.exists() && downloaded.length() > 0) {
+                    source = downloaded;
+                    ours = true;
+                }
+
+                /* 2. If something is here, verify it before trusting it. */
+                if (source != null) {
+                    stage[0] = "verify";
+                    File s0 = source;
+                    boolean ok = verify(a, s0, progress, bar, cancelled);
+                    if (cancelled.get()) return;
+                    if (!ok) {
+                        if (ours) {
+                            /* A file this app fetched and that does not verify is ours to drop:
+                               the verifier's sentence stays on screen, but the next stage is a
+                               fresh download rather than the installer. */
+                            a.runOnUiThread(() -> showProgress(progress, bar,
+                                    "已下载的镜像校验不通过，已删除，将重新下载"));
+                            s0.delete();
+                            Prefs.clearVerified(a);
+                            source = null;
+                        } else {
+                            a.runOnUiThread(() -> showProgress(progress, bar,
+                                    "这个镜像校验不通过，请换一个文件或改用下载"));
+                            return;
+                        }
+                    }
+                }
+
+                /* 3. Nothing usable here: download, and wait for the download to end. */
+                if (source == null) {
+                    if (cancelled.get()) return;
+                    stage[0] = "download";
+                    AppLog.i("安装: 下载 " + r.name + "（" + AppLog.bytes(r.bytes) + "）");
+                    Permissions.askForDownload(a);
+                    a.runOnUiThread(() -> showProgress(progress, bar,
+                            "开始下载 " + r.name + "\n" + AppLog.bytes(r.bytes)));
+                    DownloadService.start(a, r);
+                    while (!cancelled.get()) {
+                        DownloadService.State st = DownloadService.state();
+                        if (DownloadService.State.DONE.equals(st.phase)) break;
+                        if (DownloadService.State.FAILED.equals(st.phase)
+                                || DownloadService.State.CANCELLED.equals(st.phase)) {
+                            /* The screen is already showing what the service said. */
+                            return;
+                        }
+                        Thread.sleep(400);
+                    }
+                    if (cancelled.get()) {
+                        DownloadService.cancel(a);
+                        return;
+                    }
+                    source = downloaded;
+                    ours = true;
+
+                    /* 4. The second verification: what arrived, not what was expected. */
+                    stage[0] = "verify";
+                    a.runOnUiThread(() -> showProgress(progress, bar, "下载完成，校验中…"));
+                    if (!verify(a, source, progress, bar, cancelled)) {
+                        if (cancelled.get()) return;
+                        source.delete();
+                        Prefs.clearVerified(a);
+                        a.runOnUiThread(() -> showProgress(progress, bar,
+                                "下载的镜像校验不通过，已删除，请重试"));
+                        return;
+                    }
+                }
+
+                if (cancelled.get()) return;
+
+                /* 5. Install what verified. */
+                stage[0] = "install";
+                a.runOnUiThread(() -> {
+                    action.setText("停止安装");
+                    showProgress(progress, bar, "准备安装…");
+                });
+                int run = InstallService.start(a);
+                String outcome = install(a, dir, source, progress, cancelled);
+                InstallService.stop(a, run);
+                if (stage[0].equals("install")) stage[0] = "idle";
+                final String o = outcome;
+                a.runOnUiThread(() -> action.setText("下载并安装"));
+                a.runOnUiThread(() -> {
+                    if (o == null) showProgress(progress, bar, "安装完成。回到 Macs 页按「启动」。");
+                    else if ("已取消".equals(o)) showProgress(progress, bar, "已停止。");
+                    else showProgress(progress, bar, "安装失败: " + o);
+                });
+            } catch (Throwable t) {
+                AppLog.w("安装: 流水线异常", t);
+                a.runOnUiThread(() -> showProgress(progress, bar, "出错: " + t));
+            } finally {
+                stage[0] = "idle";
+            }
+        }, "henge-pipeline").start();
+
+        action.setOnClickListener(v -> {
+            /* One button. While anything of the pipeline is running it stops it — the download,
+               the verification or the install, whichever it has reached. */
+            if (stage[0].equals("download") || DownloadService.running()) {
+                cancelled.set(true);
+                action.setText("正在停止…");
                 DownloadService.cancel(a);
+                return;
+            }
+            if (stage[0].equals("verify")) {
+                cancelled.set(true);
                 action.setText("正在停止…");
                 return;
             }
-            if (installing[0] || InstallService.running()) {
+            if (stage[0].equals("install") || InstallService.running()) {
                 cancelled.set(true);
                 action.setText("正在停止…");
                 InstallService.requestStop(a);
                 Native.nativeInstallStop();
                 return;
             }
-            if (InstallService.running())
-                /* The previous attempt's service is still up. It is superseded rather than stopped:
-                 * stopping it here would leave the tap with nothing started, which is what "tap
-                 * again and nothing happens" was, and a stop in that window is also what takes the
-                 * process down. The new run's id invalidates the old one's teardown. */
-                AppLog.i("安装: 上一次的服务仍在，直接让新运行取代它");
-
-            String local = Prefs.localIpsw(a);
-            File localFile = local == null ? null : new File(local);
-            boolean haveImage = (localFile != null && localFile.exists()
-                    && localFile.length() > (1L << 30))
-                    || (ipsw.exists() && ipsw.length() > 0);
-
-            if (!haveImage) {
-                // The download belongs to the service, not to this screen: that is what keeps it
-                // alive when the user goes and does something else for an hour.
-                AppLog.i("下载: 请求服务下载 " + r.name);
-                Permissions.askForDownload(a);
-                showProgress(progress, bar, "准备下载 " + r.name + "\n" + AppLog.bytes(r.bytes));
-                bar.setProgress(0);
-                starting[0] = true;
-                AppLog.i("下载: 已请求，等待服务开始");
-                DownloadService.start(a, r);
-                action.setText("停止");
-                return;
-            }
-
-            File source = (localFile != null && localFile.exists()) ? localFile : ipsw;
-            installing[0] = true;
             cancelled.set(false);
-            action.setText("停止安装");
-            showProgress(progress, bar, "准备安装…");
-            final boolean ours = (localFile == null);   // downloaded by this app, so it may be re-fetched
-            // A restore is the one operation where being reclaimed costs an hour.
-            final int run = InstallService.start(a);
-            new Thread(() -> {
-                /*
-                 * Check the image before touching the machine. Nothing downstream does: libzip
-                 * reads without verifying and idevicerestore trusts what it reads, so a file that
-                 * went bad would be personalised and sent to the guest as if it were good, and the
-                 * failure would show up as firmware that misbehaves for no visible reason.
-                 */
-                /*
-                 * Once per file, not once per install: a verified image is remembered by path,
-                 * length and modification time, so a second attempt at the same broken install
-                 * starts immediately instead of reading 16 GB again.
-                 */
-                IpswIntegrity.Result check = null;
-                if (Prefs.isVerified(a, source)) {
-                    AppLog.i("安装: 镜像已校验过，跳过校验（" + source.getName() + "）");
-                } else {
-                    a.runOnUiThread(() -> showProgress(progress, bar, "校验镜像…"));
-                    check = IpswIntegrity.verify(source,
-                            line -> a.runOnUiThread(() -> showProgress(progress, bar, line)),
-                            cancelled);
-                }
-                if (check != null && !check.ok) {
-                    String why = check.problem;
-                    AppLog.w("安装: 镜像校验失败: " + why, null);
-                    Prefs.clearVerified(a);
-                    if (ours && !"已取消".equals(why)) {
-                        // Only a file this app downloaded is ours to delete; a path the user picked
-                        // stays theirs, however broken it is.
-                        a.runOnUiThread(() -> showProgress(progress, bar,
-                                "镜像校验失败，已删除，将重新下载\n" + why));
-                        source.delete();
-                        cancelled.set(false);
-                        a.runOnUiThread(() -> DownloadService.start(a, chosen[0]));
-                        installing[0] = false;
-                        a.runOnUiThread(() -> action.setText("下载并安装"));
-                        return;
-                    }
-                    installing[0] = false;
-                    InstallService.stop(a, run);
-                    a.runOnUiThread(() -> {
-                        action.setText("下载并安装");
-                        showProgress(progress, bar, "镜像校验失败，请检查这个文件或重新下载\n" + why);
-                    });
-                    return;
-                }
-                if (check != null) Prefs.markVerified(a, source);
-                String outcome = install(a, dir, source, progress, cancelled);
-                installing[0] = false;
-                InstallService.stop(a, run);
-                a.runOnUiThread(() -> {
-                    action.setText("下载并安装");
-                    if (outcome == null) {
-                        showProgress(progress, bar, "安装完成。回到 Macs 页按「启动」。");
-                    } else if ("已取消".equals(outcome)) {
-                        showProgress(progress, bar, "已停止。");
-                        cancelled.set(false);
-                    } else {
-                        showProgress(progress, bar, "失败: " + outcome);
-                    }
-                });
-            }, "henge-install").start();
+            action.setText("停止");
+            pipeline.run();
         });
+
 
         // The screen follows the service rather than the other way round: the download outlives
         // this view, so the view reads it instead of owning it.
@@ -337,7 +363,9 @@ final class InstallTab {
             } else {
                 return;
             }
-            if (installing[0] || InstallService.running()) return;
+            /* Download progress belongs to the screen only while the pipeline is in its download
+               stage; in every other stage the pipeline itself says what is happening. */
+            if (!"download".equals(stage[0])) return;
             DownloadService.State state = DownloadService.state();
             String phase = state.phase;
             /* The download service holds one state for the whole app, so a state that names a
@@ -346,11 +374,6 @@ final class InstallTab {
             boolean mine = state.name == null || state.name.isEmpty()
                     || state.name.equals(chosen[0].build);
             if (!mine) phase = DownloadService.State.IDLE;
-            if (starting[0]) {
-                if (DownloadService.State.RUNNING.equals(phase)
-                        || DownloadService.State.CANCELLED.equals(phase)) starting[0] = false;
-                else return;   /* still the old state: leave "准备下载…" alone */
-            }
             if (DownloadService.State.RUNNING.equals(phase)) {
                 action.setText("停止");
                 int percent = state.total > 0 ? (int) (state.received * 100 / state.total) : 0;
@@ -410,6 +433,33 @@ final class InstallTab {
 
 
         return root;
+    }
+
+    /**
+     * Verifies `image` unless it was already verified, and says so on screen while it does.
+     *
+     * Returns false when the image does not verify or the user stopped it; the caller decides what
+     * that means — drop the file and download, or stop and say why.
+     */
+    private static boolean verify(Activity a, File image, TextView progress,
+                                  android.widget.ProgressBar bar, AtomicBoolean cancelled) {
+        if (Prefs.isVerified(a, image)) {
+            AppLog.i("校验: 已校验过，跳过（" + image.getName() + "）");
+            a.runOnUiThread(() -> showProgress(progress, bar,
+                    "镜像已校验过\n" + image.getName()));
+            return !cancelled.get();
+        }
+        a.runOnUiThread(() -> showProgress(progress, bar, "校验镜像…\n" + image.getName()));
+        IpswIntegrity.Result check = IpswIntegrity.verify(image,
+                line -> a.runOnUiThread(() -> showProgress(progress, bar, line)), cancelled);
+        if (check == null) return false;                 /* stopped */
+        if (!check.ok) {
+            AppLog.w("校验: 失败 " + check.problem, null);
+            return false;
+        }
+        Prefs.markVerified(a, image);
+        AppLog.i("校验: 通过 " + image.getName());
+        return true;
     }
 
     /** The percentage inside a status line, or 0 when it carries none. */
