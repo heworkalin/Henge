@@ -2190,25 +2190,32 @@ static int run_loop(HvCpu *cpu, int one) {
             /* The range is given as the low 32 bits, the way every other pc in the log is
                printed: the high half is always 0xfffffe00 for the kernel image. */
             uint64_t plow = (uint32_t) cpu->pc;
-            if (pc_lo && pc_n < 6 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
+            if (pc_lo && pc_n < 40 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
                 uint64_t wx = 0, nm = 0, slid = 0;
                 HvWalk wpc;
                 pc_n++;
                 hv_mmu_walk(cpu, cpu->x[21] + 0x48, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &wx, 4);
                 hv_mmu_walk(cpu, cpu->x[21] + 0x10, HV_ACC_READ, 1, &wpc);
+                uint64_t npa = wpc.pa;
                 (void) hv_phys_read(m, wpc.pa, &nm, 8);
+                /* The same slot read straight from physical memory: if the two disagree, what the
+                   guest sees at this VA is not what the image has at that PA, and the fault is in
+                   the translation rather than in whoever wrote it. */
+                uint64_t nmpa = 0;
+                (void) hv_phys_read(m, cpu->x[21] + 0x10 - 0xfffffdffa8000000ull, &nmpa, 8);
                 hv_mmu_walk(cpu, cpu->x[26] + 0x8c0, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &slid, 8);
                 fprintf(stderr, "hengevm: pchk pc %llx x0 %llx x1 %llx x21 %llx x23 %llx "
-                                "w27 %llx flags48 %llx name10 %llx x8 %llx x9 %llx x10 %llx x26 %llx slide %llx icount %llu\n",
+                                "w27 %llx flags48 %llx name10 %llx namePA %llx x8 %llx x9 %llx x10 %llx x26 %llx slide %llx namePA %llx icount %llu\n",
                         (unsigned long long) cpu->pc, (unsigned long long) cpu->x[0],
                         (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[21],
                         (unsigned long long) cpu->x[23], (unsigned long long) cpu->x[27],
                         (unsigned long long) (wx & 0xffffffffu), (unsigned long long) nm,
+                        (unsigned long long) npa,
                         (unsigned long long) cpu->x[8], (unsigned long long) cpu->x[9],
                         (unsigned long long) cpu->x[10], (unsigned long long) cpu->x[26],
-                        (unsigned long long) slid, (unsigned long long) cpu->icount);
+                        (unsigned long long) slid, (unsigned long long) nmpa, (unsigned long long) cpu->icount);
             }
         }
         if (g_timing) {
