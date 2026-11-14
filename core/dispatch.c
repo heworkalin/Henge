@@ -1542,6 +1542,25 @@ static int run_loop(HvCpu *cpu, int one) {
                                     uint32_t m4 = 0;
                                     (void) hv_phys_read(cpu->m, 0x78324000ull, &m4, 4);
                                     fprintf(stderr, "hengevm: dt magic at 78324000 = %08x\n", m4);
+                                    {
+                                        uint32_t w[16];
+                                        /* Find the header: the pointer in boot_args lands inside the
+                                           structure block, so the tree itself starts somewhat
+                                           earlier. */
+                                        {
+                                            static uint8_t b4[4096];
+                                            for (uint64_t q2 = 0x78300000ull; q2 < 0x78340000ull; q2 += 0x1000) {
+                                                if (hv_phys_read(cpu->m, q2, b4, sizeof b4) != 0) continue;
+                                                for (unsigned i = 0; i + 4 < sizeof b4; i++)
+                                                    if (b4[i] == 0xd0 && b4[i+1] == 0x0d && b4[i+2] == 0xfe && b4[i+3] == 0xed)
+                                                        fprintf(stderr, "hengevm: fdt magic at pa %llx\n",
+                                                                (unsigned long long) (q2 + i));
+                                            }
+                                        }
+                                        if (hv_phys_read(cpu->m, 0x78324000ull, w, sizeof w) == 0)
+                                            for (int k = 0; k < 16; k++)
+                                                fprintf(stderr, "hengevm: dt+%02x %08x\n", k * 4, w[k]);
+                                    }
                                 }
                             }
                             fprintf(stderr, "hengevm: kf hit at pa %llx (first used: %llx)\n",
@@ -1655,6 +1674,25 @@ static int run_loop(HvCpu *cpu, int one) {
                         }
                     } else {
                         fprintf(stderr, "hengevm: boot_args: scan found none and 837f0000 is not RAM here\n");
+                    }
+                }
+            }
+            /* The layout lives in the device tree, and the device tree pointer is in boot_args:
+               the first sixteen words of it say where it is and how long, which is what a map
+               dump has to start from. */
+            {
+                static int ba_done;
+                if (!ba_done) {
+                    ba_done = 1;
+                    uint64_t *q = hv_phys_ptr(m, 0x837f0000ull, 0x1000);
+                    if (q) {
+                        fprintf(stderr, "hengevm: boot_args rev %u ver %u\n",
+                                *(const uint16_t *) q, *((const uint16_t *) q + 1));
+                        for (int k = 0; k < 16; k++)
+                            fprintf(stderr, "hengevm: ba[%2d] %llx\n", k,
+                                    (unsigned long long) q[k]);
+                    } else {
+                        fprintf(stderr, "hengevm: boot_args page not readable\n");
                     }
                 }
             }
