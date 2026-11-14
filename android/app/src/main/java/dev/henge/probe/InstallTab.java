@@ -247,9 +247,13 @@ final class InstallTab {
                             Prefs.clearVerified(a);
                             source = null;
                         } else {
+                            /* The user's own file is theirs: it is not deleted. It is also not
+                               installed — the pipeline goes on to the download, which is what the
+                               flow says a failed verification leads to. */
                             a.runOnUiThread(() -> showProgress(progress, bar,
-                                    "这个镜像校验不通过，请换一个文件或改用下载"));
-                            return;
+                                    "导入的镜像校验不通过，改为下载"));
+                            AppLog.w("安装: 导入的镜像校验不通过，改为下载", null);
+                            source = null;
                         }
                     }
                 }
