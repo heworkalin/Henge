@@ -6,6 +6,7 @@ import android.view.ViewGroup;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -90,7 +91,7 @@ final class InstallTab {
                 Releases.Release r = Releases.ALL[i];
                 if (marks[i] == null) continue;
                 if (r == chosen[0]) {
-                    marks[i].setText("已选择");
+                    marks[i].setText(r == Releases.RECOMMENDED ? "推荐 · 已选择" : "已选择");
                 } else if (Releases.ipswFile(dir, r).exists()) {
                     marks[i].setText("已下载");
                 } else if (Releases.partFile(dir, r).exists()) {
@@ -104,13 +105,16 @@ final class InstallTab {
         for (int i = 0; i < Releases.ALL.length; i++) {
             final int index = i;
             Releases.Release r = Releases.ALL[i];
-            Lists.LiveRow row = Lists.liveRow(a, releases, r.name, r.build + " · " + r.note,
+            String state = r.tested ? "已测试" : "实验性 · 未测试";
+            Lists.LiveRow row = Lists.liveRow(a, releases, r.name, r.build + " · " + state + " · " + r.note,
                     "", false, null);
             marks[i] = row.value;
             row.view.setOnClickListener(v -> {
                 chosen[0] = r;
                 Prefs.setReleaseBuild(a, r.build);
-                AppLog.i("安装: 选择 " + r.name);
+                AppLog.i("安装: 选择 " + r.name + (r.tested ? "" : "（实验性，未测试）"));
+                if (!r.tested)
+                    Toast.makeText(a, "实验性版本：本机没有测试过，可能装不上", Toast.LENGTH_SHORT).show();
                 paint.run();
             });
             if (i < Releases.ALL.length - 1) Lists.divider(a, releases);
@@ -226,9 +230,55 @@ final class InstallTab {
             installing[0] = true;
             cancelled.set(false);
             action.setText("停止安装");
+            final boolean ours = (localFile == null);   // downloaded by this app, so it may be re-fetched
             // A restore is the one operation where being reclaimed costs an hour.
             InstallService.start(a);
             new Thread(() -> {
+                /*
+                 * Check the image before touching the machine. Nothing downstream does: libzip
+                 * reads without verifying and idevicerestore trusts what it reads, so a file that
+                 * went bad would be personalised and sent to the guest as if it were good, and the
+                 * failure would show up as firmware that misbehaves for no visible reason.
+                 */
+                /*
+                 * Once per file, not once per install: a verified image is remembered by path,
+                 * length and modification time, so a second attempt at the same broken install
+                 * starts immediately instead of reading 16 GB again.
+                 */
+                IpswIntegrity.Result check = null;
+                if (Prefs.isVerified(a, source)) {
+                    AppLog.i("安装: 镜像已校验过，跳过校验（" + source.getName() + "）");
+                } else {
+                    a.runOnUiThread(() -> showProgress(progress, bar, "校验镜像…"));
+                    check = IpswIntegrity.verify(source,
+                            line -> a.runOnUiThread(() -> showProgress(progress, bar, line)),
+                            cancelled);
+                }
+                if (check != null && !check.ok) {
+                    String why = check.problem;
+                    AppLog.w("安装: 镜像校验失败: " + why, null);
+                    Prefs.clearVerified(a);
+                    if (ours && !"已取消".equals(why)) {
+                        // Only a file this app downloaded is ours to delete; a path the user picked
+                        // stays theirs, however broken it is.
+                        a.runOnUiThread(() -> showProgress(progress, bar,
+                                "镜像校验失败，已删除，将重新下载\n" + why));
+                        source.delete();
+                        cancelled.set(false);
+                        a.runOnUiThread(() -> DownloadService.start(a, chosen[0]));
+                        installing[0] = false;
+                        a.runOnUiThread(() -> action.setText("下载并安装"));
+                        return;
+                    }
+                    installing[0] = false;
+                    InstallService.stop(a);
+                    a.runOnUiThread(() -> {
+                        action.setText("下载并安装");
+                        showProgress(progress, bar, "镜像校验失败，请检查这个文件或重新下载\n" + why);
+                    });
+                    return;
+                }
+                if (check != null) Prefs.markVerified(a, source);
                 String outcome = install(a, dir, source, progress, cancelled);
                 installing[0] = false;
                 InstallService.stop(a);
