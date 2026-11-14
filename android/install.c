@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #include <android/log.h>
 
 #include "dispatch.h"
+#include "mmu.h"
 #include "disk.h"
 #include "install.h"
 #include "machine.h"
@@ -43,6 +45,9 @@
 /* The root disk's default size. macOS wants at least ~32 GB; 64 GiB leaves room to work and costs
  * nothing until written, because the file is sparse. */
 #define DISK_BYTES_DEFAULT (64ull << 30)
+
+static void *monitor_thread(void *arg);
+static void *kicker_thread(void *arg);
 
 static HvMachine g_machine;
 static HvVmapple g_board;
@@ -347,7 +352,64 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
         if (pthread_create(&t, NULL, cpu_thread, &g_board.cpu[i]) == 0) pthread_detach(t);
     }
     g_running = 1;
+    {
+        pthread_t kt;
+        if (pthread_create(&kt, NULL, kicker_thread, NULL) == 0) pthread_detach(kt);
+    }
+    if (getenv("HENGE_HEARTBEAT")) {
+        pthread_t mt;
+        if (pthread_create(&mt, NULL, monitor_thread, NULL) == 0) pthread_detach(mt);
+    }
     return 0;
+}
+
+/* A clock on the wall, not on the guest: with blocks chained, neither icount nor the block count
+   moves once a loop is hot, so a run that looks idle and a run that is stuck look the same. This
+   samples the CPU from another thread and says where the guest is, and whether that spot changes. */
+/* The engine only services timers, devices and interrupts when the dispatcher runs, and chained
+   blocks do not return to it. host/vm.c has this thread; the app and the host installer build
+   their own CPU threads instead, so without it the guest gets a tick only when a block happens to
+   end: one interrupt in ninety seconds, and every timeout in the restore path expires. */
+static void *kicker_thread(void *arg) {
+    (void) arg;
+    while (g_running) {
+        usleep(1000);
+        hv_machine_kick_all(&g_machine);
+    }
+    return NULL;
+}
+
+static void *monitor_thread(void *arg) {
+    (void) arg;
+    uint64_t t0 = mach_absolute_time();
+    uint64_t prev_pc = 0, changes = 0, samples = 0, same = 0;
+    while (g_running && !g_machine.stop) {
+        struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        HvCpu *c = &g_cpus[0];
+        uint64_t pc = c->pc;
+        samples++;
+        if (pc != prev_pc) changes++; else same++;
+        prev_pc = pc;
+        /* What is at that address, read through the guest's own tables: an address alone does not
+           say whether it is the idle loop, a spin waiting for a device, or a panic handler. */
+        uint32_t w[4] = {0, 0, 0, 0};
+        for (int k = 0; k < 4; k++) {
+            HvWalk walk;
+            hv_mmu_walk(c, pc + (uint64_t) k * 4, HV_ACC_READ, 1, &walk);
+            if (walk.fsc == 0) hv_phys_read(&g_machine, walk.pa, &w[k], 4);
+        }
+        fprintf(stderr, "hengevm: alive %.0fs pc %llx el%u daif %llx exc %llu irq %llu "
+                        "moved %llu/%llu vctl %llx pctl %llx %08x %08x\n",
+                (double) (mach_absolute_time() - t0) / 24000000.0, (unsigned long long) pc,
+                c->el, (unsigned long long) c->daif,
+                (unsigned long long) g_machine.stats.exceptions,
+                (unsigned long long) g_machine.stats.interrupts,
+                (unsigned long long) changes, (unsigned long long) samples,
+                (unsigned long long) c->cntv_ctl, (unsigned long long) c->cntp_ctl,
+                w[0], w[1]);
+    }
+    return NULL;
 }
 
 static void stop_cpus(void) {

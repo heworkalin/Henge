@@ -338,7 +338,12 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                    if the page is missing (the guest's data is wrong) or the walk went somewhere
                    else (this engine's translation is wrong). */
                 {
-                    fprintf(stderr, "\nhengevm:  ttbr0=%llx ttbr1=%llx tcr=%llx\n",
+                    /* The state the guest's handler will see: whether it may call vm_fault for a
+                   pageable kernel page at all depends on the interrupt mask in this PSTATE. */
+                fprintf(stderr, "\nhengevm:  spsr %llx (I=%llu F=%llu) daif %llx el %u\n",
+                        (unsigned long long) spsr, (unsigned long long) ((spsr >> 7) & 1),
+                        (unsigned long long) ((spsr >> 6) & 1), (unsigned long long) cpu->daif, cpu->el);
+                fprintf(stderr, "hengevm:  ttbr0=%llx ttbr1=%llx tcr=%llx\n",
                             (unsigned long long) cpu->ttbr0_el1, (unsigned long long) cpu->ttbr1_el1,
                             (unsigned long long) cpu->tcr_el1);
                     FILE *saved = hv_walk_dbg;

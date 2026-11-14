@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <stdlib.h>
 #include "common.h"
 #include "libimobiledevice-glue/thread.h"
 
@@ -194,6 +195,18 @@ int cond_wait(cond_t* cond, mutex_t* mutex)
 
 int cond_wait_timeout(cond_t* cond, mutex_t* mutex, unsigned int timeout_ms)
 {
+	/* Emulation is slower than the hardware these waits were written for, and the guest is also
+	   being asked to boot an operating system in between. HENGE_TIMEOUT_SCALE stretches every
+	   wait that this project's restore path makes, so a slow run can be told apart from a stuck
+	   one without editing the vendored sources each time. */
+	static unsigned hg_scale;
+	if (!hg_scale) {
+		const char *s = getenv("HENGE_TIMEOUT_SCALE");
+		hg_scale = s ? (unsigned) atoi(s) : 1;
+		if (!hg_scale) hg_scale = 1;
+	}
+	timeout_ms *= hg_scale;
+
 #ifdef _WIN32
 	mutex_unlock(mutex);
 	DWORD res = WaitForSingleObject(cond->sem, timeout_ms);
