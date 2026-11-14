@@ -501,3 +501,56 @@ iBEC 加载内核时改写 __DATA_CONST 里的 kalloc 视图（值来源不明/�
 | 失败后重装闪退 | `startForegroundService()` 与 `startForeground()` 之间被 `stopService`（系统日志：`Bringing down service while still waiting for start foreground`）| `foregrounded` 标志 + 延迟停止（`pendingStop`）；界面的"停止"改为下发 `ACTION_STOP` 命令 |
 | 上一次的收尾线程把新服务关掉 | 线程与 service 实例无关 | 每次启动分配 generation，只有当前代号的运行才能停服务 |
 | 失败后点重装没反应 | 点击分支先去停旧服务就 `return` | 直接启动新运行，旧运行由 generation 作废 |
+
+## 本地跑安装（不必每次刷手机）
+
+```
+tools/build-restore-host.sh          # 一次，出 build/host/lib/libhengerestore.a
+tools/build-install-host.sh          # 一次，出 build/host/host-install
+tools/run-install-host.sh /tmp/hi.log 180
+```
+
+`run-install-host.sh` 是**轮询**的：每 2 秒看进程还在不在，自己退出就立刻读完日志；
+超过给定秒数才当作"卡住"，同样把日志留下。实测一次完整跑到失败 **约 50 秒**，
+不是三分钟 —— 三分钟是上限，不是等待时间。
+
+需要 `CURL_CA_BUNDLE=work/ca-bundle.pem`：本机 CA 库缺 Apple Root CA，
+`gs.apple.com` 会报 "self-signed certificate in certificate chain"。
+
+## 第一次内核数据异常（本地复现，2026-11）
+
+现场：`esr 9600004f`（permission fault, level 3）或 `96000047`（translation fault, level 3），
+pc 落在 `0xfffffe001c890b5c`，`far` 页对齐。
+
+用**正确的镜像 VA 基址**反汇编（`0xfffffe001bb18000` ↔ PA `0x73b18000`，
+不是 `0xfffffe001b3dc000` —— 用错基址读出来的是隔壁函数，之前的
+"kalloc_type_view" 结论就是错基址的产物，需要重做）：
+
+```
+fffffe001c890b10: pacibsp
+...
+fffffe001c890b44: sub  x5, x3, x0
+fffffe001c890b4c: ldp  x8, x9, [x1]
+fffffe001c890b5c: stp  x12, x13, [x0]      ← 故障在这里：目标页没有映射
+```
+
+这是 `memmove`。调用者（`x30 = 0xfffffe001cfaaea8`）：
+
+```
+fffffe001cfaae74: ldr x0, [x8, #0x440]     ; zone（地址 0x81d000 + 0x440）
+fffffe001cfaae78: ldr x1, [x24, #0x20]     ; size = 0x158
+fffffe001cfaae8c: bl  0xe8e0c4             ; 分配，返回指针在 x1
+fffffe001cfaae94: cbnz w0, ...
+fffffe001cfaae98: ldp x8, x2, [x24, #0x18] ; 源与长度
+fffffe001cfaaea4: bl  0xd78b10             ; memmove(新分配的指针, 源, 0x158)
+```
+
+寄存器：`x0 = far`（目标，页对齐）、`x1 = 0xfffffe001f3cf6b8`（源，合法）、
+`x2 = 0x158`、`x27 = 0x14b14000`（slide）。
+
+也就是说：**分配器给出一块堆内存，这块内存所在的那一页在 guest 自己的页表里没有映射**。
+同一张 L3 表 512 条里只有 5 条有值（如 `[0] [1] [2] [25] [26]`，PTE 形如
+`0460000084a1c603`），而目标落在没值的那一段。
+
+所以问题不在"我们读错了表"：故障那一刻 guest 的表的确实没有这一条。
+下一步要问的是分配器的映射步骤为什么没落下这条 PTE。

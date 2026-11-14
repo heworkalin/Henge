@@ -25,7 +25,7 @@ mkdir -p "$OUT/obj"
 # not a compile error. That cost an hour once; the find below is cheap enough.
 stale() {
     [ -f "$1" ] || return 0
-    [ "$1" -nt "$2" ] && return 0
+    [ "$1" -nt "$2" ] || return 0   # the object is not newer than its source: rebuild
     [ -n "$(find core host devices android/compat/include tools/host_include \
                  -name '*.h' -newer "$1" -print -quit 2>/dev/null)" ]
 }
@@ -36,7 +36,7 @@ build() { # out-name source...
         # The name keeps the path: devices/aes.c and third_party/mbedtls/library/aes.c would
         # otherwise share one object, and the link picks whichever was written last.
         obj="$OUT/obj/$(echo "${src%.c}" | tr '/' '_').o"
-        stale "$obj" "$src" && $CC $CFLAGS -c "$src" -o "$obj"
+        if stale "$obj" "$src"; then $CC $CFLAGS -c "$src" -o "$obj"; fi
     done
 }
 
@@ -55,7 +55,7 @@ build mbed third_party/mbedtls/library/aes.c third_party/mbedtls/library/sha256.
             third_party/mbedtls/library/platform_util.c third_party/mbedtls/library/constant_time.c
 build app android/install.c
 
-stale "$OUT/obj/host_enter.o" host/enter.S && $CC -D_GNU_SOURCE -D__ANDROID__ -Ihost -Icore -c host/enter.S -o "$OUT/obj/host_enter.o"
+if stale "$OUT/obj/host_enter.o" host/enter.S; then $CC -D_GNU_SOURCE -D__ANDROID__ -Ihost -Icore -c host/enter.S -o "$OUT/obj/host_enter.o"; fi
 
 objs=$(ls "$OUT"/obj/*.o)
 

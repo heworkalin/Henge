@@ -282,6 +282,21 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                     if ((r % 6) == 0) fprintf(stderr, "\nhengevm:  ");
                     fprintf(stderr, " x%d=%llx", r, (unsigned long long) cpu->x[r]);
                 }
+                /* The block that faulted, word by word: the load that made the access is in it,
+                   and so is whatever advanced the base register to the bad address. */
+                {
+                    uint64_t from = hv_pc_hist_last(cpu->index);
+                    if (!from || from > ret) from = ret - 32 * 4;
+                    fprintf(stderr, "\nhengevm:  executed from %llx:", (unsigned long long) from);
+                    for (uint64_t at = from; at <= ret; at += 4) {
+                        HvWalk ww; uint32_t word = 0;
+                        hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &ww);
+                        if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 4) == 0)
+                            fprintf(stderr, " %08x", word);
+                        else fprintf(stderr, " ????????");
+                    }
+                    fprintf(stderr, "\n");
+                }
                 /* Whether the guest's own tables map what it just touched: the descriptors say
                    if the page is missing (the guest's data is wrong) or the walk went somewhere
                    else (this engine's translation is wrong). */
@@ -307,6 +322,16 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                         }
                         fprintf(stderr, "hengevm:  L3 table %llx: %d of 512 entries set, first %d last %d\n",
                                 (unsigned long long) w0.table, filled, first, last);
+                        /* Which pages, and with what: five entries in a 2 MB window is a small
+                           allocation mapped on demand, and the shape says whether the address
+                           being touched is inside it (a missing PTE) or past its end (a wrong
+                           pointer), which are different bugs. */
+                        for (int k = 0; k < 512; k++) {
+                            uint64_t e = 0;
+                            if (hv_phys_read(cpu->m, w0.table + (uint64_t) k * 8, &e, 8) != 0) continue;
+                            if (e) fprintf(stderr, "hengevm:   [%3d] +%#07x %016llx\n", k, k * 0x1000,
+                                           (unsigned long long) e);
+                        }
                     }
                     hv_walk_dbg = saved;
                     for (int k = 0; k < 2; k++) {
