@@ -612,6 +612,16 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
 }
 
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
+    /* Every component the firmware loads goes through here, whatever code does the copying, so
+       one place records the whole layout: which range each block lands in and from where. A
+       16 KB block into the kernel image's neighbourhood is exactly what overwrites it. */
+    if (len >= 0x1000 && pa >= 0x70000000ull && pa < 0x80000000ull && getenv("HV_COPY_LOG")) {
+        static int n;
+        if (n++ < 400)
+            fprintf(stderr, "hengevm: copy pa %llx len %x pc %llx icount %llu\n",
+                    (unsigned long long) pa, len, (unsigned long long) m->access_pc,
+                    (unsigned long long) (m->ncpus > 0 && m->cpus ? m->cpus[0]->icount : 0));
+    }
     HvRam *r = hv_ram_lookup(m, pa);
     if (r && pa + len - r->pa <= r->size) {
         if (r->readonly) return 0; /* ROM: writes are ignored */

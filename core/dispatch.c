@@ -2299,6 +2299,25 @@ static int run_loop(HvCpu *cpu, int one) {
             /* The range is given as the low 32 bits, the way every other pc in the log is
                printed: the high half is always 0xfffffe00 for the kernel image. */
             uint64_t plow = (uint32_t) cpu->pc;
+            /* HV_PCHK_DST=<hex>: only dump when the destination register holds an address in
+               this range, so a probe on a hot copy routine is not used up by its small calls. */
+            static uint64_t dst_lo, dst_hi;
+            static int dst_read;
+            if (!dst_read) {
+                const char *d = getenv("HV_PCHK_DST");
+                dst_read = 1;
+                if (d) dst_lo = strtoull(d, (char **) &d, 16), d && *d == ':' ? dst_hi = strtoull(d + 1, 0, 16) : 0;
+            }
+            static uint64_t len_lo;
+            static int len_read;
+            if (!len_read) {
+                const char *l = getenv("HV_PCHK_LEN");
+                len_read = 1;
+                if (l) len_lo = strtoull(l, 0, 16);
+            }
+            uint64_t dstv = (uint32_t) cpu->x[22];
+            if (dst_lo && (dstv < dst_lo || dstv > dst_hi)) goto skip_pchk;
+            if (len_lo && (uint32_t) cpu->x[24] < len_lo) goto skip_pchk;
             if (pc_lo && pc_n < 400 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
                 uint64_t wx = 0, nm = 0, slid = 0;
                 HvWalk wpc;
@@ -2329,6 +2348,7 @@ static int run_loop(HvCpu *cpu, int one) {
                         (unsigned long long) slid, (unsigned long long) nmpa, (unsigned long long) cpu->icount);
             }
         }
+    skip_pchk:
         if (g_timing) {
             uint64_t te0 = mach_absolute_time();
             hv_enter(cpu, b->code);
