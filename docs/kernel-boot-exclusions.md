@@ -371,3 +371,67 @@ P1 的入口工具（都不需要设备）：
 1. `tools/disasm-raw.sh <kernel blob> 0x1c896488 <from> <to>` 看 `0x1c90cb7c` 是哪个 `ldr`、哪个寄存器
 2. `halt.txt` 里该块的 `trace_ring`（记录 x0/x4）看垃圾值首次出现在哪个寄存器
 3. 重点怀疑形态：**PAC 签名残留**（bit57/PAC 区残留）而不是"页表错"
+
+## 八、panic 原文与判据（2026-11，内核能跑到 panic 之后）
+
+异常环 + 帧链 + "从代码里反查它引用的字符串"这一套组合，把内核的死因还原到了源码行。
+
+### 8.1 崩溃链（实测，四轮一致）
+
+```
+1c90cb7c  panic 的 %s 打印循环里 ldrsb 读到坏指针
+   ↑ 帧链
+1c8e54b8  panic 打印封装（pacia/paciza 传参，x0=输出回调）
+1ca3ffbc  debugger 层
+1ca3e514  debugger 层
+1c894d10  locore 异常向量
+1c8e5828  panic 本体
+1d16c930  panic 调用 thunk（x6 = xpaci(x30) 作为 "caller"）
+1d16e9f8  ★ 真正调用 panic 的位置
+1d16ee58 / 1d16eaa0 / 1d16d030   同编译单元（kalloc.c）
+```
+
+### 8.2 panic 原文（从 0x1d16e9f4 前两条 adrp+add 读出）
+
+```
+kalloc_type_view(%s) from kext(%s) hasn't been rebuilt with required xnu headers
+@kalloc.c:705
+```
+
+对应源码 `osfmk/kern/kalloc.c:695 kalloc_type_validate_flags()`：
+
+```c
+if (!(kt_flags & KT_CHANGED) || !(kt_flags & KT_CHANGED2)) panic(...);
+```
+
+### 8.3 现场反汇编（0x1d16e928，就是 `kalloc_type_slide()`）
+
+```
+ldr  w8, [x21, #0x48]     ; kt_flags 在 view+0x48
+orr  w8, w8, #0x4000      ; KT_SLID
+str  w8, [x21, #0x48]
+bics wzr, w27, w8         ; 校验 w27 & ~(flags|KT_SLID)
+b.ne panic
+```
+
+同一函数在加 slide 之前还做了**"已被 slide 过"检测**：若 `(orig ^ (orig+slide)) & 0xffc0000000000000`
+非零，就把该字段直接写成 `0x0080000000000000`（毒化值）。这说明 XNU 预期这些指针**进来时是 raw
+的**，由它自己 slide。
+
+### 8.4 已排除
+
+- **X5**：我们的 `__DATA` fixup 只落在 `seg5 __DATA`（19466 个槽，`already 0`、`outside 0`），
+  段表里**没有** `__kalloc*` section（`kalloc_sections 0`）⇒ "按 section 名跳过"这条修法**无效**，
+  但不代表我们的 fixup 没碰 kty view（view 可能就在 `__DATA,__data` 之类里面）。
+- **X6**：不是宿主环境问题（bionic CLI 同样复现）。
+
+### 8.5 下一步（唯一主线）
+
+拿到 **kty view 数组的 VA 区间**（即 `kalloc_type_slide()` 里 `[x21, x23)`），
+与 fixup 的 19466 个槽求交集：
+
+- 交集非空 ⇒ 我们对内核自己会 slide 的结构做了 slide ⇒ 按区间排除，这条 panic 应消失
+- 交集为空 ⇒ `kt_flags` 确实缺位 ⇒ 查 prelinked kext 与内核的头文件版本 / DT 的 kext 选择
+
+拿区间的手段：在 pc `0x1d16e928` 做一次性 hook（记录 `x21` 与被写的 VA），
+引擎目前没有通用 pc hook，需要新增。离线扫描 `0x50` 定长记录数组**未命中**，不要重复这条路。
