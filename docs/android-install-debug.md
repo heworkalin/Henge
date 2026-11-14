@@ -305,3 +305,88 @@ _start (0x7d82488) → b → start_first_cpu (__TEXT_EXEC+0x805c，此时 MMU �
 但 chained fixup 的 authenticated pointer 恰恰把**链信息存在高位**（`ubfx #51,#11`、
 `tbnz #62/#63`）。如果 fixup 循环里出现 `aut*`，`put_strip` 会破坏这些高位 ——
 这与"槽没有被解码"的现象吻合，值得优先验证。
+
+## 十二、chained fixup 补完（已修复并提交 `85a4f89`）
+
+### 做了什么
+
+内核是 **fileset kernel collection**，chained fixup 本该由 loader 做完，
+而 iBEC 一个都没做（实测 `already 0`）。引擎在**内核第一个块**时按 loader 语义补：
+
+- 指针格式 **8 = `DYLD_CHAINED_PTR_64_KERNEL_CACHE`**
+- `target` 是**相对镜像基址的偏移**，`next` 以 **4 字节**为单位（已用数据验证：步长 4 的链
+  恰好穿过已知槽，步长 8 的不通）
+- 只写未签名 VA（引擎本来就把 `AUT*` 当空操作）
+
+### 只修 `__DATA`，不碰 `__DATA_CONST`
+
+`__DATA_CONST` 是**内核自己的**：它的 pass 会用槽值重算
+（`base + (v & 0x3fffffff)`），且**不检查"是否已修"**。我们先修、内核后修，
+基址被加两遍，客户机跳进镜像中段的数据区（实测 `0xfffffe0038c7c5a0` = 期望值 + 基址低 32 位）。
+
+### 效果
+
+| 阶段 | 之前 | 现在 |
+|---|---|---|
+| 串口输出 | 一行都没有 | `loaded ramdisk at ... size 0xb400000`、`loaded device tree`、`aborting autoboot due to tethered restore` |
+| restore 用户态进程 | 无 | 在 EL0 跑约 3.9 万块、1970 万次内存操作 |
+| 宿主 JIT 崩溃 | SIGILL | 消失 |
+
+---
+
+## 十三、下一个问题：`kalloc_type` 视图校验失败引发的 panic 级联
+
+### 现象链（全部实测）
+
+```
+panic → panic 的打印路径自己踩坏指针 → 重新进 panic/异常 → 两个异常成对重复 4 次
+（SP 每轮降 0x770）→ 越过内核栈 guard 页 → 异常桩发现 SP 不在栈内 → wfe 自旋
+```
+
+| 证据 | 值 |
+|---|---|
+| 陷阱指令 | `0xe7ffdeff`（XNU `panic`/`Debugger` 路径里的 trap），`ESR EC=0` |
+| panic 函数 | 链接 VA `0x7dd1700`，引用 `"panic(cpu %u caller 0x%lx): "`、`"Original panic string:"`、`"Please go to https://panic.apple.com..."` |
+| panic 格式串 | `kalloc_type_view(%s) from kext(%s) hasn't been rebuilt with required xnu headers @%s:%d`（链接 VA `0x704a4ac`，陷阱时在 `x2`） |
+| 打印崩溃点 | `ldrsb` 循环访问 `0x20000000935144`（形状像未 rebase 的 fixup 条目，但镜像与内存里都找不到该值 → 运行时算出来的） |
+| guard 页 | 相邻页 `RO/RW` 交替（周期 `0x8000`）= 16 KB 内核栈 + guard 页；`ESR 0x9600004f`（写/权限错/level 3） |
+
+### 已排除
+
+- **不是** fixup 没修：panic 那一刻 `__DATA_CONST` 前几个槽已是正确指针
+  （`0xfffffe001d1645a0` = 基址 + target），说明内核自己的 rebase 阶段跑完了。
+- **不是**栈问题：栈溢出是级联的后果。
+
+### XNU 源码对应（`osfmk/kern/kalloc.c`）
+
+```c
+if (!(flags & KT_CHANGED) || !(flags & KT_CHANGED2))
+    panic("kalloc_type_view(%s) from kext(%s) hasn't been rebuilt with required xnu headers", ...);
+
+static inline void kalloc_type_slide_fixed(vm_offset_t addr) {
+    ktv->kt_signature += vm_kernel_slide;
+    ktv->kt_zv.zv_name  += vm_kernel_slide;
+    ktv->kt_flags |= KT_SLID;
+}
+```
+
+- `KT_CHANGED = 0x20`、`KT_CHANGED2 = 0x40`、`KT_SLID = 0x4000`，高 16 位是类型哈希。
+- 视图记录在 **`__DATA_CONST,__kalloc_type` / `__kalloc_type_var`** 节里，
+  已用 fileset 解析确认共 **287 个**这样的节，全部位于 `__DATA_CONST`
+  （例如 `com.apple.kernel` 的 `0xfffffe000783e4b8`，大小 `0x16700`）。
+- **这些节所在的页确实在 fixup 链的 `page_start` 里**（不是 `0xffff`），
+  即 chained fixup 会处理这些页 —— 而 XNU 又对同样的字段做手工 slide，
+  两者叠加的条件/顺序是下一步要弄清的疑点。
+- 另一个已知的守卫：`kalloc.c:663` —— `if (kt_flags & KT_SLID) { kt_signature -= slide; zv_name -= slide; }`
+  即"已经 slide 过"的状态由 `KT_SLID` 位表示。
+
+### 下一步（择一）
+
+1. **在 panic 处抓参数**：`kalloc_type_validate_flags(flags, name, uuid)` 的 `name` 是视图里的
+   `zv_name` 指针；找到它的调用点并记录该指针与 `flags`，即可知道是"哪个 kext、什么 flags"。
+   难点：字符串不是通过 `adrp+add` 引用的（已确认无该模式、也无字面量副本）。
+2. **比对镜像里这些视图的 `kt_flags`**：从 fileset 里解析出 `__kalloc_type` 记录，
+   看镜像里 `0x20|0x40` 是否置位。若置位 → 运行期被谁改了；若没置位 → 是构建/组合问题。
+3. **确认是否有 AuxKC**：macOS 12+ 的第三方/辅助 kext 来自 AuxKC，其 `__kalloc_type`
+   视图需要"用新头文件重建"，与这条 panic 文案完全吻合。我们的 DT 里 `BootKC-*` 全是 -1，
+   需要确认 AuxKC 的 memory-map 条目是否也该提供。

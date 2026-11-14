@@ -41,47 +41,38 @@ iBSS ✓ → iBEC/recovery ✓ → RestoreRamDisk(188 MB) ✓ → RestoreDeviceT
 
 ---
 
-## 三、第二个问题：现在的状态（**已修正，前一版结论作废**）
+## 三、当前状态（2026-11-14 下午）
 
-### 作废的旧结论
+### 已修复并提交
 
-> ~~"iBEC 把内核入口算成 arm_init 前 4 字节，跳过了 start.s 的 per-CPU/页表建立"~~
-> 错因两个：把「内核以物理地址 identity 运行的开机代码」当成 iBEC；
-> 外加一处 0x1000 的地址算错。
-
-### 实测：入口完全正常
-
-| 事实 | 证据 |
+| 提交 | 内容 |
 |---|---|
-| PA `0x74898000` 的代码 = 内核镜像文件偏移 `0xd80000`（`__TEXT_EXEC+0x8000`）| 逐字节相同 |
-| `LC_UNIXTHREAD` pc `0xfffffe0007d82488` | 首条指令 `b 0xfffffe0007d8405c` = `__TEXT_EXEC+0x805c` |
-| 实际执行起点 `0x7489805c` | 同一个位置，MMU 开启前以 PA identity 运行 |
-| 段内 `adrp/add/sub` 三连算出的 `0x75176ae8` | 是**内核自己**的 PA→VA 重定位（`adrp` 立即数=镜像字节，已核对） |
-| `0x1d176ae8` 处（= `__TEXT+0x165EAE8`）| `pacibsp / sub sp,sp,#0xb0 / stp x24,x23`，**栈正常** |
+| `27ab79c` | 客户机 `x16` 被宿主 GOT 地址污染（安装从 iBSS 崩溃推进到内核阶段）+ 35 项回归测试 |
+| `85a4f89` | **内核 kernel collection 的 chained fixup**：按 loader 语义补 `__DATA` 段（19,466 槽）；`__DATA_CONST` 留给内核自己（它按槽值重算且不跳过已修槽） |
 
-**即：`_start → start_first_cpu → arm_init` 一路是对的，入口/栈/重定位全部无问题。**
+### 现在的进度
 
-### 真正的卡点：一个没被解码的 chained fixup 槽
+```
+iBSS ✓ → iBEC ✓ → RestoreRamDisk ✓ → RestoreDeviceTree ✓ → RestoreKernelCache ✓
+→ 内核启动 ✓ → 串口开始输出 ✓ → 加载 ramdisk（188 MB）/设备树 ✓
+→ 进入 restore 模式 ✓ → restore 用户态进程在 EL0 运行 ✓（约 3.9 万块 / 1970 万次内存操作）
+→ 内核 panic ✗
+```
 
-崩溃指令 `str x20,[x8]`，`x8` 来自全局槽（链接期 VA `0xfffffe000a6e48f0`，运行时 `0x1f1f88f0`）：
+### 卡点：`kalloc_type` 视图校验失败
 
-- 内核镜像里该槽的值就是 `0xc000000379cf90`
-- 崩溃时读出来**还是** `0xc000000379cf90`
-- 该值 **bit63 置位 = authenticated pointer 类型的 chained fixup 编码值**，低 48 位 `0x379cf90`
-  不是内核 VA ⇒ 它**从未被解码**
+panic 原文（来自内核字符串 + 陷阱现场 `x2`）：
 
-⇒ 内核把编码值当指针用 → 数据异常（EC 0x25）+ `TPIDR_EL1 == 0` → 判定不可恢复 → `wfe`。
+```
+kalloc_type_view(%s) from kext(%s) hasn't been rebuilt with required xnu headers @%s:%d
+```
 
-已知 fixup **跑过一部分**：运行时 `__DATA_CONST` 与镜像有 220 KB 差异；
-`__DATA` 只有 170 字节差异。这个槽在漏掉的那一批里。
-
-### 附带：一个高度可疑的实现选择
-
-引擎把 PAC 签名/验签实现为**空操作**，并在 `AUT*`/`XPAC*` 时用
-`core/translate.c:put_strip()` 清掉 bit 54..48。
-但 chained fixup 的 authenticated pointer 把**链信息存在高位**
-（`ubfx #51,#11`、`tbnz #62/#63`）。若 fixup 循环里出现 `aut*`，
-`put_strip` 会破坏这些高位 —— 与"槽未被解码"的现象吻合，优先查这条。
+- 该 panic 要求视图 `kt_flags` 同时置位 `KT_CHANGED(0x20)` 和 `KT_CHANGED2(0x40)`
+- 视图记录在 `__DATA_CONST,__kalloc_type` / `__kalloc_type_var`，共 287 个节
+- panic 的打印路径**自己崩了**（`%s` 参数是坏指针），于是：
+  panic → 打印崩 → 再 panic → 异常成对重复 4 次（SP 每轮降 0x770）→ 越过内核栈 guard 页
+  → 异常桩判定 SP 不在栈内 → `wfe` 自旋。**栈溢出是后果，不是原因。**
+- 已排除：fixup 缺失（panic 时 `__DATA_CONST` 槽已是正确指针）、栈本身、入口、PAC 未签名
 
 ## 四、下一步（按推荐顺序）
 

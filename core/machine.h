@@ -253,6 +253,9 @@ typedef struct HvMachine {
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
     int halt_dumped;     /* the idle spin was seen once, and its block path was written out */
+    int trap_dumped;     /* the first EL1 undefined-instruction trap was captured with its stack */
+    uint64_t kimage_pa;  /* where the kernel collection was found, for the fixup audit */
+    uint64_t kimage_va;
     HvStats stats;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
