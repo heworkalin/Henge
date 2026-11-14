@@ -1570,6 +1570,22 @@ static int run_loop(HvCpu *cpu, int one) {
                                     }
                                 }
                             }
+                            /* What the host actually put in the staging buffer for the slot that
+                               ends up inside the kernel image: if it is already wrong there, the
+                               data we send is at fault; if it is right, the copy lands elsewhere
+                               than intended. */
+                            {
+                                static int stg_done;
+                                if (!stg_done) {
+                                    stg_done = 1;
+                                    uint64_t v = 0;
+                                    if (hv_phys_read(cpu->m, 0xB49D4720ull, &v, 8) == 0)
+                                        fprintf(stderr, "hengevm: staging[+0xE27860] = %llx\n",
+                                                (unsigned long long) v);
+                                    else
+                                        fprintf(stderr, "hengevm: staging slot not readable\n");
+                                }
+                            }
                             fprintf(stderr, "hengevm: kf hit at pa %llx (first used: %llx)\n",
                                     (unsigned long long) pa, (unsigned long long) (m->kimage_pa ? m->kimage_pa : pa));
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
@@ -2283,7 +2299,7 @@ static int run_loop(HvCpu *cpu, int one) {
             /* The range is given as the low 32 bits, the way every other pc in the log is
                printed: the high half is always 0xfffffe00 for the kernel image. */
             uint64_t plow = (uint32_t) cpu->pc;
-            if (pc_lo && pc_n < 40 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
+            if (pc_lo && pc_n < 400 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
                 uint64_t wx = 0, nm = 0, slid = 0;
                 HvWalk wpc;
                 pc_n++;
