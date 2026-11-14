@@ -108,7 +108,10 @@ static int init_rest(HvMachine *m) {
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
     m->stop_pc2 = ~0ull;
-    m->chain = 1;
+    /* HV_NO_CHAIN: every block is entered through the dispatcher. The knob that finds out whether
+       a wrong register comes from a chained entry (which restores only what the previous block
+       spilled) rather than from the block itself. */
+    m->chain = getenv("HV_NO_CHAIN") ? 0 : 1;
     m->slots = calloc(m->max_slots, sizeof *m->slots);
     m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
     m->slot_stub = calloc(m->max_slots, sizeof *m->slot_stub);

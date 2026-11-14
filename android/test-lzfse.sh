@@ -29,7 +29,7 @@ CFLAGS="-std=gnu11 -O1 -g -w $INC $DEFS"
 
 # The decoder calls the C library; guest code cannot. Its memory routines are renamed to ones that
 # live in this binary, so everything executed as guest code is inside the registered range.
-LZ="-O2 -w -Iandroid/third_party/lzfse -fno-builtin \
+LZ="-O2 -w -Iandroid/third_party/lzfse -fno-builtin -fno-stack-protector \
     -Dmemcpy=hv_memcpy -Dmemset=hv_memset -Dmemmove=hv_memmove"
 for f in android/third_party/lzfse/lzfse_decode.c android/third_party/lzfse/lzfse_decode_base.c \
          android/third_party/lzfse/lzfse_fse.c android/third_party/lzfse/lzvn_decode_base.c; do

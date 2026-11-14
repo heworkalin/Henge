@@ -103,7 +103,25 @@ int main(int argc, char **argv) {
     m.stop_pc = landing;
     m.log = getenv("HV_LOG") ? atoi(getenv("HV_LOG")) : 0;
 
-    int r = hv_run(&cpu);
+    /* STEP=n: run n blocks and report where each ended, with the registers that should not have
+       moved. The first block after which a register differs from what the CPU would have left is
+       the one to read. */
+    int r;
+    const char *stepenv = getenv("STEP");
+    if (stepenv) {
+        int n = atoi(stepenv);
+        for (int i = 0; i < n; i++) {
+            r = hv_run_one(&cpu);
+            printf("block %2d: end pc %#llx  x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx x19 %#llx x20 %#llx\n",
+                   i, (unsigned long long) cpu.pc, (unsigned long long) cpu.x[0],
+                   (unsigned long long) cpu.x[1], (unsigned long long) cpu.x[2],
+                   (unsigned long long) cpu.x[3], (unsigned long long) cpu.x[4],
+                   (unsigned long long) cpu.x[19], (unsigned long long) cpu.x[20]);
+            if (r != HV_EXIT_BRANCH && r != HV_EXIT_SYSREG) break;
+        }
+    } else {
+        r = hv_run(&cpu);
+    }
     printf("jit returned %d (x0 = %llu, pc %#llx elr %#llx esr %#llx far %#llx x30 %#llx)\n", r,
            (unsigned long long) cpu.x[0], (unsigned long long) cpu.pc,
            (unsigned long long) cpu.elr_el1, (unsigned long long) cpu.esr_el1,
