@@ -333,3 +333,41 @@ tools/run-install-host.sh /tmp/hi.log 300 4
    设备上的间接现象（寄存器怪值、指针非法）不能作为证据。
 7. **页表写历史比"挂监视器等它被写"更有效。** 快照 + 差分不依赖 store 路径，也不会被
    chaining 绕过。
+
+## 六、第二轮排除（拿到异常环之后，2026-11）
+
+设备端 CLI（`tools/build-install-android.sh` → `/data/local/tmp`）跑通后，`work/halt.txt` 里的
+`exc t…` 环形记录直接回答了"第一个异常是什么"。据此**作废一批旧方向，并把它们标记为不必再查**。
+
+### X1 「宿主 SIGSEGV 是我们的 bug」—— 排除
+glibc/proot 下 3/3 段错误、gdb 下不崩、**bionic CLI 上 0 次崩溃并正常退出**。
+⇒ 那是 proot(ptrace) + glibc 语义组合出来的产物，手机 App 不会那样崩。**不要再修这个 race。**
+
+### X2 「内核栈页只读是根因」—— 排除（是后果）
+异常环（`halt.txt` 第 70–79 条）显示：先有一个**读垃圾指针**的转换失败，同一个 pc
+（`0x1c90cb7c`）、同一个 far（`0x20000000935144`）**重复 4 次**，每次 `sp` 稳定下降 `0x770`；
+到第 78 条时 `sp_el0 = 0x1f2eff80` 已经走出栈页，才写 `0x1f2eff8c` 触发 permission fault。
+⇒ 栈只读是**循环撑爆栈**的结果。之前所有围绕"谁把栈页标只读"的方向（页表保护来源、rebase 误伤、
+guard page、PTE 写坏）都不必再查。
+
+### X3 「我们的代码页只读机制误伤」—— 排除（`code_page 0`）
+### X4 「诊断代码改变了行为」—— 排除（`slow_mem 0`、`log` 门控已撤、开关化）
+### X5 「`HENGEBUILD` 时间戳能判断构建新鲜度」—— 排除（`android/install.c` 不重编就戳旧值）
+
+### X6 「设备 12 次 hvc vs 宿主 32 次 = 环境差异」—— 排除
+`halt.txt` 头行 `halt ... icount 66254`：机器**早期就 halt 并 MACH Reboot 过一轮**，之后才跑到
+6100 万。计数差来自"跑了几轮重启"，不是 bionic 与 glibc 的差异。
+
+## 七、剩下的唯一主线
+
+| 编号 | 问题 | 状态 |
+|---|---|---|
+| P1 | `0x1c90cb7c` 从哪儿拿到垃圾指针 `0x20000000935144`（bit57 置起、低位像正常内核 VA） | **唯一主线** |
+| P2 | 栈被走穿 | 已确定是 P1 的后果，不单独查 |
+| P3 | 25G83 Stage1 `Memory image not valid` | 独立问题，24G90 通了再说 |
+
+P1 的入口工具（都不需要设备）：
+
+1. `tools/disasm-raw.sh <kernel blob> 0x1c896488 <from> <to>` 看 `0x1c90cb7c` 是哪个 `ldr`、哪个寄存器
+2. `halt.txt` 里该块的 `trace_ring`（记录 x0/x4）看垃圾值首次出现在哪个寄存器
+3. 重点怀疑形态：**PAC 签名残留**（bit57/PAC 区残留）而不是"页表错"

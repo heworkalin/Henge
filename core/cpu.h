@@ -190,6 +190,16 @@ typedef struct HvCpu {
     uint32_t helper_hist_idx;
     uint32_t helper_hist_pad;
     struct { uint64_t pc, op, x4, x16, x30, x0; } helper_hist[64];
+
+    /* Every exception this CPU has taken, in order, so a fault that is only the consequence of
+       an earlier one can be told apart from the one that started it. A permission fault on the
+       kernel stack says nothing on its own: what matters is whether anything was already being
+       handled when it happened. */
+    uint32_t exc_depth;
+    uint32_t exc_count;
+    uint32_t exc_next;
+    uint32_t exc_pad;
+    struct { uint64_t esr, far, pc; uint32_t el, depth; uint32_t pad; } exc_ring[8];
 } HvCpu;
 
 #define HV_CPU_X(n)        ((n) * 8)

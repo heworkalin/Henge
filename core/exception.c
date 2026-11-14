@@ -541,6 +541,9 @@ static int vmapple_hvc(HvCpu *cpu, uint32_t fn) {
     case 0xc3000006: { /* VCPU_KICK: the kernel released a ticket lock and wakes the vcpu that is
                           waiting for that ticket (osfmk/arm64/lock_ticket_pv.c). The id is the
                           topology's phys_id, which for us is the cpu index. */
+        static int off = -1;
+        if (off < 0) off = getenv("HV_NO_PVLOCK") != NULL;
+        if (off) return 0;   /* the pre-PV behaviour: not handled, the kernel sees a failure */
         uint64_t id = (uint32_t) cpu->x[1];
         cpu->x[0] = 0;
         if (id < (uint64_t) cpu->m->ncpus) {
@@ -556,6 +559,9 @@ static int vmapple_hvc(HvCpu *cpu, uint32_t fn) {
                           disabled and expects to be parked until a kick or an interrupt arrives,
                           then to get the mask it passed in x1 back. Handled as a WFI so the run
                           loop parks with the machine lock released. */
+        static int off = -1;
+        if (off < 0) off = getenv("HV_NO_PVLOCK") != NULL;
+        if (off) return 0;
         cpu->x[0] = 0;
         if (cpu->x[1]) cpu->daif &= ~HV_PSTATE_I;
         else cpu->daif |= HV_PSTATE_I;
