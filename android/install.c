@@ -55,6 +55,16 @@ static HvVmapple g_board;
 static HvCpu g_cpus[HV_MAX_CPUS];
 static HvDisk g_disk, g_aux;
 static volatile int g_install_step = -1;
+/*
+ * Which run a progress report belongs to.
+ *
+ * A restore that failed leaves its own thread in idevicerestore for a while, and that thread keeps
+ * reporting: the last thing the previous run says is "failed", and a new attempt that reads it a
+ * second after starting decides it has failed too — the second attempt that went to 0% and stopped
+ * on its own. Only the current run may write the step, and a new run starts from "nothing yet"
+ * rather than inheriting the previous verdict.
+ */
+static volatile int g_install_gen;
 static volatile double g_install_progress;
 static int g_running;
 
@@ -106,7 +116,7 @@ int hv_android_make_disk(const char *path, uint64_t bytes) {
 static void stop_cpus(void);
 
 static void on_install_progress(int step, double progress, void *user) {
-    (void)user;
+    if ((int)(intptr_t)user != __atomic_load_n(&g_install_gen, __ATOMIC_RELAXED)) return;
     /* The restore is over: its guest (a panic, in a failed one) is spinning in a wfe loop that will
        never end. Stopping the CPUs here is what lets the next attempt build a machine at all. */
     if (step >= HV_INSTALL_DONE) stop_cpus();
@@ -259,9 +269,13 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     }
     hv_vmapple_reset_cpu(&g_board);
 
-    g_install_step = 0;
+    /* Nothing has been reported by this run yet: keeping the previous verdict here is what made
+       the attempt after a failure look like it had already failed. */
+    g_install_step = -1;
     g_install_progress = 0;
-    if (hv_install_start(g_board.vusb, ipsw, workdir, ecid, on_install_progress, NULL) != 0) {
+    int gen = __atomic_add_fetch(&g_install_gen, 1, __ATOMIC_RELAXED);
+    if (hv_install_start(g_board.vusb, ipsw, workdir, ecid, on_install_progress,
+                         (void *)(intptr_t)gen) != 0) {
         say(&cursor, end, "  installer      : could not start\n");
         return -1;
     }

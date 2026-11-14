@@ -281,10 +281,11 @@ Java_dev_henge_probe_Native_nativeInstallStatus(JNIEnv *env, jclass clazz) {
     (void)clazz;
     double progress = 0;
     int step = hv_android_install_status(&progress);
-    const char *state = hv_install_result() == 1 ? "进行中"
-                      : hv_install_result() == 0 ? "完成" : "失败";
+    /* The verdict comes from this run's own steps. hv_install_result() speaks for whichever restore
+       thread is in the process, including one belonging to a run that has already been replaced. */
+    const char *state = step >= 101 ? "失败" : step == 100 ? "完成" : "进行中";
     char out[128];
-    snprintf(out, sizeof out, "%d %.0f%% %s", step, progress * 100.0, state);
+    snprintf(out, sizeof out, "%d %.0f%% %s", step < 0 ? 0 : step, progress * 100.0, state);
     return (*env)->NewStringUTF(env, out);
 }
 
