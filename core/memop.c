@@ -457,7 +457,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                             if (ibec_dumps < 200) {
                                 ibec_dumps++;
                                 uint8_t *txt = malloc(4u << 20);
-                                if (txt && hv_phys_read(cpu->m, 0x70080000ull, txt, 4u << 20) == 0) {
+                                if (txt && hv_phys_read(cpu->m, 0x70000000ull, txt, 4u << 20) == 0) {
                                     char p5[512];
                                     snprintf(p5, sizeof p5, "%s", wd);
                                     char *sl5 = strrchr(p5, '/');
@@ -467,7 +467,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                                         if (tf) {
                                             fwrite(txt, 1, 4u << 20, tf);
                                             fclose(tf);
-                                            fprintf(f, "  ibec text pa 0x70080000..0x70480000 written\n");
+                                            fprintf(f, "  ibec text pa 0x70000000..0x70400000 written\n");
                                         }
                                     }
                                 }
