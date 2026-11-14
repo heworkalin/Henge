@@ -299,7 +299,11 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
            zero fill (and then the image being copied in) would bury the one store worth seeing. */
         HvWalk ww;
         hv_mmu_walk(cpu, va, HV_ACC_WRITE, el, &ww);
-        if ((ww.pa & ~0xfffull) == (cpu->m->watch_pa & ~0xfffull) && cpu->m->watch_pa - va < len) {
+        /* A window, not the exact address: the decoder that fills this region writes sixteen bytes
+           at a time, so the store that puts the value in can start just past the address of
+           interest and never cover it. Stores near it are what has to be read. */
+        if ((ww.pa & ~0xfffull) == (cpu->m->watch_pa & ~0xfffull)
+                && (va > cpu->m->watch_pa ? va - cpu->m->watch_pa : cpu->m->watch_pa - va) <= 0x40) {
             watched = 1;
             w = cpu->m->watch_pa;
         }
@@ -362,7 +366,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                             hv_mmu_walk(cpu, pc, HV_ACC_EXEC, el, &cw);
                             uint64_t cpa = cw.pa ? cw.pa : pc;
                             uint32_t words[4] = {0, 0, 0, 0};
-                            hv_phys_read(cpu->m, pc & ~3ull, words, sizeof words);
+                            hv_phys_read(cpu->m, cpa & ~3ull, words, sizeof words);
                             fprintf(f, "  code pc %#llx -> pa %#llx  insn %08x %08x %08x %08x\n",
                                     (unsigned long long) pc, (unsigned long long) cpa,
                                     words[0], words[1], words[2], words[3]);
@@ -373,7 +377,8 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                                 snprintf(p3, sizeof p3, "%s", wd);
                                 char *sl3 = strrchr(p3, '/');
                                 if (sl3) {
-                                    snprintf(sl3 + 1, sizeof p3 - (size_t)(sl3 + 1 - p3), "fwcode.bin");
+                                    snprintf(sl3 + 1, sizeof p3 - (size_t)(sl3 + 1 - p3),
+                                             "fwcode-%02d.bin", fw_dumps);
                                     FILE *cf = fopen(p3, "wb");
                                     if (cf) {
                                         fwrite(code, 1, 1u << 16, cf);
