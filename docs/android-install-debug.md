@@ -390,3 +390,40 @@ static inline void kalloc_type_slide_fixed(vm_offset_t addr) {
 3. **确认是否有 AuxKC**：macOS 12+ 的第三方/辅助 kext 来自 AuxKC，其 `__kalloc_type`
    视图需要"用新头文件重建"，与这条 panic 文案完全吻合。我们的 DT 里 `BootKC-*` 全是 -1，
    需要确认 AuxKC 的 memory-map 条目是否也该提供。
+
+### 新证据：`__kalloc_type` 的视图字段在 fixup 链上（很可能就是本 panic 的成因）
+
+记录布局（`struct zone_view` + 后续字段）：
+
+```
++0x00 zv_zone   +0x08 zv_stats   +0x10 zv_name   +0x18 zv_next   +0x20 {hash:16, flags:16}
+```
+
+`com.apple.kernel` 的 `__kalloc_type`（链接 VA `0xfffffe000783e4b8`，文件偏移 `0x83a4b8`）
+第一条记录实测：
+
+| 偏移 | 文件里的值 | 含义 |
+|---|---|---|
+| `+0x10` | `0x00200000000406ea` | `zv_name`（fixup 编码：next=4, target=`0x406ea`）|
+| `+0x20` | `0x00600000000406ff` | 低 32 位 `0x000406ff`：`& 0x60 == 0x60` ✓，高 16 位 `0x0004` = 类型哈希 |
+| `+0x28` | `0x0000003000000064` | — |
+
+而该页（`__DATA_CONST` 第 80 页，`page_start = 0x0`）的 fixup 链**几乎是每 8 字节一个槽**
+（0x0, 0x8, 0x10, 0x18, 0x20, 0x28, …，共 1393 个），**`+0x10` 和 `+0x20` 都在链上**。
+
+⇒ 只要 chained fixup 应用到这一页，就会按指针格式重写 `+0x20`
+（`{hash,flags}` 打包值），`KT_CHANGED2` 随之消失，`kalloc_type_validate_flags`
+就会 panic —— 与观测完全一致。
+
+同时 `kalloc_type_slide_fixed()` 又对 `kt_signature` / `zv_name` 做手工 `+= slide`，
+说明这些节的设计预期是：**fixup 不该处理它们**（由 XNU 自己 slide）。
+
+### 下一步（针对本条）
+
+1. 弄清真机上的顺序：是 iBoot 应用 fixup 时**跳过**这些节，还是内核 pass 根本不跑
+   `__DATA_CONST`（我们观测到它跑过：槽值确实变成了 `基址+target`）。
+2. 若确认"内核 pass 不该碰 `__kalloc_type*` 节"，修法是在我们的 pass 里
+   **只修 `__kalloc_type*` 之外的槽**，并**让内核 pass 跳过已修槽**
+   （否则内核仍会重写这些字段）。
+3. 纯诊断选项：把内核里 `kalloc_type_validate_flags` 的比较**临时**改成不 panic，
+   看内核能不能带着损坏的视图继续走下去（能走多远、下一个卡点是什么）。
