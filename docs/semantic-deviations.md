@@ -34,7 +34,7 @@
 |---|---|---|
 | `core/exception.c` `vmapple_hvc` | OEM 区间 `0xc3000003` MABS / `0xc3000004` BootSessionUUID / `0xc3000005` WFK / `0xc3000006` KICK，以及 `0x8100ff01`/`0x8300ff01` UID、`ff03` REVISION、`feff` FEATURES | XNU `osfmk/arm64/hv_hvc.h` + `arm64_hypercall.c`：`hvg_is_hcall_available` 先探 `PAC_NOP`、再核对 OEM UID 必须等于 `3B878185-AA62-4E1F-9DC9-D6799CBB6EBB`、REVISION major=1，任何一步失败就放弃全部 OEM 调用。上游对未知 FID 返回 `-1` ⇒ 上游一直在走降级路径 |
 | `core/exception.c` WFK/KICK | WFK 按 WFI 方式 park 并按 `x1` 还原 PSTATE.I；KICK 唤醒目标 vCPU | `osfmk/arm64/lock_ticket_pv.c`：等锁前 `ml_set_interrupts_enabled(FALSE)`，等 `hvg_hc_wait_for_kick`，语义是"停住，直到被 kick 或中断唤醒，然后恢复中断状态"。上游立即返回成功 ⇒ 锁协议作废 |
-| `core/dispatch.c` `kernel_fixups` | chained fixup 的 rebase 能力（默认关闭） | 见下 D-2 |
+| `core/dispatch.c` `kernel_fixups` | chained fixup 的 rebase 能力（默认关闭） | 见 X 节与 U-8 |
 | `core/memop.c` | 每个 load/store 形式的 C 慢路径 | 上游只有内联快速路径；这是新增的兜底实现 |
 | `core/dispatch.c` | `/chosen/random-seed` 用宿主 `/dev/urandom` 填充 | 上游不做这件事（0 处）。`osfmk/prng/prng_random.c:114 → PE_get_random_seed()` 读该属性（`pexpert/gen/pe_gen.c:145`），iBoot 留的是 64 个 0：不 panic，但所有派生密钥来自已知常量 |
 | `core/dispatch.c` | 「不 rebase 内核镜像」的策略 | 上游也没有任何 rebase 代码 ⇒ 我们与上游一致。内核在 `osfmk/arm/arm_init.c:362 → :224 → kernel_collection_slide()` 自己 rebase 整个 collection；我们若补一次会让内核再加一次 slide（实测 `0x1d1645a0 → 0x38c7c5a0`，pc `0x1d177750` 写出该值） |
