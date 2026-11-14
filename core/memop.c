@@ -767,6 +767,18 @@ static void watch_store(HvCpu *cpu, uint64_t va, uint64_t v, unsigned len, uint6
    written and undone, or written somewhere else. */
 static void ptw_note(HvCpu *cpu, uint64_t pa, uint64_t value, unsigned size, uint64_t pc, uint64_t va) {
     if (!cpu->m->ptw_log) return;
+    /* The store used a translation the fast path had; walk the tables again, cold, and see
+       whether it says the same page. A table page whose address has been remapped without the
+       software TLB noticing would put entries in the wrong physical page — the kernel would see
+       its mapping install itself and find nothing there later, which is what the guest does. */
+    {
+        HvWalk fw;
+        hv_mmu_walk(cpu, va, HV_ACC_WRITE, cpu->el, &fw);
+        if (fw.fsc == 0 && (fw.pa & ~0xfffull) != (pa & ~0xfffull))
+            fprintf(stderr, "hengevm: ptw TLB-fresh mismatch at %llx: used %llx, walk says %llx "
+                            "(pc %llx)\n", (unsigned long long) va, (unsigned long long) pa,
+                    (unsigned long long) fw.pa, (unsigned long long) pc);
+    }
     uint64_t page = pa & ~0xfffull;
     for (uint32_t k = 0; k < cpu->m->ptw_n && k < 512; k++) {
         if (cpu->m->ptw_pages[k] != page) continue;
