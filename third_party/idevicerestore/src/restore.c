@@ -1453,6 +1453,110 @@ int restore_send_streamed_image_decryption_key(struct idevicerestore_client_t* c
 	return 0;
 }
 
+
+/*
+ * The device tree handed to iBoot carries no /chosen/memory-map, so iBoot builds
+ * one itself and picks every component's load address with nothing reserving the
+ * region the kernel image sits in: the kernelcache is then overwritten while the
+ * kernel starts, and the panic it causes says nothing about the cause.
+ *
+ * Adding the node here, empty, is the smallest change that asks iBoot to fill in
+ * a map we own instead. Apple's device tree layout (UniXNU's make-dt.py writes
+ * the same one) is
+ *     node := u32 props, u32 children, props*, children*
+ *     prop := char key[32]; u32 len; value; pad4
+ * with the node's name in a property called "name".
+ */
+static uint32_t adt_u32(const uint8_t* b, size_t at) { uint32_t v; memcpy(&v, b + at, 4); return v; }
+
+/* Offset of the node whose name property is `want`, searching from the root. */
+static int64_t adt_find(const uint8_t* b, size_t len, size_t at, const char* want, size_t* end) {
+	size_t p = at;
+	if (p + 8 > len) return -1;
+	uint32_t nprops = adt_u32(b, p), nkids = adt_u32(b, p + 4);
+	p += 8;
+	int64_t found = -1;
+	size_t name_off = 0;
+	for (uint32_t i = 0; i < nprops; i++) {
+		if (p + 36 > len) return -1;
+		const char* key = (const char*) b + p;
+		uint32_t l = adt_u32(b, p + 32);
+		if (p + 36 + l > len) return -1;
+		if (!strcmp(key, "name")) name_off = p + 36;
+		p += 36 + l + ((4 - (l % 4)) % 4);
+	}
+	/* children sit after the properties, so a name is only known now */
+	if (name_off && !strncmp((const char*) b + name_off, want, strlen(want)))
+		found = (int64_t) at;
+	for (uint32_t i = 0; i < nkids; i++) {
+		size_t kid_end = p;
+		int64_t r = adt_find(b, len, p, want, &kid_end);
+		if (r >= 0) { found = r; p = kid_end; break; }
+		p = kid_end;
+	}
+	if (end) *end = p;
+	return found;
+}
+
+/* Insert an empty memory-map child under /device-tree/chosen. Returns the new size. */
+static size_t adt_add_memory_map(void** datap, size_t size) {
+	uint8_t* b = (uint8_t*) *datap;
+	size_t chosen_end = 0, root_end = 0;
+	int64_t chosen = adt_find(b, size, 0, "chosen", &root_end);
+	if (chosen < 0) {
+		logger(LL_ERROR, "device tree: no chosen node, leaving it alone\n");
+		return size;
+	}
+	(void) adt_find(b, size, 0, "memory-map", &chosen_end);
+	if (chosen_end) {
+		logger(LL_INFO, "device tree: already has a memory-map\n");
+		return size;
+	}
+	/* serialize {name="memory-map"} with no children */
+	static const char node_name[] = "memory-map";
+	uint8_t node[8 + (36 + 12) + 3 * (36 + 16)];
+	uint8_t* q = node;
+	uint32_t zero = 0;
+	memcpy(q, &(uint32_t){4}, 4); memcpy(q + 4, &zero, 4); q += 8;
+	memcpy(q, "name", 32); memcpy(q + 32, &(uint32_t){sizeof node_name}, 4); q += 36;
+	memcpy(q, node_name, sizeof node_name); q += 12;
+	const char* keys[3] = { "KernelCache", "RAMDisk", "TrustCache" };
+	for (int i = 0; i < 3; i++) {
+		memcpy(q, keys[i], 32); memcpy(q + 32, &(uint32_t){16}, 4); q += 36;
+		memset(q, 0, 16); q += 16;
+	}
+	/* the chosen node's children end where its subtree ends */
+	size_t at = 0;
+	{ size_t e = 0; (void) adt_find(b, size, (size_t) chosen, "memory-map", &e); at = e; (void) e; }
+	/* adt_find above walked chosen's own subtree: its end offset is what we want */
+	size_t ins = 0;
+	{
+		size_t p = (size_t) chosen + 8;
+		uint32_t nprops = adt_u32(b, (size_t) chosen), nkids = adt_u32(b, (size_t) chosen + 4);
+		for (uint32_t i = 0; i < nprops; i++) {
+			uint32_t l = adt_u32(b, p + 32);
+			p += 36 + l + ((4 - (l % 4)) % 4);
+		}
+		for (uint32_t i = 0; i < nkids; i++) {
+			size_t e = p;
+			(void) adt_find(b, size, p, "__none__", &e);
+			p = e;
+		}
+		ins = p;
+	}
+	(void) at;
+	size_t add = sizeof node;
+	uint8_t* nb = (uint8_t*) realloc(b, size + add);
+	if (!nb) return size;
+	memmove(nb + ins + add, nb + ins, size - ins);
+	memcpy(nb + ins, node, add);
+	uint32_t kids = adt_u32(nb, (size_t) chosen + 4) + 1;
+	memcpy(nb + chosen + 4, &kids, 4);
+	*datap = nb;
+	logger(LL_INFO, "device tree: memory-map added (%zu -> %zu bytes)\n", size, size + add);
+	return size + add;
+}
+
 int restore_send_component(struct idevicerestore_client_t* client, plist_t message, const char* component, const char* component_name)
 {
 	size_t size = 0;
@@ -1501,6 +1605,11 @@ int restore_send_component(struct idevicerestore_client_t* client, plist_t messa
 	if (ret < 0) {
 		logger(LL_ERROR, "Unable to get personalized component %s\n", component);
 		return -1;
+	}
+
+	/* Before iBoot sees it: give the tree the map it otherwise invents. */
+	if (!strcmp(component, "DeviceTree") || !strcmp(component, "RestoreDeviceTree")) {
+		size = adt_add_memory_map(&data, size);
 	}
 
 	dict = plist_new_dict();
