@@ -325,7 +325,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
         {
             static int cap;
             const char *wd = getenv("HV_BLOCK_DUMP");
-            if (wd && *wd && cap < 256) {
+            if (wd && *wd && cap < 4096) {
                 char p2[512];
                 snprintf(p2, sizeof p2, "%s", wd);
                 char *sl = strrchr(p2, '/');
@@ -333,6 +333,13 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                     snprintf(sl + 1, sizeof p2 - (size_t)(sl + 1 - p2), "watch.txt");
                     FILE *f = fopen(p2, "a");
                     if (f) {
+                        if (cap == 0) {
+                            /* Written by this file, which is recompiled whenever the watch code
+                               changes: it is the one thing in the log that says which build is
+                               actually running. */
+                            fprintf(f, "# watch log from build %s %s\n", __DATE__, __TIME__);
+                            fflush(f);
+                        }
                         cap++;
                         fprintf(f, "store %u at %#llx (%s) = %s pc %#llx x30 %#llx\n",
                                 len, (unsigned long long) va,
