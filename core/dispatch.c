@@ -1180,6 +1180,8 @@ static int run_loop(HvCpu *cpu, int one) {
             watch_set = 1;
             const char *wv = getenv("HV_WATCH_VA");
             if (wv && *wv) m->watch_va = strtoull(wv, NULL, 16);
+            const char *wp = getenv("HV_WATCH_PA");
+            if (wp && *wp) m->watch_pa = strtoull(wp, NULL, 16);
         }
     }
     unpark(cpu);

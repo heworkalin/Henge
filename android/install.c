@@ -119,6 +119,22 @@ static void on_install_progress(int step, double progress, void *user) {
     }
 }
 
+/* HV_BLOCK_DUMP points at a file the engine writes every block to (see dispatch.c). */
+static int startup_dump_blocks(const char *workdir) {
+    if (!workdir || !*workdir) return -1;
+    static char path[512];
+    snprintf(path, sizeof path, "%s/blocks.bin", workdir);
+    setenv("HV_BLOCK_DUMP", path, 1);
+    setenv("HV_BLOCK_DUMP_EVERY", "1", 1);
+    /* The kalloc_type view record of com.apple.driver.AppleUSBAudio, whose packed fields nothing
+       rebased: whoever writes it is the thing to find, so watch that page. */
+    setenv("HV_WATCH_VA", "fffffe001c4a7850", 1);
+    /* The same record by physical address: the firmware builds the kernel image with the MMU off,
+       so a write there is a write to this PA and never matches the kernel VA above. */
+    setenv("HV_WATCH_PA", "74507000", 1);
+    return 0;
+}
+
 static void *cpu_thread(void *arg) {
     hv_run((HvCpu *)arg);
     return NULL;
@@ -138,6 +154,9 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     char *cursor = report + strlen(report);
     char *end = report + cap;
     say(&cursor, end, "\n--- install ---\n");
+    /* Which build this log is from: a run that started before an install finished has produced
+       more than one confusing log while this was being worked on. */
+    fprintf(stderr, "HENGEBUILD %s %s\n", __DATE__, __TIME__);
 
     if (!rom || !disk || !aux || !ipsw) {
         say(&cursor, end, "  files          : MISSING — ROM, disk, auxiliary storage and IPSW are all needed\n");
@@ -184,6 +203,23 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
        a restore that panics in firmware needs: the moment before the panic matters more than the
        panic, and the guest only reports the last one. */
     g_machine.log = getenv("HV_LOG") ? atoi(getenv("HV_LOG")) : 2;
+    /*
+     * Every translated block, written to the work directory: the guest words it came from and the
+     * host words it became. A register that goes wrong in translated code cannot be explained from
+     * the guest side — the guest's own instructions do not touch it — so the emitted code has to be
+     * read, and this is how it becomes readable.
+     */
+    if (startup_dump_blocks(workdir) != 0)
+        say(&cursor, end, "  block dump     : unavailable\n");
+    /*
+     * EXPERIMENT (not a fix): chaining lets one block jump straight into the next, which is where
+     * the restore firmware's bit reader ends up reading a host address out of a guest register.
+     * With chaining off every block is entered through the dispatcher, which restores all guest
+     * registers from their slots — if this makes iBSS run, the corruption is in what a chained
+     * entry assumes about registers that live in slots.
+     */
+    /* Chaining was turned off here to test whether an entry that skips the dispatcher is what
+       corrupts a register: it is not — the same fault happens either way. Back on. */
 
     HvCfgParams cfg;
     memset(&cfg, 0, sizeof cfg);

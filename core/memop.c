@@ -1,5 +1,7 @@
 #include "memop.h"
 
+#include <stdlib.h>
+
 #include <stdio.h>
 #include <string.h>
 
@@ -288,12 +290,57 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
 int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, int el, uint64_t pc) {
     uint8_t *b = buf;
     uint64_t w = cpu->m->watch_va;
-    if (write && w && w - va < len) {
-        uint64_t v = 0;
-        memcpy(&v, b + (w - va), len - (w - va) < 8 ? len - (w - va) : 8);
-        fprintf(stderr, "hengevm: watch: write to %llx = %llx (%u-byte store at %llx) by pc %llx x30 %llx\n",
-                (unsigned long long)w, (unsigned long long)v, len, (unsigned long long)va, (unsigned long long)pc,
-                (unsigned long long)cpu->x[30]);
+    /* Page granular, not address granular: the page is what the TLB check forces onto this path,
+       and the store that matters may land anywhere in it. The physical form exists because the
+       firmware runs with the MMU off, where a watched VA is the PA of whatever it is building. */
+    int watched = write && w && ((w ^ va) & ~0xfffull) == 0;
+    if (write && !watched && cpu->m->watch_pa) {
+        HvWalk ww;
+        hv_mmu_walk(cpu, va, HV_ACC_WRITE, el, &ww);
+        if ((ww.pa & ~0xfffull) == (cpu->m->watch_pa & ~0xfffull)) {
+            watched = 1;
+            w = cpu->m->watch_pa;
+        }
+    }
+    if (watched) {
+        char val[32] = "-";
+        if (w >= va && w - va < len) {
+            uint64_t v = 0;
+            uint32_t n = len - (uint32_t)(w - va);
+            if (n > 8) n = 8;
+            memcpy(&v, b + (w - va), n);
+            snprintf(val, sizeof val, "%#llx", (unsigned long long) v);
+        } else if (len) {
+            /* A page watch fires for stores anywhere in the page: report what was written. */
+            uint64_t v = 0;
+            uint32_t n = len < 8 ? len : 8;
+            memcpy(&v, b, n);
+            snprintf(val, sizeof val, "head=%#llx", (unsigned long long) v);
+        }
+        fprintf(stderr, "hengevm: watch: %u-byte store at %llx (watched %s) by pc %llx x30 %llx\n",
+                len, (unsigned long long) va, val, (unsigned long long) pc, (unsigned long long) cpu->x[30]);
+        /* Also to a file: at the moment the kernel starts, stderr loses output. */
+        {
+            static int cap;
+            const char *wd = getenv("HV_BLOCK_DUMP");
+            if (wd && *wd && cap < 256) {
+                char p2[512];
+                snprintf(p2, sizeof p2, "%s", wd);
+                char *sl = strrchr(p2, '/');
+                if (sl) {
+                    snprintf(sl + 1, sizeof p2 - (size_t)(sl + 1 - p2), "watch.txt");
+                    FILE *f = fopen(p2, "a");
+                    if (f) {
+                        cap++;
+                        fprintf(f, "store %u at %#llx = %s pc %#llx x30 %#llx x0 %#llx x1 %#llx x2 %#llx\n",
+                                len, (unsigned long long) va, val, (unsigned long long) pc,
+                                (unsigned long long) cpu->x[30], (unsigned long long) cpu->x[0],
+                                (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[2]);
+                        fclose(f);
+                    }
+                }
+            }
+        }
     }
     while (len) {
         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
@@ -335,6 +382,12 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                 }
             }
         }
+        /* Watch one page while diagnosing: a kernel global that holds a pointer somebody wrote a
+           bad value into. The store that does it names itself, with what it wrote. */
+        if (cpu->m->log >= 2 && write && va >= 0xfffffe001f1f8000ull && va < 0xfffffe001f1f9000ull)
+            fprintf(stderr, "hengevm: watch: write %u bytes at %llx (pa %llx) value %llx pc %llx\n",
+                    chunk, (unsigned long long) va, (unsigned long long) pa,
+                    (unsigned long long) b[0], (unsigned long long) pc);
         if (hv_phys_ptr(cpu->m, pa, chunk)) {
             rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
         } else {
@@ -361,7 +414,21 @@ static uint64_t gpr(HvCpu *cpu, int r) {
     return r == 31 ? 0 : cpu->x[r];
 }
 
+/* Whether a value looks like an address in this process's own libraries rather than anything a
+   guest could have: the guest's addresses are its own small or kernel ones, and the libraries sit
+   within a few hundred MB of this function. */
+int hv_looks_host(uint64_t v) {
+    uintptr_t ref = (uintptr_t) &hv_looks_host;
+    uint64_t d = v > ref ? v - (uintptr_t) ref : (uintptr_t) ref - v;
+    return v != 0 && d < (1ull << 28);
+}
+
 static void set_gpr(HvCpu *cpu, int r, uint64_t v) {
+    /* A load that brings one of our own addresses into a guest register: the guest cannot have
+       produced it, so whatever answered the read returned a host pointer. */
+    if (cpu->m->log >= 2 && r != 31 && hv_looks_host(v))
+        fprintf(stderr, "hengevm: load into x%d gave a host address %llx (pc %llx)\n",
+                r, (unsigned long long) v, (unsigned long long) cpu->pc);
     if (r != 31) cpu->x[r] = v;
 }
 
@@ -458,6 +525,29 @@ static uint64_t atomic_result(int aop, int size, uint64_t old, uint64_t s) {
     }
 }
 
+
+/* The same watch, for the paths that do not go through hv_vmem_xfer: an atomic or exclusive
+   store to the watched page would otherwise never be seen, and the one write that matters may
+   well be one of those. */
+static void watch_store(HvCpu *cpu, uint64_t va, uint64_t v, unsigned len, uint64_t pc, const char *how) {
+    uint64_t w = cpu->m->watch_va;
+    if (!w || ((w ^ va) & ~0xfffull) != 0) return;
+    const char *wd = getenv("HV_BLOCK_DUMP");
+    if (!wd || !*wd) return;
+    char p2[512];
+    snprintf(p2, sizeof p2, "%s", wd);
+    char *sl = strrchr(p2, '/');
+    if (!sl) return;
+    snprintf(sl + 1, sizeof p2 - (size_t)(sl + 1 - p2), "watch.txt");
+    FILE *f = fopen(p2, "a");
+    if (!f) return;
+    fprintf(f, "%s %u at %#llx = %#llx (watched %#llx) pc %#llx x30 %#llx x0 %#llx x1 %#llx x2 %#llx\n",
+            how, len, (unsigned long long) va, (unsigned long long) v, (unsigned long long) w,
+            (unsigned long long) pc, (unsigned long long) cpu->x[30], (unsigned long long) cpu->x[0],
+            (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[2]);
+    fclose(f);
+}
+
 static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t pc) {
     int size = op->size;
     uint32_t bytes = 1u << size;
@@ -469,6 +559,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
     uint64_t old, s = gpr(cpu, op->rs);
     if (op->kind == HV_MEM_CAS) {
         uint64_t desired = gpr(cpu, op->rt) & mask;
+        watch_store(cpu, va, desired, bytes, pc, "cas");
         if (host) {
             old = s & mask;
             cas_host(host, size, &old, desired);
@@ -480,6 +571,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         set_gpr(cpu, op->rs, old);
         return 0;
     }
+    watch_store(cpu, va, s, bytes, pc, "atomic-op");
     if (host) {
         old = load_host(host, size);
         while (!cas_host(host, size, &old, atomic_result(op->atomic_op, size, old, s))) {
@@ -557,6 +649,7 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
     uint64_t mask = esize == 8 ? ~0ull : (1ull << (esize * 8)) - 1;
     uint64_t n0 = gpr(cpu, op->rt) & mask, n1 = pair ? gpr(cpu, op->rt2) & mask : 0;
     int ok = 0;
+    if (cpu->excl_addr == va && cpu->excl_size == bytes) watch_store(cpu, va, n0, esize, pc, "exclusive");
     if (cpu->excl_addr == va && cpu->excl_size == bytes) {
         if (!host) {
             ok = !hv_phys_write(cpu->m, pa, &n0, esize) && (!pair || !hv_phys_write(cpu->m, pa + esize, &n1, esize));
@@ -578,6 +671,7 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
 }
 
 static int do_vector(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t pc) {
+    if (op->store) watch_store(cpu, va, 0, op->bytes, pc, "vector-store");
     uint8_t buf[64];
     uint32_t ebytes = 1u << op->size;
     if (op->store) {
@@ -647,6 +741,14 @@ static void pred_stat(HvCpu *cpu, const HvMemOp *op, uint64_t va, uint64_t pc, i
 
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     cpu->m->access_pc = pc;
+    {   /* one-shot: is the slow path in use at all during the kernel's init? */
+        static int seen;
+        if (!seen && cpu->m->log >= 2 && pc >= 0xfffffe0000000000ull) {
+            seen = 1;
+            fprintf(stderr, "hengevm: memop first kernel access: slow_mem %d pc %llx insn %08x\n",
+                    cpu->m->slow_mem, (unsigned long long) pc, insn);
+        }
+    }
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         hv_raise_undef(cpu, pc);
@@ -705,6 +807,20 @@ int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 uint64_t a = gpr(cpu, op.rt), b = pair ? gpr(cpu, op.rt2) : 0;
                 memcpy(buf, &a, esize);
                 if (pair) memcpy(buf + esize, &b, esize);
+            }
+            /* Every store of the kernel's early initialisation, in order: what it writes, where.
+               A store that lands on the slot the halt comes from, or one that should have and did
+               not, is the answer to why it later reads a non-pointer. */
+            static uint32_t traced;
+            if (cpu->m->log >= 2 && pc >= 0xfffffe0000000000ull && traced < 800) {
+                uint64_t v0 = 0, v1 = 0;
+                memcpy(&v0, buf, op.bytes >= 8 ? 8 : op.bytes);
+                if (pair) memcpy(&v1, buf + esize, op.bytes > esize ? (op.bytes - esize) : 0);
+                fprintf(stderr, "hengevm: store %llx <- %llx%s size %u pc %llx\n",
+                        (unsigned long long) va, (unsigned long long) v0,
+                        pair ? "" : "", op.bytes, (unsigned long long) pc);
+                (void) v1;
+                traced++;
             }
             rc = hv_vmem_xfer(cpu, va, buf, op.bytes, 1, el, pc);
             break;
