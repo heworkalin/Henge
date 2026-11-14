@@ -522,7 +522,7 @@ final class InstallTab {
     /* One place that sets the button, so its label survives a screen change too. */
     private static void setAction(android.widget.Button action, String label) {
         lastAction = label;
-        setAction(action, label);
+        action.setText(label);
     }
 
     private static void showProgress(TextView text, android.widget.ProgressBar bar, String message) {
