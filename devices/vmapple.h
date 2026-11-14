@@ -25,7 +25,10 @@
 #define VMAPPLE_GIC_DIST   0x10000000ull
 #define VMAPPLE_GIC_REDIST 0x10010000ull
 #define VMAPPLE_GIC_MSI    0x1fff0000ull /* third gic reg in the guest's device tree; not in QEMU */
-#define VMAPPLE_UART       0x20010000ull
+#define VMAPPLE_UART       0x20010000ull   /* the port the firmware prints on */
+/* The device tree's own `serial-device` is uart0, "arm,pl011", at this address -- a different
+   port from the firmware's. The kernel's console output went nowhere without it. */
+#define VMAPPLE_UART_KERNEL 0x11000000ull
 #define VMAPPLE_RTC        0x20050000ull
 #define VMAPPLE_GPIO       0x20060000ull
 #define VMAPPLE_PVPANIC    0x20070000ull
@@ -43,6 +46,7 @@
 
 /* SPI numbers; the INTID is 32 more. */
 #define VMAPPLE_IRQ_UART 1
+#define VMAPPLE_IRQ_UART_KERNEL 3   /* polled in the device tree; a spare SPI if it ever is not */
 #define VMAPPLE_IRQ_RTC 2
 #define VMAPPLE_IRQ_GPIO 5
 #define VMAPPLE_IRQ_AES 0x12
@@ -57,6 +61,7 @@ typedef struct HvVmapple {
     int ncpus;
     HvGic *gic;
     HvPl011 *uart;
+    HvPl011 *uart_kernel;
     HvPl031 *rtc;
     HvPl061 *gpio;
     HvPcie *pcie;

@@ -9,6 +9,7 @@
 typedef struct HvPl011 {
     HvGic *gic;
     int intid;
+    uint64_t pa;
     uint32_t cr, lcr, ibrd, fbrd, ifls, imsc, ris, dmacr;
     uint8_t rx[64];
     int rx_head, rx_count;

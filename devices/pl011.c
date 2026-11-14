@@ -25,6 +25,10 @@ static void default_output(void *opaque, uint8_t c) {
 }
 
 static uint64_t pl011_read(void *opaque, uint64_t off, unsigned size) {
+    {   /* Is anyone talking to this port at all? Offsets and sizes, not values. */
+        static int n;
+        if (getenv("HENGE_UART_LOG") && n++ < 200) fprintf(stderr, "hengevm: uart read %llx off %#llx size %u\n", (unsigned long long) ((HvPl011 *) opaque)->pa, off, size);
+    }
     (void)size;
     HvPl011 *u = opaque;
     switch (off) {
@@ -57,6 +61,10 @@ static uint64_t pl011_read(void *opaque, uint64_t off, unsigned size) {
 }
 
 static void pl011_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    {
+        static int n;
+        if (getenv("HENGE_UART_LOG") && n++ < 200) fprintf(stderr, "hengevm: uart write %llx off %#llx size %u v %#llx\n", (unsigned long long) ((HvPl011 *) opaque)->pa, off, size, v);
+    }
     (void)size;
     HvPl011 *u = opaque;
     switch (off) {
@@ -91,6 +99,7 @@ HvPl011 *hv_pl011_create(HvMachine *m, HvGic *gic, uint64_t pa, int intid) {
     HvPl011 *u = calloc(1, sizeof *u);
     u->gic = gic;
     u->intid = intid;
+    u->pa = pa;
     u->cr = 0x300;  /* TXE, RXE: QEMU's reset value */
     u->ifls = 0x12;
     u->ris = INT_TX;

@@ -1379,7 +1379,6 @@ static int run_loop(HvCpu *cpu, int one) {
                             if (!kf_is_kernel(h)) continue;
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
                             if (getenv("HV_SLOW_MEM")) cpu->m->slow_mem = 1;
-                            kernel_fixups(cpu->m, pa, pa + off_k);
                             /* The moment worth keeping: the firmware has finished with the image
                                and the kernel has not run yet, so whatever is wrong in it is the
                                firmware's doing alone. */
@@ -1460,6 +1459,15 @@ static int run_loop(HvCpu *cpu, int one) {
                             *len = 16u << 20;
                             fprintf(stderr, "hengevm: boot_args dt length %u -> %u (pa 837f0000 fixed)\n",
                                     was, *len);
+                            /* The kernel prints nothing without -v, and its own words about what
+                               it does next are worth more than anything inferred from registers.
+                               The command line follows the device tree fields at 0x6c. */
+                            char *cmd = (char *) q + 0x6c;
+                            if (!getenv("HV_QUIET_BOOT") && !strstr(cmd, "-v")) {
+                                size_t n = strnlen(cmd, 1000);
+                                if (n + 3 < 1024) { memcpy(cmd + n, " -v", 4); }
+                                fprintf(stderr, "hengevm: boot-args now \"%s\"\n", cmd);
+                            }
                         } else {
                             fprintf(stderr, "hengevm: boot_args at 837f0000 has dt length %u; scan found none\n", was);
                         }

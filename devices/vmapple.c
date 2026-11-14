@@ -378,6 +378,11 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        stops are worth more than anything we can infer from the registers. */
     b->uart->output = vmapple_serial_out;
     b->uart->output_opaque = m;
+    /* The kernel reads `serial-device` from the device tree and finds uart0 at this address, not
+       the firmware's port: without a device there its console is silent by construction. */
+    b->uart_kernel = hv_pl011_create(m, b->gic, VMAPPLE_UART_KERNEL, 32 + VMAPPLE_IRQ_UART_KERNEL);
+    b->uart_kernel->output = vmapple_serial_out;
+    b->uart_kernel->output_opaque = m;
     b->rtc = hv_pl031_create(m, b->gic, VMAPPLE_RTC, 32 + VMAPPLE_IRQ_RTC);
     b->gpio = hv_pl061_create(m, b->gic, VMAPPLE_GPIO, 32 + VMAPPLE_IRQ_GPIO);
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);
