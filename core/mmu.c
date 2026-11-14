@@ -20,6 +20,8 @@ static int granule_bits(uint32_t tg, int ttbr1) {
 /* This file is built with -mgeneral-regs-only, and the walk and the TLB fill
    call nothing in libc: hv_tlb_refill runs them from translated code without
    saving the guest's SIMD registers, which libc's memory routines would use. */
+FILE *hv_walk_dbg; /* set while a walk is being traced into a file */
+
 static HvRam *ram_of(HvMachine *m, uint64_t pa) {
     for (int i = 0; i < m->nram; i++)
         if (pa - m->ram[i].pa < m->ram[i].size) return &m->ram[i];
@@ -83,6 +85,13 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
             out->s1ptw = 1;
             return;
         }
+        /* Diagnostic for one address: a permission fault on a write to what the kernel believes
+           is its own stack means either the descriptor is read-only or this walk is reading the
+           wrong table, and only the descriptors say which. */
+        if (hv_walk_dbg)
+            fprintf(hv_walk_dbg, "walk %#llx L%d base %#llx idx %#llx desc %#llx\n",
+                    (unsigned long long) va, level, (unsigned long long) base,
+                    (unsigned long long) idx, (unsigned long long) desc);
         if (!(desc & 1)) {
             out->fsc = HV_FSC_TRANSLATION(level);
             return;

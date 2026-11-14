@@ -30,6 +30,7 @@ typedef struct HvWalk {
 
 /* el is the EL whose permissions apply (0 for LDTR/STTR at EL1). */
 void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out);
+extern FILE *hv_walk_dbg; /* non-NULL: every walk level is written there (diagnostics) */
 
 void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);

@@ -252,6 +252,7 @@ typedef struct HvMachine {
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
+    int halt_dumped;     /* the idle spin was seen once, and its block path was written out */
     HvStats stats;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
@@ -344,7 +345,9 @@ void hv_pc_hist_note(HvCpu *cpu);
 void hv_pc_hist_note_va(int index, uint64_t va);
 uint64_t hv_pc_hist_last(int index);
 void hv_pc_hist_dump(HvCpu *cpu);
+void hv_pc_hist_dump_file(HvCpu *cpu);
 void hv_trace_ring_dump(HvCpu *cpu);
+void hv_helper_hist_dump(HvCpu *cpu);
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m); /* CPU 0 */

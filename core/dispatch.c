@@ -55,6 +55,185 @@ void hv_flush_blocks(HvMachine *m) {
 
 /* Parked: not running guest code, nor using its TLB, so other CPUs need not
    wait for it (TLBIs, a flush). It catches up with requests on the way back. */
+/* A kernel collection arrives with chained fixups that the *loader* is supposed to have resolved:
+   iBoot rebases every slot and signs the authenticated ones, and the kernel then skips its own pass
+   because the sub-image says it is already in the cache (the guard reads the Mach-O flags of the
+   fileset entry and branches over the fixup loop). Only the rebasing has to happen here — guest
+   pointers are never signed in this engine, and every AUT* the guest runs strips the signature
+   field anyway.
+   Pointer format 8, DYLD_CHAINED_PTR_64_KERNEL_CACHE: target:30, cacheLevel:2, diversity:16,
+   addrDiv:1, key:2, next:12 (in 4-byte units), isAuth:1. `target` is an offset from the image
+   base, and the chain start offsets are per page in a table after the segment header. */
+static uint32_t kf_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t kf_u64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static uint16_t kf_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+
+static int kf_is_kernel(const uint8_t *h) {
+    if (kf_u32(h) != 0xfeedfacf) return 0;
+    uint32_t ncmds = kf_u32(h + 16), off = 32;
+    for (uint32_t c = 0; c < ncmds && off + 72 <= 4096; c++) {
+        uint32_t cmd = kf_u32(h + off), csz = kf_u32(h + off + 4);
+        if (csz < 8 || off + csz > 4096) return 0;
+        if (cmd == 0x19 && !memcmp(h + off + 8, "__TEXT", 7) && kf_u64(h + off + 24) == 0xfffffe0007004000ull) return 1;
+        off += csz;
+    }
+    return 0;
+}
+
+static void kernel_fixups(HvMachine *m, uint64_t image_pa, uint64_t image_va) {
+    uint8_t hdr[4096];
+    if (hv_phys_read(m, image_pa, hdr, sizeof hdr) != 0) return;
+    uint32_t ncmds = kf_u32(hdr + 16), off = 32, csz_fix = 0, fix_off = 0, nseg = 0;
+    char segname[8][17];
+    memset(segname, 0, sizeof segname);
+    for (uint32_t c = 0; c < ncmds && off + 8 <= sizeof hdr; c++) {
+        uint32_t cmd = kf_u32(hdr + off), csz = kf_u32(hdr + off + 4);
+        if (csz < 8 || off + csz > sizeof hdr) break;
+        if (cmd == 0x80000034) { fix_off = kf_u32(hdr + off + 8); csz_fix = kf_u32(hdr + off + 12); }
+        if (cmd == 0x19 && nseg < 8) { /* LC_SEGMENT_64: the starts table is indexed in this order */
+            memcpy(segname[nseg], hdr + off + 8, 16);
+            segname[nseg][16] = 0;
+            nseg++;
+        }
+        off += csz;
+    }
+    if (!csz_fix || csz_fix > (8u << 20)) return;
+    uint8_t *fx = malloc(csz_fix);
+    if (!fx) return;
+    if (hv_phys_read(m, image_pa + fix_off, fx, csz_fix) != 0) { free(fx); return; }
+    uint32_t starts = kf_u32(fx + 4);
+    uint32_t segs_in_fix = kf_u32(fx + starts);
+    uint32_t applied = 0, already = 0, slots = 0;
+    uint32_t seg_applied[8] = {0}, seg_already[8] = {0};
+    for (uint32_t s = 0; s < segs_in_fix; s++) {
+        /* __DATA_CONST is the kernel's own: its pass recomputes those slots from the value it finds
+           and does not skip one that is already a pointer, so rewriting them here applies the base
+           twice and the guest jumps into the middle of the image. Only __DATA is left to the loader. */
+        if (s < 8 && !strcmp(segname[s], "__DATA_CONST")) continue;
+        uint32_t soff = kf_u32(fx + starts + 4 + 4 * s);
+        if (!soff) continue;
+        const uint8_t *sp = fx + starts + soff;
+        if (sp + 22 > fx + csz_fix) continue;
+        uint16_t psize = kf_u16(sp + 4), pfmt = kf_u16(sp + 6);
+        uint64_t seg_off = kf_u64(sp + 8);
+        uint16_t pages = kf_u16(sp + 20);
+        if (pfmt != 8 || !psize) continue;
+        for (uint16_t pg = 0; pg < pages; pg++) {
+            if (sp + 22 + 2 * pg + 2 > fx + csz_fix) break;
+            uint16_t start = kf_u16(sp + 22 + 2 * pg);
+            if (start == 0xffff) continue;
+            uint64_t o = start;
+            for (;;) {
+                uint64_t pa = image_pa + seg_off + (uint64_t) pg * psize + o;
+                uint64_t v = 0;
+                if (hv_phys_read(m, pa, &v, 8) != 0) break;
+                uint64_t target = v & 0x3fffffffull;
+                uint32_t next = (uint32_t) ((v >> 51) & 0xfff);
+                slots++;
+                if (v >= 0xfffffe0000000000ull) { already++; if (s < 8) seg_already[s]++; } /* a pointer already: the loader got here */
+                else {
+                    uint64_t nv = image_va + target;
+                    hv_phys_write(m, pa, &nv, 8);
+                    applied++;
+                    if (s < 8) seg_applied[s]++;
+                }
+                if (!next) break;
+                o += (uint64_t) next * 4;
+                if (o >= psize) break;
+            }
+        }
+    }
+    free(fx);
+    /* Read back the first slots of __DATA_CONST: if they hold the base twice by the time the
+       guest reaches them, something rebased on top of this pass. */
+    uint64_t probe[4] = {0, 0, 0, 0};
+    hv_phys_read(m, image_pa + 0x6f8000, probe, sizeof probe);
+    const char *wd = getenv("HV_BLOCK_DUMP");
+    if (wd && *wd) {
+        char p2[512];
+        snprintf(p2, sizeof p2, "%s", wd);
+        char *sl = strrchr(p2, '/');
+        if (sl) snprintf(sl + 1, sizeof p2 - (size_t) (sl + 1 - p2), "fixups.txt");
+        FILE *f = fopen(p2, "w");
+        if (f) {
+            fprintf(f, "image pa %llx va %llx\nslots %u applied %u already %u\n",
+                    (unsigned long long) image_pa, (unsigned long long) image_va, slots, applied, already);
+            fprintf(f, "dataconst[0..3] %#llx %#llx %#llx %#llx\n",
+                    (unsigned long long) probe[0], (unsigned long long) probe[1],
+                    (unsigned long long) probe[2], (unsigned long long) probe[3]);
+            for (int i = 0; i < 8; i++)
+                if (seg_applied[i] || seg_already[i]) fprintf(f, "seg%d: applied %u already %u\n", i, seg_applied[i], seg_already[i]);
+            fclose(f);
+        }
+    }
+}
+
+/* A signal raised from inside the JIT region: the translator emitted something the host refuses to
+   run (SIGILL), or one of its loads and stores went outside what it should touch. The dispatcher
+   only knows the block it entered, not how far into it the CPU got, so the block is found by
+   binary search over the block table (which is laid out in JIT order) and what it was made from is
+   written out next to the block dump. */
+static HvMachine *g_fault_m;
+
+static void jit_fault(int sig, siginfo_t *si, void *ucv) {
+    ucontext_t *uc = ucv;
+    uint64_t pc = (uint64_t) uc->uc_mcontext.pc;
+    HvMachine *m = g_fault_m;
+    const char *wd = getenv("HV_BLOCK_DUMP");
+    FILE *f = NULL;
+    if (wd && *wd) {
+        char p[512];
+        snprintf(p, sizeof p, "%s", wd);
+        char *sl = strrchr(p, '/');
+        if (sl) snprintf(sl + 1, sizeof p - (size_t) (sl + 1 - p), "jitcrash.txt");
+        f = fopen(p, "a");
+    }
+    if (f) fprintf(f, "signal %d fault %p pc %#llx\n", sig, si->si_addr, (unsigned long long) pc);
+    if (m && pc >= (uint64_t) (uintptr_t) m->jit.base && pc < (uint64_t) (uintptr_t) (m->jit.base + m->jit.used) && m->nblocks) {
+        int lo = 0, hi = m->nblocks - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if ((uint64_t) (uintptr_t) m->blocks[mid].code <= pc) lo = mid;
+            else hi = mid - 1;
+        }
+        HvBlock *b = &m->blocks[lo];
+        uint64_t off_in_block = (pc - (uint64_t) (uintptr_t) b->code) / 4;
+        if (f) {
+            fprintf(f, "block va %#llx flags %#x ninsns %u word %llu\n",
+                    (unsigned long long) b->va, b->flags, b->ninsns, (unsigned long long) off_in_block);
+            const uint32_t *gw = (const uint32_t *) ((const uint8_t *) b->ram->host + (b->pa - b->ram->pa));
+            fprintf(f, "guest:");
+            for (uint32_t i = 0; i < b->ninsns && i < 64; i++) fprintf(f, " %08x", gw[i]);
+            fprintf(f, "\nhost:");
+            for (int64_t i = (int64_t) off_in_block - 16; i < (int64_t) off_in_block + 16; i++)
+                if (i >= 0) fprintf(f, " %08x", b->code[i]);
+            fprintf(f, "\n");
+            if (hv_self) {
+                fprintf(f, "guest regs: pc %#llx el%u\n", (unsigned long long) hv_self->pc, hv_self->el);
+                for (int i = 0; i < 31; i++) fprintf(f, "x%d %#llx%s", i, (unsigned long long) hv_self->x[i], (i % 4 == 3) ? "\n" : "  ");
+                fprintf(f, "sp %#llx spsr %#llx\n", (unsigned long long) hv_self->sp, (unsigned long long) hv_self->spsr_el1);
+            }
+            fclose(f);
+        }
+    } else if (f) fclose(f);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void jit_fault_watch(HvMachine *m) {
+    static int once;
+    if (once) return;
+    once = 1;
+    g_fault_m = m;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = jit_fault;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+
 static void park(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     __atomic_store_n(&p->tlb_live, 0, __ATOMIC_SEQ_CST);
@@ -305,6 +484,21 @@ static void *fast_resume(HvCpu *cpu) {
 }
 
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
+int hv_looks_host(uint64_t v);
+/* What a host address is, by name: a value that turns up in a guest register has to be traced back
+   to the object it belongs to, and a symbol name is the shortest way there. */
+static const char *host_name(uint64_t v) {
+    static char buf[320];
+    Dl_info di;
+    memset(&di, 0, sizeof di);
+    if (dladdr((void *)(uintptr_t) v, &di) && di.dli_sname)
+        snprintf(buf, sizeof buf, "%s+0x%llx", di.dli_sname,
+                 (unsigned long long) (v - (uintptr_t) di.dli_saddr));
+    else
+        snprintf(buf, sizeof buf, "lib+0x%llx", 
+                 (unsigned long long) (di.dli_fbase ? (uintptr_t) v - (uintptr_t) di.dli_fbase : 0));
+    return buf;
+}
 static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
 /* Could this TLBI (just done) change the mapping of pc's page? A page or range
@@ -337,8 +531,38 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in);
 
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     HvPerCpu *pcs = cpu->pc_state;
+    if (cpu->m->log >= 2) {
+        /* The ring the data-abort dump reads: who called, with what. */
+        uint32_t i = cpu->helper_hist_idx++ & 63;
+        cpu->helper_hist[i].pc = info_in->pc;
+        cpu->helper_hist[i].op = info_in->op & 0xff;
+        cpu->helper_hist[i].x4 = cpu->x[4];
+        cpu->helper_hist[i].x16 = cpu->x[16];
+        cpu->helper_hist[i].x30 = cpu->x[30];
+        cpu->helper_hist[i].x0 = cpu->x[0];
+    }
     if (pcs) __atomic_store_n(&pcs->phase, HV_PHASE_HELPER, __ATOMIC_RELAXED);
+    /* Whether a helper is what moves a register: the guest's own instructions are the only other
+       writers, and those are known. A value that leaves the guest's own address space is the
+       interesting case, so it is the one that gets printed. */
+    const uint64_t x16_before = cpu->x[16], x4_before = cpu->x[4];
+    /* The first helpers of a boot: what the save point saw, before any C code ran. A register
+       already wrong here was written by the block or by the thunk, not by the helper. */
+    if (cpu->m->log >= 2 && cpu->icount < 40)
+        fprintf(stderr, "hengevm: helper in: pc %llx op %llu insn %08x x16 %llx x4 %llx\n",
+                (unsigned long long) info_in->pc, (unsigned long long) (info_in->op & 0xff),
+                info_in->insn, (unsigned long long) x16_before, (unsigned long long) x4_before);
     uint32_t r = helper(cpu, info_in);
+    if (cpu->m->log >= 2) {
+        if (cpu->x[16] != x16_before && cpu->x[16] > 0x100000000ull)
+            fprintf(stderr, "hengevm: helper x16: pc %llx op %llu insn %08x %llx -> %llx\n",
+                    (unsigned long long) info_in->pc, (unsigned long long) (info_in->op & 0xff),
+                    info_in->insn, (unsigned long long) x16_before, (unsigned long long) cpu->x[16]);
+        if (cpu->x[4] != x4_before && cpu->x[4] > 0x100000000ull)
+            fprintf(stderr, "hengevm: helper x4: pc %llx op %llu insn %08x %llx -> %llx\n",
+                    (unsigned long long) info_in->pc, (unsigned long long) (info_in->op & 0xff),
+                    info_in->insn, (unsigned long long) x4_before, (unsigned long long) cpu->x[4]);
+    }
     if (pcs) __atomic_store_n(&pcs->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
     /* An exception just taken (an abort, an undefined instruction, a trap): its
        vector's block, as after an SVC. */
@@ -889,6 +1113,15 @@ static void stop_the_world(HvCpu *cpu) {
     }
 }
 
+/* The kernel's block-by-block path, kept while diagnosing (see run()). */
+#define FW_REC 1024
+static struct { uint64_t pc, x20, x22, x23, x30, x0; } fw_rec[FW_REC];
+static uint32_t fw_n;
+
+#define KTRACE_MAX 8192
+static uint64_t ktrace[KTRACE_MAX];
+static uint32_t ktrace_n;
+
 int hv_run(HvCpu *cpu) {
     if (cpu->pc_state) cpu->pc_state->thread = mach_thread_self();
     hv_big_lock(cpu->m);
@@ -940,6 +1173,7 @@ static int run_loop(HvCpu *cpu, int one) {
     uint32_t chain_flags = 0;
     uint32_t last_reason = HV_EXIT_BRANCH;
     hv_self = cpu;
+    if (m->log >= 2) jit_fault_watch(m);
     unpark(cpu);
     for (;;) {
         if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) {
@@ -1095,7 +1329,222 @@ static int run_loop(HvCpu *cpu, int one) {
            where the guest died, not how it got there. Kept only while diagnosing (log >= 2), and
            it is one store per block, which is why it can be on at all. */
         if (m->log >= 2) hv_pc_hist_note(cpu);
+        /* The kernel's own execution order, from its entry to wherever it stops: with no symbols
+           and no console, the sequence of blocks is the only account of what the initialisation
+           actually did, and where it departed from what it should have done. */
+        static int boot_args_fixed;
+        if (m->log >= 2 && cpu->pc < 0xfffffe0000000000ull) {
+            /* First execution ever in the page that decides the kernel entry: this is the
+               firmware's own code as loaded, before anything could have rewritten it. */
+            static int fw_page_a;
+            if (!fw_page_a && (cpu->pc & ~0xfffull) == 0x74898000ull) {
+                fw_page_a = 1;
+                const char *wd2 = getenv("HV_BLOCK_DUMP");
+                if (wd2 && *wd2) {
+                    char pa2[512];
+                    snprintf(pa2, sizeof pa2, "%s", wd2);
+                    char *sl6 = strrchr(pa2, '/');
+                    if (sl6) {
+                        snprintf(sl6 + 1, sizeof pa2 - (size_t)(sl6 + 1 - pa2), "fwcode_a.bin");
+                        FILE *af = fopen(pa2, "wb");
+                        if (af) {
+                            uint8_t pg[4096];
+                            if (hv_phys_read(m, 0x74898000ull, pg, sizeof pg) == 0) fwrite(pg, 1, sizeof pg, af);
+                            fclose(af);
+                        }
+                    }
+                }
+            }
+            /* What the firmware had in the registers that decide the kernel entry, just before it
+               jumps: x20 holds the link-time entry, x22/x23 the relocation delta, x30 the target. */
+            fw_rec[fw_n % FW_REC].pc = cpu->pc;
+            fw_rec[fw_n % FW_REC].x20 = cpu->x[20];
+            fw_rec[fw_n % FW_REC].x22 = cpu->x[22];
+            fw_rec[fw_n % FW_REC].x23 = cpu->x[23];
+            fw_rec[fw_n % FW_REC].x30 = cpu->x[30];
+            fw_rec[fw_n % FW_REC].x0 = cpu->x[0];
+            fw_n++;
+        }
+        if (m->log >= 2 && cpu->pc >= 0xfffffe0000000000ull && ktrace_n < KTRACE_MAX) {
+            /* Did the firmware patch its own code before jumping? iBEC picks the kernel entry
+               with a constant in an adrp/add pair at 0x748980c4; if that constant was rewritten
+               at run time, the page holding it differs from what it held when first executed.
+               Snapshot the page both times and compare offline. */
+            {
+                static int page_a;
+                if (ktrace_n == 0) {
+                    const char *wd1 = getenv("HV_BLOCK_DUMP");
+                    if (wd1 && *wd1 && !page_a) {
+                        char pb[512];
+                        snprintf(pb, sizeof pb, "%s", wd1);
+                        char *sl5 = strrchr(pb, '/');
+                        if (sl5) {
+                            snprintf(sl5 + 1, sizeof pb - (size_t)(sl5 + 1 - pb), "fwcode_b.bin");
+                            FILE *bf = fopen(pb, "wb");
+                            if (bf) {
+                                uint8_t pg[4096];
+                                if (hv_phys_read(cpu->m, 0x74898000ull, pg, sizeof pg) == 0) fwrite(pg, 1, sizeof pg, bf);
+                                fclose(bf);
+                            }
+                        }
+                    }
+                }
+            }
+            /* To a file, not to stderr: at the moment the kernel starts, the stderr pipe loses
+               output (every probe that printed here went missing while the file writes worked). */
+            if (ktrace_n == 0) {
+                /* The loader's half of the hand-off: find the kernel collection in RAM and rebase
+                   its chained fixups, which iBoot would have done before jumping. */
+                {
+                    static int fx_done;
+                    if (!fx_done) {
+                        fx_done = 1;
+                        uint64_t off_k = 0;
+                        uint32_t last_i = (fw_n + FW_REC - 1) % FW_REC;
+                        if (fw_n) off_k = fw_rec[last_i].x22 - fw_rec[last_i].x23; /* PA -> VA */
+                        uint8_t h[4096];
+                        for (uint64_t pa = 0x70000000ull; pa < 0xf0000000ull; pa += 0x1000) {
+                            if (hv_phys_read(cpu->m, pa, h, sizeof h) != 0) continue;
+                            if (!kf_is_kernel(h)) continue;
+                            kernel_fixups(cpu->m, pa, pa + off_k);
+                            break;
+                        }
+                    }
+                }
+                const char *wd = getenv("HV_BLOCK_DUMP");
+                if (wd && *wd) {
+                    char ep[512];
+                    snprintf(ep, sizeof ep, "%s", wd);
+                    char *sl3 = strrchr(ep, '/');
+                    if (sl3) snprintf(sl3 + 1, sizeof ep - (size_t)(sl3 + 1 - ep), "entry.txt");
+                    FILE *ef = fopen(ep, "w");
+                    if (ef) {
+                        for (uint32_t k = 0; k < 1024 && k < fw_n; k++) {
+                            uint32_t i2 = (fw_n - 1 - k) % FW_REC;
+                            fprintf(ef, "fw -%u pc %llx x20 %llx x22 %llx x23 %llx x30 %llx x0 %llx\n",
+                                    k, (unsigned long long) fw_rec[i2].pc,
+                                    (unsigned long long) fw_rec[i2].x20, (unsigned long long) fw_rec[i2].x22,
+                                    (unsigned long long) fw_rec[i2].x23, (unsigned long long) fw_rec[i2].x30,
+                                    (unsigned long long) fw_rec[i2].x0);
+                        }
+                        fprintf(ef, "pc %llx\nprev %llx\nx0 %llx\nx1 %llx\nx2 %llx\nx3 %llx\nel %u\nspsr %llx\n",
+                                (unsigned long long) cpu->pc, (unsigned long long) prev_pc,
+                                (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                                (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3],
+                                cpu->el, (unsigned long long) cpu->spsr_el1);
+                        fclose(ef);
+                    }
+                }
+            }
+            ktrace[ktrace_n++] = cpu->pc;
+            /* From the kernel's first block on, every load and store goes through the emulator, so
+               the writes of the init sequence can be listed. Blocks already translated for the
+               firmware keep their fast paths, which is what keeps the install itself quick. */
+            /* iBEC appends nodes to the device tree and leaves boot_args' length at the older,
+               smaller value, so the kernel parses a truncated tree. Try the true length. */
+            if (!boot_args_fixed) {
+                boot_args_fixed = 1;
+                for (uint64_t pa = 0; pa < (1ull << 32); pa += 0x4000) {
+                    const uint64_t *q = hv_phys_ptr(m, pa, 0x1000);
+                    if (!q) continue;
+                    const uint16_t *h = (const uint16_t *) q;
+                    if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue;
+                    if ((q[1] >> 40) != 0xfffffe) continue;
+                    uint32_t *len = (uint32_t *) (uintptr_t) (q + 13);   /* 0x68: device tree length */
+                    uint32_t was = *len;
+                    if (!was || was >= (16u << 20)) continue;            /* not the real one */
+                    *len = 16u << 20;
+                    fprintf(stderr, "hengevm: boot_args dt length %u -> %u (pa %llx)\n",
+                            was, *len, (unsigned long long) pa);
+                    break;
+                }
+                /* The scan above has not found it once in practice; iBEC places boot_args at
+                   the same physical address every boot, so fall back to that. */
+                {
+                    uint64_t *q = hv_phys_ptr(m, 0x837f0000ull, 0x1000);
+                    if (q) {
+                        uint32_t *len = (uint32_t *) (uintptr_t) (q + 13);
+                        uint32_t was = *len;
+                        if (was && was < (16u << 20)) {
+                            *len = 16u << 20;
+                            fprintf(stderr, "hengevm: boot_args dt length %u -> %u (pa 837f0000 fixed)\n",
+                                    was, *len);
+                        } else {
+                            fprintf(stderr, "hengevm: boot_args at 837f0000 has dt length %u; scan found none\n", was);
+                        }
+                    } else {
+                        fprintf(stderr, "hengevm: boot_args: scan found none and 837f0000 is not RAM here\n");
+                    }
+                }
+            }
+            if (!m->slow_mem) {
+                m->slow_mem = 1;
+                __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);  /* re-translate with it */
+            }
+        }
+        /*
+         * A register the block changed without its own instructions changing it: the block's entry
+         * value is in the ring, the value it left behind is in the slot. Guest code writes x16 for
+         * itself all the time, so the telling case is a host address appearing, which no guest can
+         * make — and then the block's own code is not the writer, a call it made is.
+         */
+        if (m->log >= 2 && hv_looks_host(cpu->x[16])) {
+            const uint64_t *e = NULL;
+            for (uint32_t k = 1; k <= 32; k++) {   /* chained blocks may have run since */
+                const uint64_t *c = &cpu->trace_ring[((cpu->trace_idx - k) & 255) * 4];
+                if (c[0] == prev_pc) { e = c; break; }
+            }
+            if (e && !hv_looks_host(e[2])) {
+                static uint64_t last_report;
+                if (last_report != prev_pc) {
+                    last_report = prev_pc;
+                    fprintf(stderr, "hengevm: block %llx left x16 %llx but entered with %llx (%s)\n",
+                            (unsigned long long) prev_pc, (unsigned long long) cpu->x[16],
+                            (unsigned long long) e[2], host_name(cpu->x[16]));
+                }
+            }
+        }
+        /* The first blocks of a boot, with the register that keeps going wrong: whether it starts
+           out wrong says whether the guest wrote it or it was handed over that way. */
+        if (m->log >= 2 && cpu->icount < 32)
+            fprintf(stderr, "hengevm: icount %llu block %llx el%u x16 %llx x4 %llx\n",
+                    (unsigned long long) cpu->icount, (unsigned long long) prev_pc, cpu->el,
+                    (unsigned long long) cpu->x[16], (unsigned long long) cpu->x[4]);
+        if (m->log >= 2 && cpu->icount < 32) {
+            /* The ring says what each block was entered with: whether the block about to run got
+               a bad x16 or made one itself. */
+            for (uint32_t k = 3; k >= 1; k--) {
+                const uint64_t *e = &cpu->trace_ring[((cpu->trace_idx - k) & 255) * 4];
+                fprintf(stderr, "hengevm:   ring -%u: va %llx x16slot %llx x16host %llx\n", k,
+                        (unsigned long long) e[0], (unsigned long long) e[1],
+                        (unsigned long long) e[2]);
+            }
+            if (hv_looks_host(cpu->x[16]))
+                fprintf(stderr, "hengevm:   x16 is %s\n", host_name(cpu->x[16]));
+        }
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
+        /*
+         * A guest register holding one of this process's own addresses, seen for the first time
+         * here: the block that just ended left it that way. Nothing in the guest can produce an
+         * address in this library, so it came from host code, and the block and the way it left
+         * name which code that was.
+         */
+        if (m->log >= 2) {
+            static uint64_t was[8];
+            static uint64_t was4[8], was0[8];
+            uint32_t ci = cpu->index < 8 ? cpu->index : 0;
+            uint64_t v16 = cpu->x[16], v4 = cpu->x[4], v0 = cpu->x[0];
+            int h16 = hv_looks_host(v16), h4 = hv_looks_host(v4);
+            int was16 = hv_looks_host(was[ci]), was44 = hv_looks_host(was4[ci]);
+            if ((h16 && !was16) || (h4 && !was44))
+                fprintf(stderr, "hengevm: host address in a guest register: cpu %u after block %llx "
+                                "(prev block %llx, why %d) x16 %llx x4 %llx x0 %llx pc %llx el%u\n",
+                        (unsigned) cpu->index, (unsigned long long) prev_pc,
+                        (unsigned long long) cpu->pc, why, (unsigned long long) v16,
+                        (unsigned long long) v4, (unsigned long long) v0,
+                        (unsigned long long) cpu->pc, cpu->el);
+            was[ci] = v16, was4[ci] = v4, was0[ci] = v0;
+        }
         prev_pc = cpu->pc;
         prev_b = b;
         if (m->stats_interval) m->stats.why[why]++;
@@ -1118,6 +1567,333 @@ static int run_loop(HvCpu *cpu, int one) {
             m->stats.miss_kind[kind]++;
         }
         cpu->miss_site = 0; /* only the next lookup miss sets it again */
+        /* Poll the kernel global the halt came from, by physical address: a store through the
+           fast path never reaches the emulator, so watching it means reading it back often. */
+        /* The one slot the kernel dies on, at the physical address this boot's boot_args imply:
+           if it never changes the kernel never wrote it, and the write that was supposed to happen
+           did not. */
+        if (m->log >= 2 && !(m->stats.blocks & 0xfff)) {
+            /* The kernel relocates its own image per boot, so the slot's address is only known
+               through the guest's page tables, resolved here rather than at boot time. */
+            static uint64_t watch_seen;
+            static uint64_t watch_pa;
+            static int watch_n, watch_failed;
+            if (!watch_pa && cpu->el == 1) {   /* the walk follows the current EL's tables */
+                HvWalk w0;
+                hv_mmu_walk(cpu, 0xfffffe001f1f88f0ull, HV_ACC_READ, 1, &w0);
+                if (w0.fsc) { if (!watch_failed) { watch_failed = 1;
+                        fprintf(stderr, "hengevm: slot walk failed (fsc %x) at blocks %llu pc %llx\n",
+                                w0.fsc, (unsigned long long) m->stats.blocks, (unsigned long long) cpu->pc); } }
+                /* A walk before the MMU is on has no answer: take only a result that lands in
+                   guest RAM, and keep retrying until one does. */
+                else if (w0.pa >= 0x70000000ull && w0.pa < 0x70000000ull + (8ull << 30)) {
+                    watch_pa = w0.pa;
+                    fprintf(stderr, "hengevm: slot walk: pa %llx at blocks %llu pc %llx\n",
+                            (unsigned long long) w0.pa, (unsigned long long) m->stats.blocks,
+                            (unsigned long long) cpu->pc);
+                }
+            }
+            if (watch_pa) {
+                uint64_t v = 0;
+                int rcw = hv_phys_read(m, watch_pa, &v, 8);
+                static int rc_noted;
+                if (rcw && !rc_noted) { rc_noted = 1;
+                    fprintf(stderr, "hengevm: slot read failed rc %d pa %llx\n", rcw,
+                            (unsigned long long) watch_pa); }
+                if (rcw == 0 && (v != watch_seen || !watch_n)) {
+                    if (watch_n < 24)
+                        fprintf(stderr, "hengevm: slot pa %llx = %llx blocks %llu pc %llx el%u\n",
+                                (unsigned long long) watch_pa, (unsigned long long) v,
+                                (unsigned long long) m->stats.blocks, (unsigned long long) cpu->pc, cpu->el);
+                    watch_seen = v, watch_n++;
+                }
+            }
+        }
+        if (m->log >= 2 && !(m->stats.blocks & 0xfff)) {
+            static uint64_t seen;
+            static int noted, first_fail;
+            uint64_t v = 0;
+            HvWalk w;   /* the kernel's slide differs per boot: resolve the VA every time */
+            hv_mmu_walk(cpu, 0xfffffe001f1f88f0ull, HV_ACC_READ, 1, &w);
+            if (w.fsc && !noted && cpu->el == 1 && !first_fail) {
+                first_fail = 1;
+                fprintf(stderr, "hengevm: global not mapped yet at blocks %llu pc %llx (fsc %x)\n",
+                        (unsigned long long) m->stats.blocks, (unsigned long long) cpu->pc, w.fsc);
+            }
+            if (!w.fsc && hv_phys_read(m, w.pa, &v, 8) == 0 && (v != seen || !noted))
+                fprintf(stderr, "hengevm: global %llx (was %llx) blocks %llu pc %llx el%u\n",
+                        (unsigned long long) v, (unsigned long long) seen,
+                        (unsigned long long) m->stats.blocks,
+                        (unsigned long long) cpu->pc, cpu->el),
+                seen = v, noted = 1;
+        }
+        /* A heartbeat: a guest that stops making progress (waiting for an interrupt that will not
+           come, or spinning) is otherwise silent, and silence looks the same as a hang. */
+        if (m->log >= 2) {
+            static uint64_t last_beat, last_idle_pc;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now = (uint64_t) ts.tv_sec;
+            if (now != last_beat) {
+                last_beat = now;
+                fprintf(stderr, "hengevm: beat pc %llx el%u icount %llu blocks %llu why %d "
+                                "slow_mem %d memops %llu\n",
+                        (unsigned long long) cpu->pc, cpu->el,
+                        (unsigned long long) cpu->icount, (unsigned long long) m->stats.blocks, why,
+                        m->slow_mem, (unsigned long long) m->stat_slow_mem);
+                /* The kernel global the halt came from, sampled once as soon as the kernel runs:
+                   a bad value already there came in with the boot data, not from a later store. */
+                if (cpu->el == 1 && cpu->pc >= 0xfffffe0000000000ull) {
+                    static int sampled;
+                    if (!sampled) {
+                        sampled = 1;
+                        HvWalk w;
+                        hv_mmu_walk(cpu, 0xfffffe001f1f88f0ull, HV_ACC_READ, 1, &w);
+                        uint64_t v = 0;
+                        if (!w.fsc && hv_phys_read(m, w.pa, &v, 8) == 0)
+                            fprintf(stderr, "hengevm: sample: [%llx] = %llx (pa %llx) at pc %llx\n",
+                                    (unsigned long long) 0xfffffe001f1f88f0ull,
+                                    (unsigned long long) v, (unsigned long long) w.pa,
+                                    (unsigned long long) cpu->pc);
+                        else
+                            fprintf(stderr, "hengevm: sample: that global is not readable (fsc %x)\n", w.fsc);
+                    }
+                }
+                /* Stuck in the kernel's halt area: what it arrived with says why, and it says it
+                   nowhere else (nothing reaches the serial port). */
+                if (cpu->pc >= 0xfffffe001c894000ull && cpu->pc < 0xfffffe001c895000ull) {
+                    static int once;
+                    if (!once) {
+                        once = 1;
+                        /* The kernel's own words, when they are not on the serial port: whatever
+                           it printed is in RAM. Search by content, so no address from an earlier
+                           run is needed; "chosen" is the control, a device tree string that is
+                           certainly there, and says whether the search works at all. */
+                        static const char *const pats[] = { "chosen", "Darwin Kernel", "panic", "xnu" };
+                        for (unsigned k = 0; k < sizeof pats / sizeof pats[0]; k++) {
+                            size_t plen = strlen(pats[k]);
+                            int found = 0;
+                            for (uint64_t pa = 0; pa < (1ull << 32) && !found; pa += (1u << 20)) {
+                                const char *base = hv_phys_ptr(m, pa, 1u << 20);
+                                if (!base) continue;
+                                for (uint32_t off = 0; off + plen < (1u << 20); off += 4) {
+                                    if (memcmp(base + off, pats[k], plen)) continue;
+                                    char text[241];
+                                    memcpy(text, base + off, 240);
+                                    text[240] = 0;
+                                    for (int i = 0; i < 240; i++)
+                                        if ((unsigned char) text[i] < 0x20 && text[i] != '\n') text[i] = ' ';
+                                    fprintf(stderr, "hengevm: found \"%s\" at pa %llx: %.120s\n",
+                                            pats[k], (unsigned long long) (pa + off), text);
+                                    found = 1;
+                                    break;
+                                }
+                            }
+                            if (!found) fprintf(stderr, "hengevm: \"%s\" not in RAM\n", pats[k]);
+                        }
+                        /* The recorded path, next to the kernel dump. */
+                        {
+                            static int kt_done;
+                            if (!kt_done) {
+                                kt_done = 1;
+                                const char *wp = getenv("HV_BLOCK_DUMP");
+                                char kp[512];
+                                if (wp && *wp) {
+                                    snprintf(kp, sizeof kp, "%s", wp);
+                                    char *sl2 = strrchr(kp, '/');
+                                    if (sl2) snprintf(sl2 + 1, sizeof kp - (size_t)(sl2 + 1 - kp), "ktrace.bin");
+                                    FILE *kf = fopen(kp, "wb");
+                                    if (kf) {
+                                        fprintf(stderr, "hengevm: ktrace %u blocks -> %s\n", ktrace_n, kp);
+                                        fwrite(ktrace, 8, ktrace_n, kf);
+                                        fclose(kf);
+                                    }
+                                }
+                            }
+                        }
+                        /* The kernel image itself, dug out of RAM by its Mach-O magic: reading the
+                           code around the halt address offline says which function stopped it, and
+                           that is not answerable from the registers alone. */
+                        {
+                            static int dumped;
+                            if (!dumped) {
+                                dumped = 1;
+                                const char *where = getenv("HV_BLOCK_DUMP");
+                                char path[512];
+                                if (where && *where) {
+                                    snprintf(path, sizeof path, "%s", where);
+                                    char *slash = strrchr(path, '/');
+                                    if (slash) snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "kernel.bin");
+                                    for (uint64_t pa = 0; pa < (1ull << 32); pa += (1u << 20)) {
+                                        const uint32_t *base = hv_phys_ptr(m, pa, 1u << 20);
+                                        if (!base) continue;
+                                        uint32_t hit = 0;
+                                        for (uint32_t off = 0; off + 4 < (1u << 20); off += 4)
+                                            if (base[off / 4] == 0xfeedfacfu || base[off / 4] == 0xcffaedfeu) { hit = off; break; }
+                                        if (!hit) continue;
+                                        FILE *f = fopen(path, "wb");
+                                        if (f) {
+                                            /* Page reads rather than one contiguous mapping: the
+                                               image spans RAM that is not mapped in one piece, and
+                                               the previous version stopped at the first hole. */
+                                            uint64_t start = pa + hit;
+                                            static uint8_t chunk[65536];
+                                            for (uint64_t off = 0; off < (80ull << 20); off += sizeof chunk) {
+                                                if (hv_phys_read(m, start + off, chunk, sizeof chunk) != 0)
+                                                    memset(chunk, 0, sizeof chunk);
+                                                fwrite(chunk, 1, sizeof chunk, f);
+                                            }
+                                            fclose(f);
+                                            fprintf(stderr, "hengevm: kernel dump: pa %llx -> %s (80 MB)\n",
+                                                    (unsigned long long) start, path);
+                                        }
+                                        pa = 1ull << 40;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        /* The boot_args iBoot built for the kernel: physBase, memSize, boot flags,
+                           the device tree pointer and the command line all live here, and every
+                           one of them is something the kernel's early init trusts. */
+                        {
+                            static int ba_done;
+                            if (!ba_done) {
+                                ba_done = 1;
+                                for (uint64_t pa = 0; pa < (1ull << 32); pa += 0x4000) {
+                                    const uint64_t *q = hv_phys_ptr(m, pa, 0x1000);
+                                    if (!q) continue;
+                                    const uint16_t *h = (const uint16_t *) q;
+                                    if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue;
+                                    if ((q[1] >> 40) != 0xfffffe) continue;
+                                    static int cands;
+                                    if (cands >= 3) break;
+                                    if (cands == 0) fprintf(stderr, "hengevm: boot_args candidates:\n");
+                                    cands++;
+                                    fprintf(stderr, "hengevm: boot_args at pa %llx (physBase %llx memSize %llx):\n",
+                                            (unsigned long long) pa, (unsigned long long) q[2],
+                                            (unsigned long long) q[3]);
+                                    /* 0..13, then past the 1024-byte CommandLine, where the flags and
+                                       the device tree pointer are. */
+                                    for (int i = 0; i < 14; i++)
+                                        fprintf(stderr, "hengevm:   [%02d] %016llx%s", i,
+                                                (unsigned long long) q[i], (i % 3 == 2) ? "\n" : "  ");
+                                    fprintf(stderr, "\n");
+                                    /* q[12] is the device tree, as a virtual address in the kernel's
+                                       linear map: physBase/virtBase turn it into a physical one. */
+                                    if (q[12] > q[1]) {
+                                        uint64_t dtpa = q[12] - q[1] + q[2];
+                                        const char *where2 = getenv("HV_BLOCK_DUMP");
+                                        char p2[512];
+                                        if (where2 && *where2) {
+                                            snprintf(p2, sizeof p2, "%s", where2);
+                                            char *sl = strrchr(p2, '/');
+                                            if (sl) snprintf(sl + 1, sizeof p2 - (size_t)(sl + 1 - p2), "dt.bin");
+                                            FILE *f2 = fopen(p2, "wb");
+                                            if (f2) {
+                                                for (uint64_t k = 0; k < (256u << 10); k += (1u << 16)) {
+                                                    const void *chunk = hv_phys_ptr(m, dtpa + k, 1u << 16);
+                                                    if (!chunk) break;
+                                                    fwrite(chunk, 1, 1u << 16, f2);
+                                                }
+                                                fclose(f2);
+                                                fprintf(stderr, "hengevm: dt at va %llx pa %llx -> %s\n",
+                                                        (unsigned long long) q[12],
+                                                        (unsigned long long) dtpa, p2);
+                                            }
+                                        }
+                                    }
+                                    for (int i = 138; i < 170; i++)
+                                        fprintf(stderr, "hengevm:   [%03d] %016llx%s", i,
+                                                (unsigned long long) q[i], (i % 3 == 2) ? "\n" : "  ");
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+                        }
+                        /* The device tree the firmware built: its `chosen` node is what decides the
+                           kernel's memory layout and boot arguments, so it is the first thing to
+                           compare against what the kernel expects. Found by the FDT magic. */
+                        {
+                            static int dt_done;
+                            if (!dt_done) {
+                                dt_done = 1;
+                                const char *where = getenv("HV_BLOCK_DUMP");
+                                char path[512];
+                                if (where && *where) {
+                                    snprintf(path, sizeof path, "%s", where);
+                                    char *slash = strrchr(path, '/');
+                                    if (slash) snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "dt2.bin");
+                                    for (uint64_t pa = 0; pa < (1ull << 32); pa += (1u << 20)) {
+                                        const uint32_t *base = hv_phys_ptr(m, pa, 1u << 20);
+                                        if (!base) continue;
+                                        /* The magic may be absent (a rebuilt tree), so fall back to
+                                           where the tree's own strings are: "chosen" and "dram-size". */
+                                        uint32_t hit = 0;
+                                        for (uint32_t off = 0; off + 4 < (1u << 20); off += 4)
+                                            if (base[off / 4] == 0xedfe0dd0u) { hit = off; break; }
+                                        if (!hit) {
+                                            const char *mb = (const char *) base;
+                                            for (uint32_t off = 0; off + 8 < (1u << 20); off++)
+                                                if (!memcmp(mb + off, "chosen", 6)) { hit = off & ~3u; break; }
+                                        }
+                                        if (!hit) continue;
+                                        FILE *f = fopen(path, "wb");
+                                        if (f) {
+                                            fwrite((const char *) base + hit, 1, (1u << 20) - hit, f);
+                                            const void *more = hv_phys_ptr(m, pa + (1u << 20), 1u << 20);
+                                            if (more) fwrite(more, 1, 1u << 20, f);
+                                            fclose(f);
+                                            fprintf(stderr, "hengevm: device tree dump: pa %llx -> %s\n",
+                                                    (unsigned long long) (pa + hit), path);
+                                        }
+                                        pa = 1ull << 40;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        /* A kernel address in a register at the halt is likely the text of the
+                           reason: read it back through the guest's own page tables. */
+                        for (int a = 0; a < 4; a++) {
+                            uint64_t va = cpu->x[a];
+                            if (va < 0xfffffe0000000000ull) continue;
+                            HvWalk w;
+                            hv_mmu_walk(cpu, va, HV_ACC_READ, 1, &w);
+                            char text[129];
+                            int n = 0;
+                            if (!w.fsc && hv_phys_read(m, w.pa, text, 128) == 0) {
+                                text[128] = 0;
+                                for (; n < 128 && text[n]; n++)
+                                    if (text[n] < 0x20 || text[n] > 0x7e) break;
+                                text[n] = 0;
+                                fprintf(stderr, "hengevm: halt x%d -> \"%s\"\n", a, text);
+                            }
+                        }
+                        fprintf(stderr, "hengevm: halt area: x0 %llx x1 %llx x2 %llx x3 %llx x4 %llx "
+                                        "x5 %llx x6 %llx x7 %llx elr %llx spsr %llx sp %llx daif %x\n",
+                                (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                                (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3],
+                                (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[5],
+                                (unsigned long long) cpu->x[6], (unsigned long long) cpu->x[7],
+                                (unsigned long long) cpu->elr_el1, (unsigned long long) cpu->spsr_el1,
+                                (unsigned long long) cpu->sp, cpu->daif);
+                    }
+                }
+                /* A guest that sits at one pc is waiting for an interrupt: whether it is taking
+                   one is then decided by these, and each of them fails in a different way. */
+                if (cpu->pc == last_idle_pc) {
+                    fprintf(stderr, "hengevm: idle daif %x irq_line %d fiq_line %d cntp_ctl %llx "
+                                    "cntp_cval %llx now %llx cntv_ctl %llx cntv_cval %llx pc %llx\n",
+                            cpu->daif, cpu->pc_state->irq_line, cpu->pc_state->fiq_line,
+                            (unsigned long long) cpu->cntp_ctl, (unsigned long long) cpu->cntp_cval,
+                            (unsigned long long) mach_absolute_time(),
+                            (unsigned long long) cpu->cntv_ctl, (unsigned long long) cpu->cntv_cval,
+                            (unsigned long long) cpu->pc);
+                    hv_pc_hist_dump(cpu);   /* how it got there */
+                }
+                last_idle_pc = cpu->pc;
+            }
+        }
         cpu->exit_reason = HV_EXIT_BRANCH;
         cpu->last_stub = 0;
         cpu->icount++;
@@ -1127,6 +1903,10 @@ static int run_loop(HvCpu *cpu, int one) {
             fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
         hv_enter(cpu, b->code);
 
+        if (m->log >= 2 && cpu->pc == 0xfffffe001c894314ull && !m->halt_dumped) {
+            m->halt_dumped = 1;
+            hv_pc_hist_dump_file(cpu);
+        }
         if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) {
             pending_chain = (uint64_t *)cpu->last_stub;
             chain_pc = cpu->pc;
@@ -1156,7 +1936,7 @@ static int run_loop(HvCpu *cpu, int one) {
    ring is filled while m->log >= 2 — one store per block entry — and printed when the guest
    reports its own panic. */
 
-#define PC_HIST 64
+#define PC_HIST 4096
 static uint64_t pc_hist[HV_MAX_CPUS][PC_HIST];
 static uint32_t pc_hist_at[HV_MAX_CPUS];
 
@@ -1178,12 +1958,63 @@ uint64_t hv_pc_hist_last(int index) {
     return pc_hist[index][(at - 1) & (PC_HIST - 1)];
 }
 
+/* The guest reached the idle spin the restore never comes out of: the ring at this instant still
+   holds the path that got there, and a few million blocks later it does not. */
+void hv_pc_hist_dump_file(HvCpu *cpu) {
+    const char *wd = getenv("HV_BLOCK_DUMP");
+    if (!wd || !*wd || !cpu || cpu->index >= HV_MAX_CPUS) return;
+    char p[512];
+    snprintf(p, sizeof p, "%s", wd);
+    char *sl = strrchr(p, '/');
+    if (sl) snprintf(sl + 1, sizeof p - (size_t)(sl + 1 - p), "halt.txt");
+    FILE *f = fopen(p, "w");
+    if (!f) return;
+    uint32_t at = pc_hist_at[cpu->index];
+    fprintf(f, "halt pc %#llx el%u icount %llu\n", (unsigned long long) cpu->pc, cpu->el,
+            (unsigned long long) cpu->m->stats.blocks);
+    fprintf(f, "elr %#llx esr %#x far %#llx sp %#llx sp_el0 %#llx spsr %#llx daif %#llx\n",
+            (unsigned long long) cpu->elr_el1, cpu->esr_el1, (unsigned long long) cpu->far_el1,
+            (unsigned long long) cpu->sp, (unsigned long long) cpu->sp_el0,
+            (unsigned long long) cpu->spsr_el1, (unsigned long long) cpu->daif);
+    {
+        HvWalk w;
+        uint64_t far = cpu->far_el1;
+        memset(&w, 0, sizeof w);
+        hv_walk_dbg = f;
+        hv_mmu_walk(cpu, far, HV_ACC_WRITE, 1, &w);
+        hv_walk_dbg = NULL;
+        /* The neighbours: one read-only page in an otherwise writable region means the kernel was
+           mid-update; a whole read-only region means a region-wide protection hit the stack. */
+        for (int i = -4; i <= 4; i++) {
+            HvWalk n;
+            uint64_t va = (far & ~0x3fffull) + (uint64_t) i * 0x4000ull;
+            memset(&n, 0, sizeof n);
+            hv_mmu_walk(cpu, va, HV_ACC_WRITE, 1, &n);
+            fprintf(f, "near %#llx fsc %#x pa %#llx r%u w%u block %#llx\n",
+                    (unsigned long long) va, n.fsc, (unsigned long long) n.pa, n.r, n.w,
+                    (unsigned long long) n.block_size);
+        }
+        fprintf(f, "walk far %#llx: fsc %#x pa %#llx block %#llx r%u w%u x%u attr %#x pstate_extra %#llx (PAN %d)\n",
+                (unsigned long long) far, w.fsc, (unsigned long long) w.pa,
+                (unsigned long long) w.block_size, w.r, w.w, w.x, w.attr,
+                (unsigned long long) cpu->pstate_extra, (cpu->pstate_extra & HV_PSTATE_PAN) ? 1 : 0);
+    }
+    fprintf(f, "tpidr_el1 %#llx x18 %#llx x19 %#llx x20 %#llx x21 %#llx\n",
+            (unsigned long long) cpu->tpidr_el1, (unsigned long long) cpu->x[18],
+            (unsigned long long) cpu->x[19], (unsigned long long) cpu->x[20],
+            (unsigned long long) cpu->x[21]);
+    for (uint32_t n = 0; n < PC_HIST; n++)
+        fprintf(f, "%llx\n", (unsigned long long) pc_hist[cpu->index][(at + n) & (PC_HIST - 1)]);
+    fclose(f);
+}
+
 void hv_pc_hist_dump(HvCpu *cpu) {
     if (!cpu || cpu->index >= HV_MAX_CPUS) return;
     uint32_t at = pc_hist_at[cpu->index];
+    uint32_t show = PC_HIST > 64 ? 64 : PC_HIST;
     fprintf(stderr, "hengevm: last %d blocks entered on cpu %u, oldest first:\n",
-            PC_HIST, (unsigned) cpu->index);
-    for (uint32_t n = 0; n < PC_HIST; n++)
+            show, (unsigned) cpu->index);
+    for (uint32_t n = PC_HIST - show; n < PC_HIST; n++)
         fprintf(stderr, "  %llx\n", (unsigned long long) pc_hist[cpu->index][(at + n) & (PC_HIST - 1)]);
 }
 
@@ -1191,11 +2022,39 @@ void hv_pc_hist_dump(HvCpu *cpu) {
    block was reached. */
 void hv_trace_ring_dump(HvCpu *cpu) {
     if (!cpu) return;
-    fprintf(stderr, "hengevm: traced blocks on cpu %u (oldest first): va x0 x4\n",
+    /* Only the entries where a register changes value: the ring holds a few hundred blocks and
+       the interesting fact is which block first saw the guest's x16 turn into something that is
+       not a guest address. Printing only the changes keeps the burst short enough for logcat. */
+    fprintf(stderr, "hengevm: traced blocks on cpu %u (changes): va x16(slot) x16(host) x4(slot)\n",
             (unsigned) cpu->index);
-    for (uint32_t n = 0; n < 64; n++) {
-        const uint64_t *e = &cpu->trace_ring[((cpu->trace_idx + n) & 63) * 4];
-        fprintf(stderr, "  %llx %llx %llx\n", (unsigned long long) e[0],
-                (unsigned long long) e[1], (unsigned long long) e[2]);
+    uint64_t last = 0, last4 = 0;
+    uint32_t printed = 0;
+    for (uint32_t n = 0; n < 256 && printed < 40; n++) {
+        const uint64_t *e = &cpu->trace_ring[((cpu->trace_idx + n) & 255) * 4];
+        if (e[0] == 0) continue;
+        if (n + 8 < 256 && e[1] == last && e[2] == last4) continue;
+        last = e[1], last4 = e[2], printed++;
+        fprintf(stderr, "  %llx %llx %llx %llx\n", (unsigned long long) e[0],
+                (unsigned long long) e[1], (unsigned long long) e[2],
+                (unsigned long long) e[3]);
+    }
+}
+
+/* The last helper calls, oldest first: guest pc, op, and the registers of interest. */
+void hv_helper_hist_dump(HvCpu *cpu) {
+    if (!cpu) return;
+    fprintf(stderr, "hengevm: last helper calls on cpu %u (oldest first): pc op x0 x4 x16 x30\n",
+            (unsigned) cpu->index);
+    uint32_t at = cpu->helper_hist_idx;
+    for (uint32_t n = 48; n < 64; n++) {   /* the last 16 that were used */
+        uint32_t i = (at + n) & 63;
+        if (cpu->helper_hist[i].pc == 0 && cpu->helper_hist[i].op == 0) continue;
+        fprintf(stderr, "  %llx %llu %llx %llx %llx %llx\n",
+                (unsigned long long) cpu->helper_hist[i].pc,
+                (unsigned long long) cpu->helper_hist[i].op,
+                (unsigned long long) cpu->helper_hist[i].x0,
+                (unsigned long long) cpu->helper_hist[i].x4,
+                (unsigned long long) cpu->helper_hist[i].x16,
+                (unsigned long long) cpu->helper_hist[i].x30);
     }
 }
