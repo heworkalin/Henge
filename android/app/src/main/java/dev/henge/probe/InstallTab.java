@@ -332,7 +332,7 @@ final class InstallTab {
                 a.runOnUiThread(() -> showProgress(progress, bar, "出错: " + t));
             } finally {
                 stage[0] = "idle";
-                PIPELINE.set(false);
+                pipelineFinished();
             }
         }, "henge-pipeline").start();
 
@@ -461,6 +461,7 @@ final class InstallTab {
         });
         self[0] = follow;
         repaint[0] = follow;
+        SCREENS.add(follow);
         DownloadService.listen(follow);
         follow.run();
 
@@ -535,6 +536,24 @@ final class InstallTab {
     private static final java.util.concurrent.atomic.AtomicBoolean PIPELINE =
             new java.util.concurrent.atomic.AtomicBoolean(false);
     private static final AtomicBoolean CANCELLED = new AtomicBoolean(false);
+    /* Every screen that is on file can redraw itself from the shared state. When a pipeline ends
+       -- especially one started by a screen that is gone -- the screens have to be told, or the
+       one on screen keeps showing the last thing it painted ("正在停止…"). */
+    private static final java.util.concurrent.CopyOnWriteArrayList<Runnable> SCREENS =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    private static void pipelineFinished() {
+        PIPELINE.set(false);
+        lastText = null;
+        lastBar = -1;
+        lastAction = null;
+        for (Runnable r : SCREENS) {
+            try {
+                r.run();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 
     /* One place that sets the button, so its label survives a screen change too. */
     private static void setAction(android.widget.Button action, String label) {
