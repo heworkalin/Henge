@@ -317,8 +317,15 @@ final class InstallTab {
                     showProgress(progress, bar, "准备安装…");
                 });
                 int run = InstallService.start(a);
-                String outcome = install(a, dir, source, progress, cancelled);
-                InstallService.stop(a, run);
+                String outcome;
+                try {
+                    outcome = install(a, dir, source, progress, cancelled);
+                } finally {
+                    /* Whatever happened -- a failure, a cancel or an exception out of install() --
+                       the foreground service has to go, or its "installing…" card outlives the
+                       attempt and claims work that is not happening. */
+                    InstallService.stop(a, run);
+                }
                 if (stage[0].equals("install")) stage[0] = "idle";
                 final String o = outcome;
                 a.runOnUiThread(() -> setAction(action, "下载并安装"));
