@@ -719,3 +719,55 @@ call [this+0x5e0](this, 0)                 ; IOService::registerService        (
 反汇编 `AppleVirtIOUSBDeviceController::start`（`0x905b904`），找它**设置 `DRIVER`/写队列寄存器**
 的位置和前置条件；`prepareDefaults` 之后它应当建立 RX 队列并等 host 的 SETUP，
 现在既没有 queue 写入也没有 device config 读取，说明它在那之前就放弃了。
+
+## 22. 卡点锁定：`goOnBus()` 从未运行（2026-11-16 晚）
+
+### 22.1 `AppleVirtIOUSBDeviceController::start` 做了什么（手工解码 bl，objdump 对裸 binary 不可靠）
+
+```
+safeMetaCast                                 0x905b95c
+IOCommandPool::withWorkLoop                  0x905b9c0
+AppleVirtIOUSBResponseTransaction::transaction 0x905b9fc
+AppleVirtIOUSBCompletionQueue::completionQueue 0x905ba3c
+IOUSBDeviceController::readyForHost()        0x905badc   ← 告诉 USB 核心"可接受 host 请求"
+（之后是 stop() 的 cold 路径，都是 bounded_ptr 断言，不是正常错误）
+```
+
+### 22.2 真正协商的是 `goOnBus()`，而它从未执行
+
+`AppleVirtIOUSBDeviceController` 有两个：
+
+| 地址 | 符号 | 内容 |
+|---|---|---|
+| `0x905c0b0` | `goOnBus(bool)` | 上线开关（vtable 槽 281 / 偏移 `0x8d8`）；比较 `[this+0x1d0]` online 标志 |
+| `0x905c16c` | `goOnBus()` | **真正的 virtio 协商** |
+
+`goOnBus()` 的开头与成功结尾：
+
+```asm
+call [transport+0x900]() ; getStatus ; cmp w0,#2 ; b.hs <skip>
+call [transport+0x908](1)            ; updateStatus(1) = ACK      ; cbz w0 → 失败
+call [transport+0x908](2)            ; updateStatus(2) = DRIVER   ; cbz w0 → 失败
+...
+w1 = 4
+call [transport+0x908](4)            ; updateStatus(4)
+strb 1,[this+0x1d0]                  ; online = 1
+call [this+0x960]()
+w19 = 0                              ; 成功
+```
+
+**实测反证**：日志里 `status` 只出现过 `0x0`（reset）和一次 `0x1`（ACK）。
+若 `goOnBus()` 执行过，必然出现**第二次** `status=0x1`、`status=0x3`、`status=0x4/0x5`。
+**一个都没有** → `goOnBus()` 未执行。
+
+### 22.3 推论（下一步的依据）
+
+`start()` 成功返回后，设备控制器停在「等待上线（`goOnBus(true)`）」的等待态。
+`goOnBus(bool)` 是 vtable 槽 281，但在 `com.apple.iokit.IOUSBDeviceFamily` 的
+`__TEXT_EXEC` 里搜不到 `ldr/add #0x8d8` 的调用点，说明触发者在别处（或经基类槽位映射）。
+
+下一步两条：
+1. 在 `IOUSBHostFamily` / 其他 kext 里找槽 281 的调用者，确定"上线"由哪个事件触发
+2. 从 DT/IORegistry 侧检查 `port-virtual-1` 是否缺"设备已连接"相关的属性
+   （串口显示 `IOPortTransportStateUSB dataRole=Device`、`USB2@` registerService 成功，
+   port 层是通的，缺的是让 device controller 认为 host 已连上）
