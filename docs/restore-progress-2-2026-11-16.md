@@ -907,3 +907,45 @@ trace 里观察到的「port 先于 controller start」在上游顺序下同样�
 调用者必须持有一个该类型的对象；`AppleVirtualPlatform` 里三处 `add #0x8c8` 都不是它。
 下一步据此在其它 kext（IOPortFamily / IOUSBDeviceFamily / IOUSBHostFamily）里按
 「对象是 AppleVirtIOUSBDeviceController」这一类型线索定位调用点。
+
+## 27. trace 精确定位：`start` 到 `readyForHost` 就结束，之后全空
+
+用 trace 按块号展开 `AppleVirtIOUSBDeviceController::start`（block 193304 起）：
+
+```
+193304  0x905b904  AppleVirtIOUSBDeviceController::start
+193307  safeMetaCast
+193313  AppleVirtIOInput::start              (邻居设备的 start，说明在遍历)
+193324  0x9b904a4  IOUSBDeviceController::start   ← 子类把工作交给基类
+        ...（基类内部）...
+        readyForHost 的返回点 0x905bae0 出现
+```
+
+块区域内**完全为零**的符号（每个都实测 0 块）：
+
+| 符号 | 块数 |
+|---|---|
+| `startEp0In`（`0x905d3d0`） | 0 |
+| `startNonIsocEndpoint`（`0x905d57c`） | 0 |
+| `prepareConfiguration`（`0x905cf8c`） | 0 |
+| `handleUSBReset`（`0x905d77c`） | 0 |
+| `goOnBus()`（`0x905c16c`） | 0 |
+| `goOffBus()`（`0x905c624`） | 0 |
+
+而 `goOnBus(bool)` 在全库范围内**没有任何 `bl`/`b` 调用者**，唯一的 vtable 槽调用点是
+`IOUSBDeviceController::handleUSBSoftDisconnect` 的 block（传 `false` = 下线）。
+
+### 27.1 因此当前状态是
+
+内核的 vusb 驱动完成了「控制器对象构造 + `readyForHost`（内部 `createUSBDevice`）」，
+然后**停在那里等待一个外部事件**，该事件才会驱动：
+`startEp0In`（建 EP0 接收队列）→ `prepareConfiguration` → `handleUSBReset` → 协商推进到 DRIVER。
+
+在真实 Virtualization.framework 中，这个事件是 **VMM（host 侧）** 给出的「设备已连接到端口」。
+我们的设备模型从未发出它，所以整条链一个函数都没进。
+
+### 27.2 下一步（唯一剩下的方向）
+
+反汇编基类 `IOUSBDeviceController::start`（`0x9b904a4`），看它在 `readyForHost` 之后
+究竟等什么（事件/信号量/端口状态回调），以及哪个 `IOPort` 状态会触发它。
+那也直接告诉我们：设备模型要模拟什么才能让 guest 走下去。
