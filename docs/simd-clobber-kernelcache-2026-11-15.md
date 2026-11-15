@@ -271,9 +271,9 @@ seg blocks: kext 0   kernel ~330k-550k   other ~95k
 三者是同一件事：**没有设备驱动被启动，于是没有任何设备被访问，restored 于是永远等不到
 USB 通道。** restore 的 -2（`recovery_enter_restore` 超时）是这个的结果，不是原因。
 
-下一步（下次接着做）：在 `__PRELINK_TEXT` 起点 `0xfffffe001bb20000` 下 `HV_PCHK` 断点，
-用一次运行区分"内核根本没跳进 kext"（→ 查 `IOCatalogue` 匹配 / `OSKext::start` 的调用链）
-和"跳进去了但走飞"（→ 按 SIMD 那套办法逐条对拍指令语义）。
+下一步（下次接着做）：判"kext 到底有没有执行"用 `HV_TRACE_PC`（**不要**用 `HV_PCHK` 传
+链接地址 —— 见 13.3 的更正），统计 `__PRELINK_TEXT`（运行时 `0x1bb20000..0x1c210000`）
+的块数即可，无需断点。
 
 ## 十三、2026-11-15 深夜：kext **加载成功、但从未启动**（本轮唯一确凿的结论）
 
@@ -316,6 +316,23 @@ extern void iokit_post_constructor_init(void);
 	iokit_post_constructor_init();     /* 内核跳进 IOKit.kext 代码的唯一入口 */
 ```
 
+> **2026-11-16 更正（重要）：本节"零命中"的推理作废。**
+> `HV_PCHK` 比较的是 `(uint32_t)cpu->pc`，即 **运行时地址（含 slide `0x14b14000`）**；
+> 而当时传的是**链接地址**，差一个 slide，必然零命中。改用 `HV_TRACE_PC`（逐块记录
+> 真实执行）后实测：
+>
+> | 函数 | 链接 VA | 运行时 VA | trace 命中 |
+> |---|---|---|---|
+> | `InitIOKit` | `0x84eb0e0` | `0x1cfff0e0` | **31** |
+> | `StartIOKitMatching` | `0x84eb250` | `0x1cfff250` | **12** |
+> | `IOCatalogue::initialize` | `0x85430d0` | `0x1d0570d0` | **12** |
+> | `__PRELINK_TEXT`（kext 代码） | — | `0x1bb20000..` | **0** |
+>
+> 验证：`HV_PCHK=1cfff0e0:1cfff2e0`（运行时）命中 16 次。
+> 真实情形是：**IOKit 初始化与 `StartIOKitMatching` 都跑了，但没有任何 kext 被 start**
+> （`__PRELINK_TEXT` 仍为 0）——问题在"匹配后没有驱动被启动"，不在"没走到那一步"。
+> 参数与换算约定见项目 `AGENTS.md` 第 5.1 节。
+
 `iokit_post_constructor_init`（`iokit/Kernel/IOStartIOKit.cpp`）里依次是：
 
 ```c
@@ -343,10 +360,12 @@ IOCatalogue 建表 → 驱动 start → 设备出现 → restored 拿到 USB
 
 ### 13.4 下次的起点（一个动作）
 
-在 `lastkernelconstructor` / `iokit_post_constructor_init` 下 `HV_PCHK`：
+用 `HV_TRACE_PC` 统计 `StartIOKitMatching`（运行时 `0x1cfff250..0x1cfff390`）之后的走向：
 
-- **不命中** ⇒ 内核的构造函数链没走完（查 `__mod_init_func` 遍历顺序 / `bsd_init` 调用点）
-- **命中即返** ⇒ JIT 语义问题（和 SIMD 同类，用 `HV_BLOCK_DUMP` + `disasm-raw.sh` 逐条对拍）
+- **`StartIOKitMatching` 跑了、`__PRELINK_TEXT` 仍为 0** ⇒ 匹配完成但 0 个驱动被 start
+  （已实测确认，见 13.3 更正）→ 查 `startIOServiceMatching` 的第一项匹配（应当是
+  `IOResources` → `AppleARMPlatform`），以及 DT 节点是否进了 IORegistry
+- 若要寄存器快照，再在**运行时地址**上下 `HV_PCHK`（`(link_va + 0x14b14000) & 0xffffffff`）
 
 定位地址的办法（kernelcache 无 `LC_SYMTAB`）：用字符串反查 —— 例如
 `"KernelConfigTables syntax error"`（file offset `0xc0354`）的 `adrp/add` 引用点就是
