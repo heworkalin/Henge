@@ -1175,3 +1175,45 @@ host 的 GET_DESCRIPTOR 无处投递 -> "Waiting for device to enter restore mod
 
 若属 1/2，那我们缺的是让 port 正确识别 vusb 为其设备来源（DT/PCI 关联）；
 若属 3，则需要 restore 环境里对应的用户态组件。
+
+## 33. 根因方向确认：起点是 userland 客户端，而它从未被创建
+
+### 33.1 完整的触发链（每一环都有反汇编 + trace 支撑）
+
+| 槽 | 符号 | trace 块数 |
+|---|---|---|
+| — | `IOUSBDeviceInterfaceUserClient::start` / `initWithTask` / `setDescription` / `_setDescription` | **0 / 0 / 0 / 0** |
+| — | `IOUSBDeviceController::handleUSBCableConnect`（槽 308，对象 `+0x9a0`） | **0** |
+| — | `IOUSBDeviceController::handleUSBConnectionDone`（槽 301，对象 `+0x968`） | **0** |
+| — | `IOUSBDeviceConfigurator::start` | 1（`-restore` 下直接返回成功，跳过） |
+| — | `IOUSBDeviceController::createUSBDevice` | 7（NULL 描述，提前返回） |
+| — | `AppleVirtIOUSBDeviceController::handleUSBReset`（槽 300，对象 `+0x960`） | **0** |
+| — | `goOnBus()` / `goOnBus(bool)` | **0 / 0** |
+| — | `io()` / `ioGated()` / `startEp0In()` | **0 / 0 / 0** |
+
+调用关系（反汇编确认）：
+
+```
+IOUSBDeviceInterfaceUserClient::_setDescription  (0x9b89490)
+   → [controller+0x9a0] = handleUSBCableConnect
+IOUSBDeviceController::handleUSBCableConnect
+   → (connect 完成) → handleUSBConnectionDone
+IOUSBDeviceController::handleUSBConnectionDone   (0x9b99b3c)
+   → getProperty("DeviceDescription") → createUSBDevice
+AppleVirtIOUSBDeviceController::goOnBus()        (0x905c16c)
+   → 末尾 call [this+0x960] = handleUSBReset
+   → handleUSBReset+0x84 → [this+0x968] = handleUSBConnectionDone
+```
+
+### 33.2 由此确定的事实
+
+- `DeviceDescription` **不是**设备树属性（DT 里不存在该字符串）
+- 它也**不是** virtio device config（控制器根本没有访问 BAR4+0x2000 的指令）
+- 它是 **userland 通过 `IOUSBDeviceInterfaceUserClient` 的 external method 提交的**
+- 而该 user client 在我们的 guest 里**从未被创建**（start/initWithTask 都是 0 块）
+
+### 33.3 因此
+
+上游能跑通，说明它的 restore 环境里有进程创建该 user client；
+我们的环境里没有。后续应查：restore kernel 里哪个 daemon/服务负责这件事，
+以及它为什么没启动（launchd 服务缺失、依赖设备未就绪、或我们模拟的某个设备缺失）。
