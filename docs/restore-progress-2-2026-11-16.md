@@ -949,3 +949,50 @@ trace 里观察到的「port 先于 controller start」在上游顺序下同样�
 反汇编基类 `IOUSBDeviceController::start`（`0x9b904a4`），看它在 `readyForHost` 之后
 究竟等什么（事件/信号量/端口状态回调），以及哪个 `IOPort` 状态会触发它。
 那也直接告诉我们：设备模型要模拟什么才能让 guest 走下去。
+
+## 28. 主路径定位：`io()` → `ioGated()` → `startEp0In()`，而 `io()` 从未被调用
+
+### 28.1 `IOUSBDeviceController::start` 里没有状态机入口
+
+手工解码基类 `start`（`0x9b904a4`，size `0xc7c`）的 bl：
+
+```
+prepareDefaults                          0x9b905d8
+OSSerializer::forTarget                  0x9b905f8
+IOCommandGate::commandGate               0x9b90850
+IOMapper::copyMapperForDevice            0x9b908cc
+IOCommandPool::withWorkLoop              0x9b90ba8
+thread_call_allocate_with_options        0x9b90bd4   ← 回调 = 0x9ba1d6c（remote wake/内部）
+IOTimerEventSource::timerEventSource     0x9b90d1c
+registerPrioritySleepWakeInterest        0x9b910e0
+```
+
+那个 thread_call 的回调（`0x9ba1d6c`，位于 `setupDeviceSetSELDataCompletion` 与
+`handleSetConfiguration` 之间的无符号函数）只会被 `tryRemoteWakeEx` / `forceControllerReinit`
+调用 → **它是 remote wake，不是启动状态机**。
+
+### 28.2 真正的主路径
+
+| 调用者 | 被调 |
+|---|---|
+| `IOUSBDeviceController::io(...)`（两个重载，`0x9b936cc` / `0x9b93cb0`） | `[this+0xa60]` = vtable 槽 332 = **`AppleVirtIOUSBDeviceController::ioGated(_IOUSBDeviceIORequestTag*)`** |
+| `ioGated`（`0x905d2c4`） | `startEp0In`（`0x905d388`）、`startNonIsocEndpoint`（`0x905d3b4`） |
+| `handleRequest` | `startNonIsocEndpoint`（`0x905df48`） |
+
+`ioGated` 在整个 kernelcache 里**没有任何 `bl` 调用者**，只有 vtable 槽引用
+（`__DATA_CONST 0x7a40808`）→ 它只经由 `IOUSBDeviceController::io()` 的虚调用进入。
+
+### 28.3 结论
+
+guest 的 vusb 驱动在 `readyForHost` 之后**等待上层提交第一个 IO 请求**；
+该请求一旦到达就会走 `io()` → `ioGated()` → `startEp0In()`，建立 EP0 接收队列，
+之后 host 的 SETUP 才有落点。
+
+实测：`io()` / `ioGated` / `startEp0In` **全部 0 块**，所以队列从未建立 ——
+这与「status 停在 ACKNOWLEDGE」是同一件事的两个侧面。
+
+### 28.4 下一步
+
+定位 `IOUSBDeviceController::io()` 的调用方（USB device 侧的上层驱动，通常是
+`AppleUSBDevice`/`IOUSBDevice` 系列），确定它在什么条件下提交第一个 EP0 请求 ——
+这也是设备模型需要促成的事件。
