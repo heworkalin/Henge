@@ -671,3 +671,51 @@ common config 里 `0x12` 是 `num_queues`、`0x14` 才是 `device_status`。
   停在哪一层调用（是 `start` 里等事件，还是 `performDeviceInitialization` 里）
 - 同时确认 `common_write` 是否需要接受 `0x12` 偏移（Apple 的 legacy 布局语义），
   但当前证据只显示 guest 访问 `0x14`，**暂不改语义**
+
+## 21. 断点打在 MMIO 上：拿到真实调用链（2026-11-16 晚）
+
+### 21.1 方法（这次是对的工具）
+
+`cpu->pc` 是 **JIT 块起始**，用它查符号一定错。但 **MMIO 回调运行在 guest 停在该访问上的那一刻**，
+所以 `x0..x7`、`sp`、`lr`、`el` 都是 guest 的真实值。在 `devices/virtio.c` 里加了
+`vusb_state_dump()`：打印寄存器 + 用 `hv_mmu_walk` 走 guest 页表扫栈，挑出指向内核代码
+（`0xfffffe..` 且半字对齐）的字。
+
+### 21.2 由此确定的 slide 与调用链
+
+`0x1db396ac − 0x90256ac = 0x14b14000`，且 4 个独立地址全部解析成合理符号：
+
+| guest 地址 | link | 符号 |
+|---|---|---|
+| `0x1db396ac` | `0x90256ac` | `AppleVirtIOPCITransport::updateStatus(uint8)+0x2c` |
+| `0x1db37934` | `0x9023934` | `AppleVirtIOPCITransport::start(IOService*)+0x67c` ← 调用者 |
+| `0x1db397c4` | `0x90257c4` | `AppleVirtIOPCITransport::reset()+0x1c` |
+| `0x1d0218d4` | `0x850d8d4` | `IOService::startCandidate(IOService*)+0x214` |
+| `0x1d020ed4` | `0x850ced4` | `IOService::probeCandidates(OSOrderedSet*)+0x1e6c` |
+
+### 21.3 `AppleVirtIOPCITransport::start` 在 ACK 之后做什么（确定）
+
+```asm
+reset()                                    ; status = 0
+updateStatus(1)                            ; ACKNOWLEDGE    ← 日志里的 status = 0x1
+bl 0x8475f64 (w0=2)                        ; 一个短延时
+updateStatus(1)                            ; 再确认
+call [this+0x378](this, provider, plane)   ; IORegistryEntry::attachToParent   (槽 111)
+call [this+0x5e0](this, 0)                 ; IOService::registerService        (槽 188)
+```
+
+**结论：`start()` 自身是成功的**，ACK 只是它的正常一步。`DRIVER(0x2)` 与队列由**下一个驱动**
+`AppleVirtIOUSBDeviceController::start`（`0x905b904`）负责，而它在 `prepareDefaults` 之后就没动静了。
+
+### 21.4 已排除项（本轮）
+
+- 我们伪造的 INTx：`HV_VUSB_INTX=1`（完全不拉线）与拉线两种情况下，vusb 的全部活动
+  （5 条记录：`status=0`、`read +0x14`×2、`status=0x1`、`read +0x14`）**逐条一致**，
+  唯一差别是 `isr read` 从 1 次变 0 次 → **中断不是卡点**
+- `performDeviceInitialization`：ACK 根本不是它发的（见上），之前那条推断链作废
+
+### 21.5 下一步
+
+反汇编 `AppleVirtIOUSBDeviceController::start`（`0x905b904`），找它**设置 `DRIVER`/写队列寄存器**
+的位置和前置条件；`prepareDefaults` 之后它应当建立 RX 队列并等 host 的 SETUP，
+现在既没有 queue 写入也没有 device config 读取，说明它在那之前就放弃了。
