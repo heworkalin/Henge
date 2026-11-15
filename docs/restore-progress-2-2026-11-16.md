@@ -1217,3 +1217,68 @@ AppleVirtIOUSBDeviceController::goOnBus()        (0x905c16c)
 上游能跑通，说明它的 restore 环境里有进程创建该 user client；
 我们的环境里没有。后续应查：restore kernel 里哪个 daemon/服务负责这件事，
 以及它为什么没启动（launchd 服务缺失、依赖设备未就绪、或我们模拟的某个设备缺失）。
+
+## 34. 找到负责创建 USB 设备描述的组件：`/usr/local/bin/restored_external`
+
+### 34.1 从哪里找到的
+
+从 IPSW 的 restore ramdisk（`043-18242-098.dmg`，APFS，1827 个文件，7z 可直接解）里：
+
+```
+System/Library/AppleUSBDevice/USBDeviceConfiguration.plist      (bplist, 29 个配置)
+System/Library/LaunchDaemons/com.apple.restored_external.plist   (RunAtLoad=true,
+                                                                  StandardOutPath=/dev/console)
+usr/local/bin/restored_external                                 (2.7 MB)
+```
+
+`USBDeviceConfiguration.plist` 里的 `standardRestore` 配置：
+
+```
+Description: "Apple Mobile Device"
+Interfaces:  [AppleUSBMux, AppleUSBNCMControlAux, AppleUSBNCMDataAux]
+DefaultConfiguration: true
+```
+
+### 34.2 `restored_external` 的关键符号与字符串
+
+```
+standardRestore                            ← plist 里的配置名
+_IOUSBDeviceControllerCreate
+_IOUSBDeviceControllerCreateWithService
+_IOUSBDeviceControllerSetDescription       ← 设置 DeviceDescription 的 API
+_IOUSBDeviceControllerForceOffBus
+_IOUSBDeviceControllerSendCommand
+IOUSBDeviceControllerCreate failed: 0x%x   ← 失败会打印错误码
+IOUSBDeviceControllerSendCommand failed: 0x%x
+com.apple.ramrod.IOUSBDeviceController.queue
+```
+
+其动态库依赖 39 个，逐一对齐 ramdisk 内文件：**0 缺失**。
+
+### 34.3 因此完整链路（最终版）
+
+```
+launchd (RunAtLoad)
+  └─> /usr/local/bin/restored_external
+        ├─ 读 USBDeviceConfiguration.plist 的 standardRestore
+        └─> _IOUSBDeviceControllerCreate / SetDescription
+              └─> IOUSBDeviceInterfaceUserClient (user client)     ← trace: 0 块
+                    └─> [controller+0x9a0] handleUSBCableConnect    ← 0 块
+                          └─> handleUSBConnectionDone               ← 0 块
+                                └─> getProperty("DeviceDescription")
+                                      └─> createUSBDevice → bit30 → io() → ioGated → startEp0In
+                                            └─> EP0 队列 → status DRIVER_OK
+                                                  └─> host 才能发 GET_DESCRIPTOR
+```
+
+### 34.4 当前缺口
+
+- guest 进程扫描：`launchd=3 restored=3 mobile_restore=1`（`restored_external` 与 `restored`
+  子串无法区分）
+- 串口里**没有** `restored_external` 的任何输出（它的 stdout 是 `/dev/console`，
+  若有 `IOUSBDeviceControllerCreate failed: 0x...` 应能看到）
+- `IOUSBDeviceInterfaceUserClient` 的 `start` / `initWithTask` / `_setDescription` 全是 0 块
+
+**结论：`restored_external` 没有成功走到 `_IOUSBDeviceControllerSetDescription`。**
+下一步查它是否被 launchd 启动、以及 `IOUSBDeviceControllerCreate` 的返回值
+（`IOUSBDeviceControllerCreate failed: 0x%x` 会打到 console）。
