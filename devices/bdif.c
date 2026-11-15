@@ -89,7 +89,7 @@ static void usb_deliver(HvBdif *b) {
        transfers, and writing every one of them through the stderr pipe measurably changes the
        CPU thread's timing (two runs that logged them all died in the host before restore; the run
        without the log did not). */
-    if (b->m->log >= 2 && (b->usb_req_n % 32) == 0)
+    if (b->m->log >= 3 && (b->usb_req_n % 32) == 0)
         fprintf(stderr, "bdif usb: req #%u ep %#x type %u len %u\n", b->usb_req_n,
                 (unsigned)m.ep, (unsigned)m.type, (unsigned)m.len);
     b->usb_req_n++;

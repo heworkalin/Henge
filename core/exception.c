@@ -85,7 +85,7 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                         (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
                         (unsigned long long) cpu->x[2], (unsigned long long) cpu->x[3], path);
     }
-    if (cpu->m->log >= 2 && (type != HV_EXC_SYNC || (esr >> 26) != 0x15) &&
+    if (cpu->m->log >= 3 && (type != HV_EXC_SYNC || (esr >> 26) != 0x15) &&
         cpu->m->stats.exceptions + cpu->m->stats.interrupts < 4096)
         fprintf(stderr, "hengevm: take %s esr %08x far %llx at pc %llx el%u vector %llx\n",
                 type == HV_EXC_SYNC ? "sync" : type == HV_EXC_IRQ ? "irq" : "fiq",
@@ -290,7 +290,10 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                  * report is not the faulting state, which is why it disagreed with the code that
                  * built the address.
                  */
-                if (cpu->m->log >= 2) {
+                /* Ring trace + helper histogram + the executed path. On a userland fault the
+                   "path from block ... to fault" line alone is up to a megabyte, and there are
+                   many such faults, so this is debug-only (HV_LOG=3). */
+                if (cpu->m->log >= 3) {
                     hv_trace_ring_dump(cpu);
                     hv_helper_hist_dump(cpu);
                     /*
@@ -393,18 +396,22 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                  */
                 uint64_t from = hv_pc_hist_last(cpu->index);
                 if (!from || from > ret) from = ret - 32 * 4;
-                fprintf(stderr, "hengevm: path from block %llx to fault %llx:",
-                        (unsigned long long) from, (unsigned long long) ret);
-                for (uint64_t at = from; at <= ret; at += 4) {
-                    HvWalk ww;
-                    uint32_t word = 0;
-                    hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &ww);
-                    if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 4) == 0)
-                        fprintf(stderr, " %08x", word);
-                    else
-                        fprintf(stderr, " ????????");
+                /* The executed path can be thousands of words -- a single line of up to a
+                   megabyte per fault, and userland faults are frequent. Debug-only. */
+                if (cpu->m->log >= 3) {
+                    fprintf(stderr, "hengevm: path from block %llx to fault %llx:",
+                            (unsigned long long) from, (unsigned long long) ret);
+                    for (uint64_t at = from; at <= ret; at += 4) {
+                        HvWalk ww;
+                        uint32_t word = 0;
+                        hv_mmu_walk(cpu, at, HV_ACC_READ, 1, &ww);
+                        if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 4) == 0)
+                            fprintf(stderr, " %08x", word);
+                        else
+                            fprintf(stderr, " ????????");
+                    }
+                    fprintf(stderr, "\n");
                 }
-                fprintf(stderr, "\n");
                 /*
                  * The words the guest was reading from. A host address inside guest-visible
                  * memory is the answer to "who put it there": it cannot come from the guest.
@@ -463,7 +470,9 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
         /* A data abort taken by kernel code is where the guest's own bookkeeping has already
            gone wrong, so the registers are the only remaining evidence of how. Four of them
            are enough to see the pattern; the rest are the same fault over and over. */
-        if (type == HV_EXC_SYNC && ((esr >> 26) & 0x3f) == 0x25 && cpu->m->log >= 2) {
+        /* The full data-abort dump (registers, zone, executed path, page tables) is a debug
+           aid, not something a normal log level should pay for. */
+        if (type == HV_EXC_SYNC && ((esr >> 26) & 0x3f) == 0x25 && cpu->m->log >= 3) {
             static int el1_dabt;
             if (el1_dabt < 4) {
                 el1_dabt++;
@@ -584,8 +593,12 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                         (unsigned long long) cpu->sp, (unsigned long long) far);
             }
         }
-        fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u%s\n", type, esr,
-                (unsigned long long)far, (unsigned long long)ret, cpu->el, extra);
+        /* Every exception (interrupt or syscall) lands here, so this is by far the highest
+           volume line in the log -- 77k lines on a single restore run. Keep it for HV_LOG=3. */
+        if (cpu->m->log >= 3) {
+            fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u%s\n", type, esr,
+                    (unsigned long long)far, (unsigned long long)ret, cpu->el, extra);
+        }
     }
     uint64_t offset = cpu->el == 0 ? 0x400 : cpu->spsel ? 0x200 : 0x000;
     cpu->spsr_el1 = spsr;

@@ -655,12 +655,14 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     const uint64_t x16_before = cpu->x[16], x4_before = cpu->x[4];
     /* The first helpers of a boot: what the save point saw, before any C code ran. A register
        already wrong here was written by the block or by the thunk, not by the helper. */
-    if (cpu->m->log >= 2 && cpu->icount < 40)
+    if (cpu->m->log >= 3 && cpu->icount < 40)
         fprintf(stderr, "hengevm: helper in: pc %llx op %llu insn %08x x16 %llx x4 %llx\n",
                 (unsigned long long) info_in->pc, (unsigned long long) (info_in->op & 0xff),
                 info_in->insn, (unsigned long long) x16_before, (unsigned long long) x4_before);
     uint32_t r = helper(cpu, info_in);
-    if (cpu->m->log >= 2) {
+    /* Per-helper register deltas are the highest-volume debug output in the engine; keep them
+       for HV_LOG=3 so the default log stays readable. */
+    if (cpu->m->log >= 3) {
         if (cpu->x[16] != x16_before && cpu->x[16] > 0x100000000ull)
             fprintf(stderr, "hengevm: helper x16: pc %llx op %llu insn %08x %llx -> %llx\n",
                     (unsigned long long) info_in->pc, (unsigned long long) (info_in->op & 0xff),
@@ -1797,7 +1799,7 @@ static int run_loop(HvCpu *cpu, int one) {
             }
             if (e && !hv_looks_host(e[2])) {
                 static uint64_t last_report;
-                if (last_report != prev_pc) {
+                if (cpu->m->log >= 3 && last_report != prev_pc) {
                     last_report = prev_pc;
                     fprintf(stderr, "hengevm: block %llx left x16 %llx but entered with %llx (%s)\n",
                             (unsigned long long) prev_pc, (unsigned long long) cpu->x[16],
@@ -2291,8 +2293,10 @@ static int run_loop(HvCpu *cpu, int one) {
                        formatted into this stack and the console is not up yet, so the bytes are
                        dumped raw -- a filter for long printable runs finds nothing when the frame
                        in between is not text. */
+                    /* Reading the guest stack is a heavyweight debug probe; require the explicit
+                       switch instead of doing it on every run at the default log level. */
                     if (cpu->el == 1 && cpu->sp > 0xfffffe0010000000ull &&
-                        (getenv("HV_STACKSCAN") || (cpu->m->log >= 2 && stack_scans < 2))) {
+                        (getenv("HV_STACKSCAN") || (cpu->m->log >= 3 && stack_scans < 2))) {
                         stack_scans++;
                         uint64_t from = (cpu->sp - 0x800) & ~0xfull, to = from + 0x3000;
                         fprintf(stderr, "hengevm: stack dump %d: pc %llx sp %llx, %#llx..%#llx\n",

@@ -1091,7 +1091,7 @@ int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                A store that lands on the slot the halt comes from, or one that should have and did
                not, is the answer to why it later reads a non-pointer. */
             static uint32_t traced;
-            if (cpu->m->log >= 2 && pc >= 0xfffffe0000000000ull && traced < 800) {
+            if (cpu->m->log >= 3 && pc >= 0xfffffe0000000000ull && traced < 800) {
                 uint64_t v0 = 0, v1 = 0;
                 memcpy(&v0, buf, op.bytes >= 8 ? 8 : op.bytes);
                 if (pair) memcpy(&v1, buf + esize, op.bytes > esize ? (op.bytes - esize) : 0);
