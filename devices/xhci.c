@@ -179,6 +179,13 @@ static void load_segment(HvXhci *x, struct HvXhciIntr *it) {
 static void event_to(HvXhci *x, int target, uint64_t param, uint32_t status, uint32_t control) {
     struct HvXhciIntr *it = &x->intr[target < HV_XHCI_INTRS ? target : 0];
     if (!it->erstsz || !it->seg_size) return;
+    /* The controller writes at the software's dequeue pointer. Keep the index in step with
+       ERDP: once the driver consumes an event it advances ERDP, and an index that only ever
+       increments would then write into a slot already consumed, where the cycle bit no longer
+       matches and the event is invisible ("command did not generate an event"). */
+    if (it->erdp >= it->seg_base && it->erdp < it->seg_base + 16ull * it->seg_size) {
+        it->index = (uint32_t)((it->erdp - it->seg_base) / 16);
+    }
     uint32_t trb[4] = {(uint32_t)param, (uint32_t)(param >> 32), status, (control & ~1u) | (uint32_t)it->pcs};
     wr(x, it->seg_base + 16ull * it->index, trb, 16);
     if (++it->index == it->seg_size) { /* next segment, or wrap and flip the cycle */
@@ -723,12 +730,14 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
     if ((v & PORT_LWS) && (s & PORT_CCS)) {
         uint32_t pls = (v >> PORT_PLS_SHIFT) & 0xf;
         s = (s & ~(0xfu << PORT_PLS_SHIFT)) | pls << PORT_PLS_SHIFT;
-        if (pls == 0 || pls == 15) { /* U0 or resume: report the link change */
-            s = (s & ~(0xfu << PORT_PLS_SHIFT)) | PORT_PLC;
-            x->portsc[p] = s;
-            port_event(x, p);
-            return;
-        }
+        /* Any link-state change requested through LWS raises PLC, not just U0/resume. The
+           driver asks for U3 (suspend) during power gating and then waits for the port to
+           report the change; only U0/15 used to raise it, so forcePowerGated() timed out
+           after 1001 ms and the port was torn down ("port is powering off" in the log). */
+        s |= PORT_PLC;
+        x->portsc[p] = s;
+        port_event(x, p);
+        return;
     }
     s = (s & ~PORT_PP) | (v & PORT_PP);
     x->portsc[p] = s;
