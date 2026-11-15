@@ -312,3 +312,61 @@ cbz  w0, <失败路径>          ; 返回 0 就整体失败
 - curl 8.23.0：`--host=aarch64-linux-android26 … --with-openssl=work/andcli/ossl`（`LIBS=-ldl`）
 
 产出 `work/andcli/{ossl,curl}/lib/*.a`，`tools/build-install-android.sh` 依赖它们。
+
+## 14. 根因链闭合：PCI 缺 MSI capability → 中断源建不起来 → ACKNOWLEDGE 后中止
+
+### 14.1 符号解析（把 `bl` 的 imm26 算准，objdump 对裸二进制显示的目标不可靠）
+
+`AppleVirtIOPCITransport::start` 里的两个分配：
+
+```
+mov w0,#2 ; bl 0xfffffe0008475f64   →  OSArray::withCapacity(unsigned)   → [x19+0xd8]
+            bl 0xfffffe000855290c   →  IOWorkLoop::workLoop()             → [x19+0xc8]
+```
+
+所以 `[+0xd8]` 是一个**容量 2 的 OSArray**（两个队列的中断源），不是 DMA 对象。
+
+### 14.2 两个 gate
+
+`AppleVirtIOPCITransport::setInterruptsEnabled(bool)`（`0x9024e90`）：
+对那个 OSArray 调虚方法，返回 0 就整体失败（`cbz w0, <失败块>`），中途还有
+`OSMetaClassBase::safeMetaCast`（类型检查）。
+
+`AppleVirtIOPCITransport::assignInterruptAction(...)`（`0x90240f4`）：
+
+```asm
+bl   [x0+0xa88]        ; findNextMSIInterruptIndex()  —— 这就是 gate
+tbz  w0, #0, <失败>     ; 失败直接返回，中断源**不加入** OSArray
+bl   ...               ; IOInterruptEventSource 创建
+[x19+0xd8](OSArray) +0x1e8   ; 把中断源 add 进数组
+```
+
+### 14.3 为什么 `findNextMSIInterruptIndex` 会失败
+
+IOPCIFamily 的符号说明了它依赖什么：
+
+```
+IOPCIBridge::resolveMSIInterrupts(IOService*, IOPCIDevice*, uint, uint)
+IOPCIMessagedInterruptController::getDeviceMSILimit(IOPCIDevice*, uint)   ← 读 MSI cap 的 MMC
+IOPCIMessagedInterruptController::initDevice / enableDeviceMSI
+```
+
+**我们的 virtio PCI capability 链里没有 MSI capability（0x05）** → `getDeviceMSILimit` 得 0 →
+`resolveMSIInterrupts` 分配不到向量 → `findNextMSIInterruptIndex` 返回 false →
+`assignInterruptAction` 不把中断源放进 OSArray → `setInterruptsEnabled` 失败 →
+`performDeviceInitialization` 在写完 `ACKNOWLEDGE` 之后中止 → `status=0` 重来。
+
+于是 guest 永远不 enable 请求队列，host 的 `GET_DESCRIPTOR` 无人响应，restore-mode 设备
+不出现 —— 这就是 `"Waiting for device to enter restore mode"` 五秒到五分钟超时的源头。
+
+`virtio-input`（`1af4:1052`）不受影响，因为 `usesMultipleInterruptVectors()` 对标准 virtio
+vendor 返回 true，走另一条分支，不吃这个 gate。
+
+### 14.4 修复方向
+
+给 PCI 设备加 MSI capability（`0x05`，Message Control 的 MMC ≥ 1 → 至少 2 个向量），
+并处理 guest 对 Message Control / Address / Data 的写入；中断注入改为「按 guest 配置的
+MSI 地址写数据」，落点是 `VMAPPLE_GIC_MSI`（`0x1fff0000`）那个 gic-msi 帧 ——
+`hv_mmio_lookup()` + 该区间的 write 回调即可，不需要绕过 MMIO。
+
+只对 `106b:1a01` 打开（`virtio-input` 现在的路径是通的，不要动它）。
