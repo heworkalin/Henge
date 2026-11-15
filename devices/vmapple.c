@@ -432,6 +432,15 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->cfg = hv_cfg_create(m, VMAPPLE_CONFIG, &p);
     b->pcie = hv_pcie_create(m, b->gic, VMAPPLE_PCIE_ECAM, 0x10000000, VMAPPLE_PCIE_MMIO, 0x1fff0000,
                              32 + VMAPPLE_IRQ_PCIE);
+    /* Installer boots (the ROM goes to DFU) get the USB device port, as VZ gives it. Created
+       before the block devices so it takes a low PCI slot: its driver uses INTx
+       (interrupt-base + slot), and slot order is the only thing that differs between it and the
+       virtio devices that do come up. HV_VUSB_LATE=1 restores the old (last) placement. */
+    int vusb_late = getenv("HV_VUSB_LATE") != NULL;
+    if (!vusb_late && (cfg->run_installer1 || cfg->run_installer2)) {
+        b->vusb = hv_virtio_usb_create(m, b->pcie);
+        b->bdif->usb = b->vusb;
+    }
     /* Same order as QEMU's documented command line: aux, root, then the NIC. */
     if (aux) b->aux_blk = hv_virtio_blk_create(m, b->pcie, aux, HV_VBLK_AUX);
     if (root) b->root_blk = hv_virtio_blk_create(m, b->pcie, root, HV_VBLK_ROOT);
@@ -448,8 +457,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
         b->balloon = hv_virtio_balloon_create(m, b->pcie, b->ram, VMAPPLE_MEM, ram_size, b->ram_fd);
         hv_virtio_balloon_set_target(b->balloon, (uint64_t)atoll(getenv("HV_BALLOON")) << 20);
     }
-    /* Installer boots (the ROM goes to DFU) get the USB device port, as VZ gives it. */
-    if (cfg->run_installer1 || cfg->run_installer2) {
+    if (vusb_late && (cfg->run_installer1 || cfg->run_installer2)) {
         b->vusb = hv_virtio_usb_create(m, b->pcie);
         b->bdif->usb = b->vusb;
     }

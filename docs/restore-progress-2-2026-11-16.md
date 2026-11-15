@@ -264,3 +264,51 @@ virtio 初始化在父类（transport）里 —— 也就是 ACKNOWLEDGE 由 tra
   （`tools/build-install-android.sh` 依赖它们）；宿主构建不需要
 - `work/AVPBooter.vmapple2.bin` 已从设备 `/data/local/tmp/henge/` 取回
 - `work/ca-bundle.pem` 由系统证书重建（`/etc/ssl/certs/ca-certificates.crt`）
+
+## 12. ACKNOWLEDGE 之后失败点的追查（两个假设已被实验否掉）
+
+### 12.1 Apple vendor-specific PCI capability —— 否掉
+
+反汇编 `AppleVirtIOTransport::getFirstAppleVendorDataCapability`（`0xfffffe0009038eb4`）：
+它遍历 PCI 的 vendor-specific capability，找 **vendor == 0x106b** 的那个，找不到返回 NULL。
+我们的 virtio cap 链里没有这种 cap（`add_cap` 写的是 virtio 布局，bytes 2..3 是 len/type）。
+
+实验：只对 vusb 在链尾加一个标准 vendor cap（`09 00 6b 10 …`），宿主重跑 ——
+**vusb 仍然停在 `status=0x1`**，行为完全不变。该假设否掉（改动保留，可用
+`HV_NO_APPLE_CAP=1` 关闭）。
+
+### 12.2 PCI slot / INTx 线号 —— 否掉
+
+`hv_pci_set_intx` 用 `line = slot`，`update_line` 再接到 `intx_base + line`；DT 里
+`pcie/interrupt-base = 0x40`（64），`VMAPPLE_IRQ_PCIE = 0x20`（32）→ base=64，slot 7 → 线 71，
+在 GIC 范围内。而创建顺序让 vusb 落在 **slot 7**，xhci 落在 slot 3（工作）。
+
+实验：把 vusb 提前创建（slot 1，`HV_VUSB_LATE=1` 可恢复原顺序），宿主重跑 ——
+**仍是 `status=0x1`**。slot 假设否掉。
+
+### 12.3 目前唯一还站着的定位
+
+`AppleVirtIOPCITransport::setInterruptsEnabled(bool)`（`0xfffffe0009024e90`）：
+
+```asm
+strb w1, [x0, #0xe0]        ; 记录期望状态
+ldr  x0, [x0, #0xd8]        ; 依赖 start 里分配的对象
+... 调用其 +0x150 的方法 ...
+cbz  w0, <失败路径>          ; 返回 0 就整体失败
+```
+
+`start` 里 `mov w0, #2; bl …; str x0, [x19, #0xd8]` 说明 `[+0xd8]` 是某一类 OSObject
+（DMA 命令 / 队列一类）。virtio-input 走同一段代码却成功，说明该路径本身可用；差别只剩
+「这个对象对 106b:1a01 的这个 transport 实例做了什么」。
+
+再往下需要 guest 侧的证据（IOLog 在该失败路径上是静默的），可行手段：
+`HV_PCHK` 在 `setInterruptsEnabled` 入口与 `cbz` 后的失败块打点，看是哪一次调用把 w0 变成 0。
+
+## 13. 环境：work/andcli 已用脚本重建（后台）
+
+`tools/build-andcli-deps.sh`：按会话里验证过的参数重编
+
+- OpenSSL 3.0.15：`./Configure android-arm64 -D__ANDROID_API__=26 no-shared no-tests --prefix=work/andcli/ossl`
+- curl 8.23.0：`--host=aarch64-linux-android26 … --with-openssl=work/andcli/ossl`（`LIBS=-ldl`）
+
+产出 `work/andcli/{ossl,curl}/lib/*.a`，`tools/build-install-android.sh` 依赖它们。

@@ -194,7 +194,22 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
     add_cap(v, 0x40, 0x50, 1, COMMON, 0x38);
     add_cap(v, 0x50, 0x60, 3, ISR, 1);
     add_cap(v, 0x60, 0x70, 4, DEVICE, 0x100);
-    add_cap(v, 0x70, 0x00, 2, NOTIFY, NOTIFY_MULT * HV_VIRTQ_MAX);
+    /* HengeVM experiment: Apple's transport looks for a vendor-specific capability whose
+       vendor id is 0x106b (getFirstAppleVendorDataCapability) -- the virtio caps above are the
+       virtio layout, where bytes 2..3 are len/type, so that search finds nothing. Only the USB
+       device port pretends to be an Apple device (106b:1a01) and only its driver makes that
+       search, so the extra capability is added for it alone (HV_NO_APPLE_CAP=1 reverts). */
+    int apple_cap = v->pci.config[0] == 0x6b && v->pci.config[1] == 0x10 &&
+                    v->pci.config[2] == 0x01 && v->pci.config[3] == 0x1a;
+    add_cap(v, 0x70, apple_cap && !getenv("HV_NO_APPLE_CAP") ? 0x80 : 0x00, 2, NOTIFY, NOTIFY_MULT * HV_VIRTQ_MAX);
+    if (apple_cap && !getenv("HV_NO_APPLE_CAP")) {
+        uint8_t *c = v->pci.config + 0x80;
+        memset(c, 0, 16);
+        c[0] = 0x09;                 /* PCI vendor-specific capability */
+        c[1] = 0x00;                 /* end of list */
+        c[2] = 0x6b, c[3] = 0x10;    /* vendor id 0x106b (Apple) */
+        c[4] = 0x10;                 /* capability length */
+    }
     reset(v);
 }
 
