@@ -77,6 +77,15 @@ static uint64_t ecam_read(void *opaque, uint64_t off, unsigned size) {
     memcpy(&v, d->config + reg, size > 4096 - reg ? 4096 - reg : size);
     if (getenv("HV_PCI_LOG") && slot == (uint32_t)atoi(getenv("HV_PCI_LOG"))) /* debugging: one slot's config space */
         fprintf(stderr, "pci %u: read %03x (%u) = %llx\n", slot, reg, size, (unsigned long long)v);
+    /* Debug: does the guest ever look at the virtual USB controller's INTx pin/line
+       or its MSI capability?  resolveMSIInterrupts must read +0x3d to derive an
+       INTID, so a run with no read of 0x3d means we never entered that path. */
+    if (get16(d->config) == 0x106b && get16(d->config + 2) == 0x1a01 &&
+        (reg == 0x3c || reg == 0x3d || (reg >= 0x80 && reg < 0xa0))) {
+        static int irq_log = -1;
+        if (irq_log < 0) irq_log = getenv("HV_PCI_IRQ_LOG") != NULL;
+        if (irq_log) fprintf(stderr, "pci vusb: read %03x (%u) = %llx\n", reg, size, (unsigned long long)v);
+    }
     return v;
 }
 

@@ -195,28 +195,32 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
     add_cap(v, 0x50, 0x60, 3, ISR, 1);
     add_cap(v, 0x60, 0x70, 4, DEVICE, 0x100);
     add_cap(v, 0x70, 0x00, 2, NOTIFY, NOTIFY_MULT * HV_VIRTQ_MAX);
-    /* The USB device port presents itself as an Apple device (106b:1a01), and that transport
-       requires MSI: IOPCIBridge::resolveMSIInterrupts asks
-       IOPCIMessagedInterruptController::getDeviceMSILimit, which reads this capability's MMC
-       field. With no capability the limit is 0, AppleVirtIOPCITransport::findNextMSIInterruptIndex
-       fails, assignInterruptAction never puts an interrupt source into the transport's OSArray,
-       and setInterruptsEnabled aborts device initialisation immediately after ACKNOWLEDGE --
-       which is exactly where this device used to stop (status 0x1, then reset, forever).
-       Standard virtio devices (1af4:xxxx) take the multi-vector branch and do not need it, so
-       this is added for 106b:1a01 only. HV_NO_MSI=1 turns it back off for comparison. */
-    if (!getenv("HV_NO_MSI") && v->pci.config[0] == 0x6b && v->pci.config[1] == 0x10 &&
-        v->pci.config[2] == 0x01 && v->pci.config[3] == 0x1a) {
-        uint8_t at = 0x80;
-        uint8_t *c = v->pci.config + at;
-        memset(c, 0, 16);
-        c[0] = 0x05;                 /* MSI capability */
-        c[1] = 0x00;                 /* end of the capability list */
-        c[2] = 0x02;                 /* Message Control: MMC=1 -> 2 vectors; MSI off until enabled */
-        v->pci.config[0x71] = at;    /* link it after the notify capability at 0x70 */
-        for (int i = 0; i < 16; i++) v->pci.wmask[at + i] = 0xff; /* the driver writes address/data here */
-        v->msi_cap = at;
-    }
     reset(v);
+}
+
+/* The USB device port presents itself as an Apple device (106b:1a01), and that transport
+   requires MSI: IOPCIBridge::resolveMSIInterrupts asks
+   IOPCIMessagedInterruptController::getDeviceMSILimit, which reads this capability's MMC
+   field. With no capability the limit is 0, AppleVirtIOPCITransport::findNextMSIInterruptIndex
+   fails, assignInterruptAction never puts an interrupt source into the transport's OSArray,
+   and setInterruptsEnabled aborts device initialisation immediately after ACKNOWLEDGE --
+   which is exactly where this device used to stop (status 0x1, then reset, forever).
+   Standard virtio devices (1af4:xxxx) take the multi-vector branch and do not need it, so
+   this is only called for 106b:1a01. HV_NO_MSI=1 turns it back off for comparison.
+
+   This has to run *after* the caller has rewritten the vendor/device ids: hv_virtio_init()
+   creates the device as 1af4:1040 and virtio_usb.c patches it to 106b:1a01 afterwards. */
+void hv_virtio_add_msi(HvVirtio *v) {
+    if (getenv("HV_NO_MSI")) return;
+    uint8_t at = 0x80;
+    uint8_t *c = v->pci.config + at;
+    memset(c, 0, 16);
+    c[0] = 0x05;                 /* MSI capability */
+    c[1] = 0x00;                 /* end of the capability list */
+    c[2] = 0x02;                 /* Message Control: MMC=1 -> 2 vectors; MSI off until enabled */
+    v->pci.config[0x71] = at;    /* link it after the notify capability at 0x70 */
+    for (int i = 0; i < 16; i++) v->pci.wmask[at + i] = 0xff; /* the driver writes address/data here */
+    v->msi_cap = at;
 }
 
 /* Raise an interrupt the way the device is configured to: an MSI is a memory write carrying the

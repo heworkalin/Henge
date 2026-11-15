@@ -51,6 +51,7 @@ typedef struct HvVirtio {
 /* device_id is the virtio device type (1 net, 2 block); PCI IDs default to the
    modern 0x1af4:0x1040+id and may be changed afterwards. */
 void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_code, int nq, uint64_t features);
+void hv_virtio_add_msi(HvVirtio *v);
 
 /* 1 and an element if the driver made one available, 0 if not, -1 if the ring is broken. */
 int hv_virtq_pop(HvVirtio *v, int q, HvVirtqElem *e);

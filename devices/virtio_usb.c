@@ -183,6 +183,7 @@ HvVirtioUsb *hv_virtio_usb_create(HvMachine *m, HvPcie *bus) {
     d->vio.pci.config[2] = 0x01, d->vio.pci.config[3] = 0x1a;  /* device 0x1a01 */
     d->vio.pci.config[0x2c] = 0x6b, d->vio.pci.config[0x2d] = 0x10;
     d->vio.pci.config[0x2e] = 0x01, d->vio.pci.config[0x2f] = 0x1a;
+    hv_virtio_add_msi(&d->vio);   /* the Apple transport needs an MSI capability */
     d->vio.dev = d;
     d->vio.notify = notify;
     d->log = getenv("HV_VUSB_LOG") != NULL;
