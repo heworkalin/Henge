@@ -117,6 +117,10 @@ static __thread Emit E; /* each CPU translates on its own thread, outside the tr
 #define LDR_X(t, n, off) (0xf9400000u | ((uint32_t)(off) / 8) << 10 | (n) << 5 | (t))
 #define STP_X(t1, t2, n, off) (0xa9000000u | ((((uint32_t)(off) / 8) & 0x7f) << 15) | (t2) << 10 | (n) << 5 | (t1))
 #define LDP_X(t1, t2, n, off) (0xa9400000u | ((((uint32_t)(off) / 8) & 0x7f) << 15) | (t2) << 10 | (n) << 5 | (t1))
+/* SIMD 128-bit pairs, opc=10: imm7 scaled by 16. Used to carry the guest's vector registers
+   across a helper call (they are the host's, because SIMD instructions are passed through). */
+#define STP_Q(t1, t2, n, off) (0xad000000u | ((((uint32_t)(off) / 16) & 0x7f) << 15) | (t2) << 10 | (n) << 5 | (t1))
+#define LDP_Q(t1, t2, n, off) (0xad400000u | ((((uint32_t)(off) / 16) & 0x7f) << 15) | (t2) << 10 | (n) << 5 | (t1))
 #define BR_X(n) (0xd61f0000u | (n) << 5)
 #define BLR_X(n) (0xd63f0000u | (n) << 5)
 #define SBFM_X(d, n, immr, imms) (0x93400000u | (immr) << 16 | (imms) << 10 | (n) << 5 | (d))
@@ -535,34 +539,43 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     if (!p0) cold_off(e);
 }
 
-/* Call hv_helper(cpu, info) and continue unless it leaves. */
-/* Call hv_helper: guest x30 saved, a blr to hv_helper_thunk with x6 = its HvHelperInfo,
-   and x0 reloaded when it comes back. Host x6 and x15 are clobbered. */
-static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
+/* Call hv_helper: guest x30 saved, a blr to hv_helper_thunk with x6 = its HvHelperInfo, and x0
+   reloaded when it comes back. Host x6 and x15 are clobbered. Returns the index of the
+   `ldr x0, [x28]` the helper comes back to (put_helper_refill re-enters there). */
+static uint32_t put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
 
 /* A memory slow path whose thunk may refill the TLB and resume at `retry`:
    the op word carries the refill flags (bits 18..8) and how far back retry is
    from where the helper would resume (bits 31..19, in words). */
 static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
-    put_helper(e, pc, insn, HV_OP_MEM);
-    uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
+    uint32_t resume = put_helper(e, pc, insn, HV_OP_MEM);
     uint32_t back = resume - retry;
     if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
 }
 
 /* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
    and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
-static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+static uint32_t put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
     uint32_t info = e->npool;
     e->pool[info] = pc;
     e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
     e->npool += 2;
     put(e, STR_X(30, 28, HV_CPU_X(30)));
+    /* The guest's v0-v31 ARE the host's: SIMD instructions are passed through untouched, so a
+       helper written in C is free to clobber exactly the ones the AAPCS lets it (v0-v7, v16-v31)
+       and the upper halves of v8-v15. All 32 are carried across the call. iBEC's LZFSE decoder
+       keeps its FSE state in q0-q2 across a store that takes the slow path, and without this the
+       state was gone on return: the decoder then took match distances from garbage and wrote the
+       wrong bytes, which is how a kalloc_type view's kt_flags became 0x2 instead of 0x71. */
+    for (int q = 0; q < 32; q += 2) put(e, STP_Q(q, q + 1, 28, HV_CPU_V + q * 16));
     put(e, LDR_X(15, 28, HV_CPU_HELPER_THUNK));
     e->fix[e->nfix++] = (LitFix){e->n, FIX_ADR, info, (uint8_t)(e->in_cold && !e->flat)};
     put(e, 0x10000006u); /* adr x6, info */
     put(e, BLR_X(15));
+    uint32_t ldr0 = e->n;
     put(e, LDR_X(0, 28, 0));
+    for (int q = 0; q < 32; q += 2) put(e, LDP_Q(q, q + 1, 28, HV_CPU_V + q * 16));
+    return ldr0;
 }
 
 /* d = n + imm for |imm| < 2^24; n and d are general registers, never SP. */

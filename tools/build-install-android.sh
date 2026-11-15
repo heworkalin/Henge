@@ -54,7 +54,26 @@ build() {
     done
 }
 
-build core/*.c
+# mmu.c: no SIMD. hv_tlb_refill runs straight out of translated code with the guest's SIMD
+# registers live (guest v0-v31 ARE the host's, since SIMD instructions are passed through), and
+# it is reached from the refill thunk, not through put_helper, so nothing else can save them. With
+# SIMD enabled here a TLB miss wiped the guest's vector state: iBEC's LZFSE decoder keeps its FSE
+# state in q0-q2 across a load or store that misses, lost it, and decoded the kernelcache into
+# wrong bytes (a kalloc_type view's kt_flags read 0x2 instead of 0x71 -> panic in validate_flags).
+# The Makefile has carried this flag for mmu.c for the same reason; the Android builds did not.
+build_mmu() {
+    obj="$OUT/obj/core_mmu.o"
+    if stale "$obj" core/mmu.c; then $CC $CFLAGS -mgeneral-regs-only -c core/mmu.c -o "$obj"; fi
+}
+build_core() {
+    for src in "$@"; do
+        [ "$src" = "core/mmu.c" ] && continue
+        obj="$OUT/obj/$(echo "${src%.c}" | tr '/' '_').o"
+        if stale "$obj" "$src"; then $CC $CFLAGS -c "$src" -o "$obj"; fi
+    done
+}
+build_mmu
+build_core core/*.c
 build devices/*.c
 build host/disk.c host/hvsparse.c host/jit_region.c host/usb_host.c
 build android/compat/compat_android.c android/compat/commoncrypto_android.c \

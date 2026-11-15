@@ -80,6 +80,14 @@ set(MBEDTLS_SRC
 
 file(GLOB CORE_SRC CONFIGURE_DEPENDS ${HENGE_ROOT}/core/*.c)
 
+# mmu.c: no SIMD. hv_tlb_refill is reached straight from translated code (the refill thunk, not
+# put_helper) while the guest's SIMD registers are live -- guest v0-v31 ARE the host's, because SIMD
+# instructions are passed through untouched. Compiled with SIMD enabled, a TLB miss wiped the
+# guest's vector state and iBEC's LZFSE decoder decoded the kernelcache into wrong bytes (a
+# kalloc_type view's kt_flags read 0x2 instead of 0x71, and validate_flags panicked). The Makefile
+# has carried this flag for mmu.c for the same reason.
+set_source_files_properties(${HENGE_ROOT}/core/mmu.c PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only")
+
 file(GLOB DEVICE_SRC CONFIGURE_DEPENDS ${HENGE_ROOT}/devices/*.c)
 # pvg_lite.c is the PVG device model. It is built for now because devices/vmapple.c
 # calls hv_pvg_lite_create() unconditionally, so leaving it out is a link error.
