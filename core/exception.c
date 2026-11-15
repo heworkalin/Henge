@@ -118,10 +118,25 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                prints only the essentials. */
             if (cpu->m->log >= 2)
                 fprintf(stderr, "hengevm: data abort: esr %08x far %llx pc %llx el%u insn-ok %d "
-                                "x0 %llx x2 %llx x4 %llx x16 %llx\n",
+                                "x0 %llx x2 %llx x4 %llx x16 %llx x29 %llx x30 %llx\n",
                         esr, (unsigned long long) far, (unsigned long long) ret, cpu->el,
                         w.fsc == 0, (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[2],
-                        (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[16]);
+                        (unsigned long long) cpu->x[4], (unsigned long long) cpu->x[16],
+                        (unsigned long long) cpu->x[29], (unsigned long long) cpu->x[30]);
+            /* A permission fault on a write: the whole descriptor chain says whether the guest
+               mapped the page read-only on purpose or this walk is reading the wrong table.
+               Nothing used to dump anything for these -- the diagnostics below keyed on
+               translation faults -- and these are permission faults. */
+            if ((esr & 0x3c) == 0x0c && cpu->m->log >= 2) {
+                FILE *saved = hv_walk_dbg;
+                HvWalk fw;
+                hv_walk_dbg = stderr;
+                hv_mmu_walk(cpu, far, HV_ACC_WRITE, 1, &fw);
+                hv_walk_dbg = saved;
+                fprintf(stderr, "hengevm: perm walk far %llx: fsc %x pa %llx L3-table %llx\n",
+                        (unsigned long long) far, fw.fsc, (unsigned long long) fw.pa,
+                        (unsigned long long) fw.table);
+            }
             /* A level-0 translation fault is almost always a bad pointer rather than bad code:
                the registers at the fault are the arguments the caller passed, and x30 says who
                the caller was -- which is the only thing that turns "somewhere a pointer went
