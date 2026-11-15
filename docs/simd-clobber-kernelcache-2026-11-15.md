@@ -274,3 +274,102 @@ USB 通道。** restore 的 -2（`recovery_enter_restore` 超时）是这个的�
 下一步（下次接着做）：在 `__PRELINK_TEXT` 起点 `0xfffffe001bb20000` 下 `HV_PCHK` 断点，
 用一次运行区分"内核根本没跳进 kext"（→ 查 `IOCatalogue` 匹配 / `OSKext::start` 的调用链）
 和"跳进去了但走飞"（→ 按 SIMD 那套办法逐条对拍指令语义）。
+
+## 十三、2026-11-15 深夜：kext **加载成功、但从未启动**（本轮唯一确凿的结论）
+
+### 13.1 先排除的（都有硬证据）
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| rebase 做错 / 多做（替 iBoot） | `HV_NO_KFIX=1`（完全不做） | **与默认完全一样**：restore failed、`kext 0`、同样 5 个 MMIO 设备。**内核自己会把 fixup 走完**，我们那份补丁只是冗余 |
+| kernelcache 解压有残留错误 | dump 运行期 `__PRELINK_TEXT`（7.27 MB）与 IPSW 明文比对 | **3967 个差异 qword 全部精确等于 `ref + 0x14b14000`（slide）**，其余 0 字节不同 |
+| kext plist 数据错 | dump 运行期 `__PRELINK_INFO`（3.26 MB XML）比对 | **0 字节不同**（`<?xml` 开头，238 个 kext 齐全） |
+| device tree 错 / 缺 memory-map | `tools/adt.py` 解析运行期树 | `/chosen/memory-map` 完整（RAMDisk `0x783ac000`/`0xb400000`、BootArgs、TrustCache）；所有 `compatible` 与 kext 的 `IONameMatch` **一一对应** |
+| 驱动 personality 不匹配 | 离线解析 238 个 kext 的 plist | `AppleVirtualPlatform/AppleVirtualPlatformPCIE` 要 `pcie,vmapple1`，DT 正是；`AppleVirtIO/AppleVirtIOUSBPCITransport` 要 `0x1a01106b`，我们 virtio-usb 正是 `0x1a01`（vendor `0x106b`） |
+| 我们替内核做了不该做的（用户提出的怀疑） | 同上 | rebase 冗余但无害；`__DATA_CONST` 本来就留给内核 |
+
+**结论：数据、匹配表、设备模型全都对。** 之前的"`HV_NO_KFIX=1` 会崩"是 SIMD bug 时代的现象，已在第十一节更正。
+
+### 13.2 真正的事实：kext 代码**一次都没执行**
+
+两个独立探针互相印证：
+
+```
+seg blocks: kext 0   kernel ~330k-555k   other ~95k      ← 段计数（__PRELINK_TEXT 命中次数）
+HV_PCHK=1bb20000:1c210000 → "hengevm: pchk" 命中 0 次    ← 断点（覆盖整个 __PRELINK_TEXT）
+```
+
+同时：**`kext` 对象确实被创建了** —— 扫描内核堆（`0x82xxxxxx`/`0x84xxxxxx`）能直接看到
+`apple.driver.IOImageLoader`、`SIBlockCommandsDevice`、`eUSBHostResources`、`sx15.6.internal`
+这些 kext 元数据字符串。
+
+也就是说：**`libsa` 的 `addKextsFromKextCollection` 成功了（238 个 OSKext 对象已建），
+但没有任何一个 kext 的代码被调用。**
+
+### 13.3 关节在哪（源码定位）
+
+`libsa/lastkernelconstructor.c`：
+
+```c
+extern void iokit_post_constructor_init(void);
+...
+	iokit_post_constructor_init();     /* 内核跳进 IOKit.kext 代码的唯一入口 */
+```
+
+`iokit_post_constructor_init`（`iokit/Kernel/IOStartIOKit.cpp`）里依次是：
+
+```c
+IOCPUInitialize();
+root = IORegistryEntry::initialize();
+IOService::initialize();
+IOCatalogue::initialize();     /* 238 个 personality 的匹配表在这里建立 */
+OSKext::initialize();
+...
+```
+
+**注意 `IOKit.kext` 自己就在 `__PRELINK_TEXT` 里**（`"KernelConfigTables syntax error"` 这个
+字符串的 file offset `0xc0354` 落在 `0x8000–0x6f8000` 内）。所以：
+
+```
+内核主干 ✓（38~55 万块）
+   ↓  libsa/lastkernelconstructor
+iokit_post_constructor_init（__PRELINK_TEXT）   ←←← 从没发生（零命中）
+   ↓
+IOCatalogue 建表 → 驱动 start → 设备出现 → restored 拿到 USB
+```
+
+**这就是全部现象的统一解释**：加载成功、匹配表本该能建、设备模型也在，唯独这一步没被调用，
+于是 `IOCatalogue` 从未初始化 → 没有设备 → `restored` 永远等不到 USB → restore `-2`。
+
+### 13.4 下次的起点（一个动作）
+
+在 `lastkernelconstructor` / `iokit_post_constructor_init` 下 `HV_PCHK`：
+
+- **不命中** ⇒ 内核的构造函数链没走完（查 `__mod_init_func` 遍历顺序 / `bsd_init` 调用点）
+- **命中即返** ⇒ JIT 语义问题（和 SIMD 同类，用 `HV_BLOCK_DUMP` + `disasm-raw.sh` 逐条对拍）
+
+定位地址的办法（kernelcache 无 `LC_SYMTAB`）：用字符串反查 —— 例如
+`"KernelConfigTables syntax error"`（file offset `0xc0354`）的 `adrp/add` 引用点就是
+`IOCatalogue::initialize` 的起始地址。
+
+### 13.5 本轮新增的工具（都在 `android/install.c`，失败时刻一次性打印）
+
+```
+HV_SCAN_PROC=1      扫 guest RAM 里的进程名（launchd/restored/... → 证明用户态在跑）
+                    附：__PRELINK_TEXT/内核段块计数（"seg blocks: kext N kernel N other N"）
+                    + 每个 CPU 的 pc/icount + pc 历史 + EL0 故障页 dump
+HV_DUMP_RAMDISK=1   dump 整个 restore ramdisk（180 MB，APFS 容器，内部文件是压缩的）
+HV_DUMP_KC=1        dump 运行期 __PRELINK_TEXT（7.27 MB）与 __PRELINK_INFO（3.26 MB）
+HV_EL0_DUMP=1       EL0 故障发生时 dump 它正在执行的那一页（用户页表此时有效）
+```
+
+**离线比对脚本**（本轮用的，可复用）：把 dump 出的段与 `kc.img` 的同 fileoff 范围逐字节
+比对；若差异全部等于 `ref + slide`，说明只是 slide，数据本身正确。
+
+### 13.6 判定口径（避免再被误导）
+
+- `kext 0` 是**段计数**，只有 `__PRELINK_TEXT` 被执行才会涨。arm64 上 kext **不**搬 basement
+  （`KEXT_ALLOC_BASE` 只在 `osfmk/mach/i386/vm_param.h` 定义），所以这个计数可信。
+- MMIO histogram 是**完整**的（`bdif` 记录到 1600 万次），所以"pcie 0 次"是"真没访问"。
+- `pkl`/`hv_pc_hist_dump` 里的 pc 是 **stop 时刻**的位置（`stop_cpus()` 在 restore 结束时调用），
+  不能用来判断"卡在哪"。
