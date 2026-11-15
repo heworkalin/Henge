@@ -6,8 +6,11 @@
     .text
     .p2align 14
     .globl _mem_programs_begin
+    .globl mem_programs_begin
     .globl _mem_programs_finish
+    .globl mem_programs_finish
 _mem_programs_begin:
+mem_programs_begin:
 
 PROGRAM single
     str x1, [x0]
@@ -370,3 +373,5 @@ END mmio
 
     .p2align 14
 _mem_programs_finish:
+mem_programs_finish:
+

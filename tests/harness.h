@@ -5,6 +5,20 @@
 
 #ifdef __ASSEMBLER__
 
+// Addressing a symbol's page: Mach-O spells it sym@PAGE / sym@PAGEOFF, ELF spells it plain
+// adrp followed by :lo12:. Both assemblers run this file through cpp, so one macro each keeps
+// the block-level tests buildable for both — they used to be Darwin-only, which is why the
+// JIT-vs-native comparisons could not be run on the device.
+#if defined(__APPLE__)
+#define ADRP_SYM(r, s)      adrp r, s@PAGE
+#define ADD_SYM(r, s, t)    add r, s, t@PAGEOFF
+#define LDR_SYM(r, s, t)    ldr r, [s, t@PAGEOFF]
+#else
+#define ADRP_SYM(r, s)      adrp r, s
+#define ADD_SYM(r, s, t)    add r, s, :lo12:t
+#define LDR_SYM(r, s, t)    ldr r, [s, :lo12:t]
+#endif
+
 // PROGRAM name ... END name. The JIT runs from _name to _name_end; natively
 // _name_native loads the registers first and the epilogue saves them after.
 .macro PROGRAM name
@@ -13,6 +27,12 @@
     .globl _\name
     .globl _\name\()_end
 _\name\()_native:
+    /* Mach-O prefixes C symbols with '_', ELF does not; the harness's C side spells the bare name.
+       Two labels at the same address give both an absolute value — `.set` would make the bare name
+       section-relative on ELF (offset 0x200 read back as an address), which is what made the first
+       device run fail at pc 0x200. Both names exist on both platforms: the extra one is harmless. */
+    .globl \name\()_native
+\name\()_native:
     ldp q0, q1, [x28, #320]
     ldp q2, q3, [x28, #352]
     ldp q4, q5, [x28, #384]
@@ -54,14 +74,18 @@ _\name\()_native:
     ldp x29, x30, [x28, #232]
     ldr x28, [x28, #224]
 _\name\():
+    .globl \name
+\name\():
 .endm
 
 .macro END name
     b _\name\()_end
 _\name\()_end:
+    .globl \name\()_end
+\name\()_end:
     stp x0, x1, [sp, #-16]!
-    adrp x0, _hv_native_cpu@PAGE
-    ldr x0, [x0, _hv_native_cpu@PAGEOFF]
+    ADRP_SYM(x0, _hv_native_cpu)
+    LDR_SYM(x0, x0, _hv_native_cpu)
     stp x2, x3, [x0, #16]
     stp x4, x5, [x0, #32]
     stp x6, x7, [x0, #48]

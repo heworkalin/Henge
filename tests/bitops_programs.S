@@ -146,3 +146,18 @@ PROGRAM reader
     str     x12, [x0, #64]
     str     x10, [x0, #72]
 END reader
+
+// ---- the guest's vector state across the paths that leave translated code ----
+// The PROLOGUE loads q0-q31 from the HvCpu and the EPILOGUE writes them back, so whatever the JIT
+// leaves in them is the result. On a CPU neither a TLB refill nor a memory slow path may touch
+// them; in the engine both run C code, and guest v0-v31 ARE the host's registers (SIMD
+// instructions are passed through), so both have to carry them.
+//   - first touch of the second page: the refill thunk -> hv_tlb_refill
+//   - a load that straddles the page boundary: the memory slow path -> hv_mem_emulate
+PROGRAM simdhold
+    ldr     w1, [x0, #4096]         // first touch of page 2: TLB refill
+    add     w1, w1, #1
+    str     w1, [x0, #4096]
+    ldr     x2, [x0, #4092]         // straddles the boundary: memory slow path
+    str     x2, [x0, #4096]
+END simdhold

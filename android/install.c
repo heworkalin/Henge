@@ -153,15 +153,12 @@ static int startup_dump_blocks(const char *workdir) {
     snprintf(path, sizeof path, "%s/blocks.bin", workdir);
     setenv("HV_BLOCK_DUMP", path, 1);
     setenv("HV_BLOCK_DUMP_EVERY", "1", 1);
-    /* The kalloc_type view record of com.apple.driver.AppleUSBAudio, whose packed fields nothing
-       rebased: whoever writes it is the thing to find, so watch that page. */
-    /* overwrite=0: a watch given on the command line must win over this default */
-    setenv("HV_WATCH_VA", "fffffe001c4a7850", 0);
-    /* The same record by physical address: the firmware builds the kernel image with the MMU off,
-       so a write there is a write to this PA and never matches the kernel VA above. This one is the
-       copy in the region iBEC assembles the kernel in before copying it into place: the value that
-       ends up in the image at 0x74507860 is written here first. */
-    setenv("HV_WATCH_PA", "837ef860", 0);
+    /* HV_WATCH_VA / HV_WATCH_PA have no defaults: a watch is armed only when the caller names an
+       address. A default here is worse than nothing -- a page watch fires for every store in the
+       page, so a hardcoded one buries the store worth seeing under hundreds of unrelated ones and
+       reads as if the engine had hit the address that was actually asked for.
+       The physical form exists because the firmware builds the kernel image with the MMU off, so a
+       write there is a write to that PA and never matches a kernel VA. */
     /* One run, for the question of whether the firmware decoded the bytes that were sent. */
     if (getenv("HENGE_DUMP_RAM")) setenv("HV_DUMP_RAM", "1", 1);
     return 0;
