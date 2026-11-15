@@ -578,3 +578,59 @@ call [provider+0x958](this, 0x12, status|new)
 看它在什么条件下返回 bit0=0。若 `[this+0xb0]` 是 `AppleVirtualPlatformPCIE`，
 `0x970`/`0x958` 就是平台侧对 "device status 变化" 的处理（很可能是
 `getVendorDataCapabilities` 或 virtio 配置空间的转发，失败即返回错误）。
+
+## 19. vtable 解析成功：provider 的三个槽全部落实（2026-11-16）
+
+### 19.1 方法（重要，之前我在猜 PAC，是错的）
+
+内核 kext 的指针是 **`DYLD_CHAINED_PTR_64_KERNEL_CACHE`**：
+
+```
+bits[63]    isAuth
+bits[62:52] next
+bits[51:50] key
+bits[49]    addrDiv
+bits[48:33] diversity
+bits[32:31] cacheLevel
+bits[29:0]  target  →  目标 VA = 0xfffffe0007004000 + target
+```
+
+校验：`IOPCIDevice` 的 `__ZTV` 前几个槽解出来是 `IOPCIDevice::~IOPCIDevice`(D1/D0)、
+`OSObject::release/retain/getRetainCount` —— 与 Itanium C++ ABI 完全一致，说明公式正确。
+虚函数槽 `n` 位于 `__ZTV + 0x10 + 8n`。
+
+脚本：`/tmp/vt.py`（`dumprange <fileoff> <n>`）。实现要点：从 MH_FILESET 的每个
+`LC_FILESET_ENTRY` 取符号表，统一按 VA 排序后查名字。
+
+### 19.2 结果（`IOPCIDevice` 的 vtable）
+
+| 槽 | 偏移 | 符号 |
+|---|---|---|
+| 231 | `0x738` | `IOService::getInterruptType(int, int*)` |
+| 299 | `0x958` | `IOPCIDevice::ioWrite8(UInt16, UInt8, IOMemoryMap*)` |
+| 302 | `0x970` | `IOPCIDevice::ioRead8(UInt16, IOMemoryMap*)` |
+
+### 19.3 由此得到的确定事实
+
+`AppleVirtIOTransport::updateStatus(this, newbits)` 的真实实现：
+
+```asm
+status = ioRead8(0x12) | newbits      ; 经 IOPCIDevice 的 BAR 访问
+ioWrite8(0x12, status)
+→ 返回值即 ioWrite8/ioRead8 的结果（performDeviceInitialization 检查其 bit0）
+```
+
+也就是说 **Apple 的 virtio transport 用 BAR 偏移 `0x12` 存设备状态**，而标准 virtio PCI
+common config 里 `0x12` 是 `num_queues`、`0x14` 才是 `device_status`。
+我们的 `bar_read/bar_write` 按标准布局实现，所以：
+
+- guest 通过 `ioRead8(0x12)` 读到的不是它的状态字
+- `ioWrite8(0x12, ...)` 写进去的也不是状态
+- 但日志里又能看到 `vusb-cfg: status = 0x1` —— 说明还有另一条路径（直接 MMIO
+  `+0x14`）在写状态，两条路径的语义不一致
+
+**下一步（确定且具体）**：反汇编 `IOPCIDevice::ioRead8`/`ioWrite8`（`0x99bd830` /
+`0x99bd9a0`），确认它们对 **memory BAR** 是走 `IOMemoryMap` 的虚拟地址还是走 I/O 端口；
+再对照我们的 `bar_read/bar_write` 的偏移布局，决定是「让 0x12 承载状态」还是
+「修正 transport 认为的状态偏移」。同时重新检查 `findNextMSIInterruptIndex`（`0x902450c`）
+对 `getInterruptType` 返回值的处理——之前记为「非 0 立刻失败」，需要按新解析的 vtable 复核。
