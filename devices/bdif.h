@@ -24,6 +24,7 @@ typedef struct HvBdif {
     HvVirtioUsb *usb;   /* NULL: no USB channel */
     uint32_t usb_qsel, usb_irq;
     HvBdifUsbQ usb_q[2];
+    uint32_t usb_req_n, usb_rsp_n; /* counts for the transfer log, not state */
 } HvBdif;
 
 /* CPU thread (board tick): hand a queued USB request to the waiting buffer. */

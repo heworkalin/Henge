@@ -83,6 +83,16 @@ static void usb_deliver(HvBdif *b) {
     if (!b->usb || !b->usb->rom_on || !q->pending || q->done) return;
     HvVusbMsg m;
     if (!hv_vusb_take_request(b->usb, &m)) return;
+    /* Every request the guest sees: endpoint, transfer type and length, never the bytes. A restore
+       that never gets going looks exactly like one whose USB channel is silent, and before this
+       nothing recorded which of the two it was. Sampled: a restore moves tens of thousands of
+       transfers, and writing every one of them through the stderr pipe measurably changes the
+       CPU thread's timing (two runs that logged them all died in the host before restore; the run
+       without the log did not). */
+    if (b->m->log >= 2 && (b->usb_req_n % 32) == 0)
+        fprintf(stderr, "bdif usb: req #%u ep %#x type %u len %u\n", b->usb_req_n,
+                (unsigned)m.ep, (unsigned)m.type, (unsigned)m.len);
+    b->usb_req_n++;
     uint32_t room = 0;
     usb_xfer(b, q->pending, 1, NULL, 0, &room);
     uint32_t payload = m.data ? m.len : 0;
@@ -108,6 +118,8 @@ void hv_bdif_poll(HvBdif *b) {
 static void usb_write(HvBdif *b, uint64_t reg, uint64_t v) {
     switch (reg) {
     case REG_UNK2: /* (re)enable: a new stage of the boot chain connecting */
+        if (b->m->log >= 2)
+            fprintf(stderr, "bdif usb: channel %s (a new stage connected)\n", v ? "online" : "offline");
         b->usb->rom_on = v != 0;
         hv_vusb_set_online(b->usb, v != 0);
         memset(b->usb_q, 0, sizeof b->usb_q);
@@ -130,6 +142,11 @@ static void usb_write(HvBdif *b, uint64_t reg, uint64_t v) {
         usb_xfer(b, v, 0, NULL, 0, &room);
         uint8_t *tmp = room ? malloc(room) : NULL;
         uint32_t n = tmp ? usb_xfer(b, v, 0, tmp, room, NULL) : 0;
+        if (b->m->log >= 2 && (b->usb_rsp_n % 32) == 0)
+            fprintf(stderr, "bdif usb: rsp #%u ep %u type %u len %u\n", b->usb_rsp_n,
+                    n >= 2 ? (unsigned)tmp[0] : 0u, n >= 2 ? (unsigned)tmp[1] : 0u,
+                    n >= 2 ? n - 2 : 0u);
+        b->usb_rsp_n++;
         if (n >= 2) hv_vusb_put_response(b->usb, tmp[0], tmp[1], tmp + 2, n - 2);
         free(tmp);
         q->done = 1;
@@ -164,7 +181,16 @@ static uint64_t bdif_read(void *opaque, uint64_t off, unsigned size) {
 static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
     uint8_t ret = 1; /* failed */
     ReqCmd req[3];   /* sector, data, retval */
-    if (hv_phys_read(b->m, req_pa, req, sizeof req) != 0) return;
+    if (hv_phys_read(b->m, req_pa, req, sizeof req) != 0) {
+        /* A doorbell that names a request block outside RAM. Silent before this, which made a
+           disk that is never touched look like a disk nobody asked for: the count of REG_CMD
+           writes said 6 and this function had printed nothing at all. */
+        if (b->m->log >= 1)
+            fprintf(stderr, "bdif %s: request at %#llx is not in RAM (doorbell ignored)\n",
+                    disk == b->aux ? "aux" : disk == b->root ? "root" : "none",
+                    (unsigned long long) req_pa);
+        return;
+    }
     if (disk && req[0].len == 16) {
         uint32_t sector[4];
         if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0) {
