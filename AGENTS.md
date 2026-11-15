@@ -142,6 +142,14 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 注意 `com.apple.kernel` 的 `vmaddr` 就是 `0xfffffe000700c000`（`__PRELINK_TEXT` 起点），
 它属于 kernel fileset entry，所以"该段 0 块"等于"内核早期段没跑"，含义要单独判断。
 
+**不要手写 ARM64 分支解码器**（`b.cond`/`cbz`/`bl` 的 imm 位域极易错，本项目已因此误判多轮）。
+用 NDK 的 `llvm-objdump`：裸 binary 先用 `llvm-objcopy -I binary -O elf64-littleaarch64
+--rename-section .data=.text,code` 包一层 ELF 再 `-d`；`--adjust-vma` 对裸 binary 的分支
+目标显示不可靠，跳转目标按 `imm` 手算后再用 trace 核对。
+
+**kext 一个都不 start 的排查现状与完整地址表见 `docs/kext-start-matching-2026-11-16.md`**
+（已排除项、已确认执行链路、复现命令）。
+
 ## 6. 调试方法论（本项目最贵的教训）
 
 1. **推导 ≠ 证据。** 讲清机制要有 XNU 源码/实测支撑；否则标"不确定"。
