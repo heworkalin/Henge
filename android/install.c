@@ -34,6 +34,7 @@
 #include <mach/mach_time.h>
 
 #include "dispatch.h"
+#include "exception.h"
 #include "mmu.h"
 #include "sysreg.h"
 #include "disk.h"
@@ -391,11 +392,15 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
    bridge the virtio devices sit on, IOUSBHostFamily for the port restored talks to). Counting
    their names in RAM says whether the boot got far enough to load them. */
 static void scan_proc_names(void) {
-    static const char *const names[] = {"launchd", "restored", "AppleVM", "mobile_restore",
-                                        "watchdogd", "launchctl", "kernel_task",
+    static const char *const names[] = {"launchd", "restored", "restored_external",
+                                        "mobile_restore", "watchdogd", "launchctl",
+                                        "kernel_task", "usbcfwflasher", "diskimagesiod",
                                         "ApplePCIe", "IOUSBHost", "AppleUSBHost",
                                         "com.apple.iokit.IOUSBHostFamily",
                                         "AppleVirtIONetPCI", "VirtIOBlockDevice"};
+    /* "restored" is a prefix of "restored_external", and the scan matches the byte after the
+       name against \0, so both can be counted separately: a hit for "restored" means the name
+       really ends there. */
     const int n = (int)(sizeof names / sizeof names[0]);
     int hits[16] = {0};
     for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull; pa += 0x1000) {
@@ -462,10 +467,17 @@ static void *kicker_thread(void *arg) {
     return NULL;
 }
 
+static void dump_last_el0(void);
+
 static void *monitor_thread(void *arg) {
     (void) arg;
     uint64_t t0 = mach_absolute_time();
     uint64_t prev_pc = 0, changes = 0, samples = 0, same = 0;
+    /* Host CPU time is the only honest measure of "is the guest actually running".  A chained
+       superblock loops entirely inside translated code and never calls back into C, so cpu->pc,
+       the block counters and the EL0 trace all look frozen while the host is in fact burning a
+       core.  utime does not lie. */
+    uint64_t prev_utime = 0;
     while (g_running && !g_machine.stop) {
         struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
         nanosleep(&ts, NULL);
@@ -474,6 +486,45 @@ static void *monitor_thread(void *arg) {
         samples++;
         if (pc != prev_pc) changes++; else same++;
         prev_pc = pc;
+        {
+            uint64_t u = 0;
+            FILE *sf = fopen("/proc/self/stat", "r");
+            if (sf) {
+                char buf[1024];
+                if (fgets(buf, sizeof buf, sf)) {
+                    char *p2 = strrchr(buf, ')');
+                    if (p2) {
+                        unsigned long ut = 0, st = 0;
+                        if (sscanf(p2 + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+                                   &ut, &st) == 2) u = ut + st;
+                    }
+                }
+                fclose(sf);
+            }
+            uint64_t d = u - prev_utime;
+            prev_utime = u;
+            fprintf(stderr, "hengevm: cpu-ticks +%llu (pc %#llx)\n",
+                    (unsigned long long) d, (unsigned long long) pc);
+        }
+        /* Dump the last userspace page as soon as userland stops moving.  Waiting for the restore
+           timeout to fire costs minutes and tells us nothing new; twenty seconds without a new
+           EL0 block is already conclusive, and the dump is the whole point of the run. */
+        {
+            extern uint64_t hv_last_el0_va;
+            static uint64_t prev_el0;
+            static int el0_same, dumped;
+            if (hv_last_el0_va && hv_last_el0_va == prev_el0) {
+                if (++el0_same == 10 && !dumped && !getenv("HV_NO_EL0_DUMP")) {
+                    dumped = 1;
+                    fprintf(stderr, "hengevm: userland has not moved for 20s (last %#llx)\n",
+                            (unsigned long long) hv_last_el0_va);
+                    dump_last_el0();
+                }
+            } else {
+                el0_same = 0;
+                prev_el0 = hv_last_el0_va;
+            }
+        }
         /* What is at that address, read through the guest's own tables: an address alone does not
            say whether it is the idle loop, a spin waiting for a device, or a panic handler. */
         uint32_t w[4] = {0, 0, 0, 0};
@@ -625,10 +676,195 @@ static void scan_kernel_log(void) {
 
 void hv_trace_dump(void);
 
+int hv_trace_last_below(uint64_t limit, uint64_t *out, int n);
+
+/* Dump the page(s) around the last userspace block the guest executed.  After the guest gives up,
+   the trace's final EL0 address is where dyld was when it last handed control to the kernel --
+   reading those bytes back through the guest's own page tables identifies the library call or
+   syscall without needing the shared cache file or a debugger. */
+static void dump_last_el0(void) {
+    extern uint64_t hv_last_el0_va;
+    uint64_t last = hv_last_el0_va;
+    if (!last) { fprintf(stderr, "hengevm: no userspace block recorded\n"); return; }
+    {
+        /* Exceptions taken from userland, on their own ring.  The general one is filled by timer
+           interrupts from the idle loop within milliseconds, so a userland fault there would be
+           long overwritten by the time the guest stops. */
+        extern uint64_t hv_uexc_n, hv_uexc_elr[], hv_uexc_far[], hv_uexc_pc[];
+        extern uint32_t hv_uexc_esr[], hv_uexc_type[];
+        uint64_t n = hv_uexc_n < 64 ? hv_uexc_n : 64, b = hv_uexc_n - n;
+        FILE *uf = fopen("/tmp/uexc_tail.txt", "w");
+        if (uf) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t k = (b + i) & 63u;
+                fprintf(uf, "%llu type=%u esr=%#x pc=%#llx elr=%#llx far=%#llx\n",
+                        (unsigned long long) (b + i), hv_uexc_type[k], (unsigned) hv_uexc_esr[k],
+                        (unsigned long long) hv_uexc_pc[k],
+                        (unsigned long long) hv_uexc_elr[k],
+                        (unsigned long long) hv_uexc_far[k]);
+            }
+            fclose(uf);
+            fprintf(stderr, "hengevm: userland exceptions total %llu -> /tmp/uexc_tail.txt\n",
+                    (unsigned long long) hv_uexc_n);
+        }
+    }
+    {
+        /* The last exceptions the guest took.  If userland stopped without any exception right
+           before it, the process was blocked or killed; if there is one, its ESR/FAR names the
+           fault, and that is the failure point. */
+        extern HvExcRec hv_exc_ring[];
+        extern uint32_t hv_exc_at;
+        FILE *ef = fopen("/tmp/exc_tail.txt", "w");
+        if (ef) {
+            uint32_t n = hv_exc_at < 128 ? hv_exc_at : 128;
+            for (uint32_t i = 0; i < n; i++) {
+                const HvExcRec *r = &hv_exc_ring[(hv_exc_at - n + i) & (HV_EXC_RING - 1)];
+                fprintf(ef, "%u el%u t%u esr=%#x elr=%#llx far=%#llx sp=%#llx\n", i, r->el,
+                        r->type, (unsigned) r->esr, (unsigned long long) r->elr,
+                        (unsigned long long) r->far, (unsigned long long) r->sp);
+            }
+            fclose(ef);
+            fprintf(stderr, "hengevm: exceptions total %u, last 128 -> /tmp/exc_tail.txt\n",
+                    hv_exc_at);
+        }
+    }
+    {
+        extern int hv_pc_hist_export(int, uint64_t *, int);
+        static uint64_t kt[512];
+        int n = hv_pc_hist_export(0, kt, 512);
+        FILE *kf = fopen("/tmp/kernel_tail.txt", "w");
+        if (kf) {
+            for (int i = 0; i < n; i++) fprintf(kf, "%#llx\n", (unsigned long long) kt[i]);
+            fclose(kf);
+            fprintf(stderr, "hengevm: kernel tail %d blocks -> /tmp/kernel_tail.txt\n", n);
+        }
+    }
+    {
+        extern uint64_t hv_svc_n, hv_svc_pc[], hv_svc_x16[], hv_svc_x0[], hv_svc_x1[], hv_svc_ret[];
+        extern char hv_svc_path[][96];
+        extern int hv_svc_pending[];
+        extern uint32_t hv_svc_imm[], hv_svc_el[];
+        uint64_t n = hv_svc_n < 4096 ? hv_svc_n : 4096, base = hv_svc_n - n;
+        FILE *sf = fopen("/tmp/svc_trace.txt", "w");
+        if (sf) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t slot = (base + i) & 4095u;
+                if (hv_svc_path[slot][0])
+                    fputs(hv_svc_path[slot], sf), fputc('\n', sf);
+                fprintf(sf, "%llu el%u svc#%#x pc=%#llx x16=%llu(%#llx) args=%#llx,%#llx ret=%#llx\n",
+                        (unsigned long long) (base + i), hv_svc_el[slot], hv_svc_imm[slot],
+                        (unsigned long long) hv_svc_pc[slot],
+                        (unsigned long long) hv_svc_x16[slot],
+                        (unsigned long long) hv_svc_x16[slot],
+                        (unsigned long long) hv_svc_x0[slot],
+                        (unsigned long long) hv_svc_x1[slot],
+                        (unsigned long long) hv_svc_ret[slot]);
+            }
+            fclose(sf);
+            fprintf(stderr, "hengevm: syscalls total %llu, pending cpu0=%d cpu1=%d -> /tmp/svc_trace.txt\n",
+                    (unsigned long long) hv_svc_n, hv_svc_pending[0], hv_svc_pending[1]);
+        }
+    }
+    {
+        extern uint64_t hv_el0_trace_n, hv_el0_trace_first_va;
+        extern uint64_t hv_el0_trace_va[], hv_el0_trace_x16[];
+        fprintf(stderr, "hengevm: EL0 blocks total %llu, first va %#llx\n",
+                (unsigned long long) hv_el0_trace_n,
+                (unsigned long long) hv_el0_trace_first_va);
+        uint64_t n = hv_el0_trace_n < 16384 ? hv_el0_trace_n : 16384;
+        uint64_t base = hv_el0_trace_n - n;
+        FILE *tf = fopen("/tmp/el0_trace.txt", "w");
+        if (tf) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t slot = (base + i) & 16383u;
+                fprintf(tf, "%llu %#llx %#llx\n",
+                        (unsigned long long) (base + i),
+                        (unsigned long long) hv_el0_trace_va[slot],
+                        (unsigned long long) hv_el0_trace_x16[slot]);
+            }
+            fclose(tf);
+            fprintf(stderr, "hengevm: wrote %llu EL0 blocks -> /tmp/el0_trace.txt\n",
+                    (unsigned long long) n);
+        }
+    }
+    /* Which processes exist right now.  "userland stopped" has two very different meanings: the
+       process blocked (it is still in the list, waiting on something) or it exited or was killed
+       (it is gone, and nothing else is left to run).  The page dump cannot tell them apart, and
+       this runs before the fast paths below return. */
+    scan_proc_names();
+    extern uint64_t hv_last_el0_ttbr0, hv_last_el0_page_va, hv_last_el0_page_pa;
+    extern uint64_t hv_last_el0_x0, hv_last_el0_x22, hv_last_el0_x23, hv_last_el0_lr, hv_last_el0_sp;
+    fprintf(stderr, "hengevm: last EL0 block %#llx (ttbr0 %#llx, page %#llx -> pa %#llx)\n",
+            (unsigned long long) last, (unsigned long long) hv_last_el0_ttbr0,
+            (unsigned long long) hv_last_el0_page_va, (unsigned long long) hv_last_el0_page_pa);
+    fprintf(stderr, "hengevm:   x0=%#llx x22=%#llx x23=%#llx lr=%#llx sp=%#llx\n",
+            (unsigned long long) hv_last_el0_x0, (unsigned long long) hv_last_el0_x22,
+            (unsigned long long) hv_last_el0_x23, (unsigned long long) hv_last_el0_lr,
+            (unsigned long long) hv_last_el0_sp);
+    {
+        extern uint64_t hv_last_el0_x16, hv_last_el0_x1, hv_last_el0_x2, hv_last_el0_x3,
+            hv_last_el0_x8;
+        fprintf(stderr, "hengevm:   SYSCALL x16=%llu (%#llx) x0=%#llx x1=%#llx x2=%#llx x3=%#llx x8=%#llx\n",
+                (unsigned long long) hv_last_el0_x16, (unsigned long long) hv_last_el0_x16,
+                (unsigned long long) hv_last_el0_x0, (unsigned long long) hv_last_el0_x1,
+                (unsigned long long) hv_last_el0_x2, (unsigned long long) hv_last_el0_x3,
+                (unsigned long long) hv_last_el0_x8);
+    }
+    /* Preferred path: the physical page was resolved while the mapping still existed.  Walking
+       the tables now fails as soon as the owning process exits, which is exactly what happens
+       when launchd's startup fails. */
+    if (hv_last_el0_page_pa) {
+        static uint8_t pbuf[0x4000];
+        if (hv_phys_read(&g_machine, hv_last_el0_page_pa, pbuf, sizeof pbuf) == 0) {
+            char ppath[128];
+            snprintf(ppath, sizeof ppath, "/tmp/el0_page_%llx.bin",
+                     (unsigned long long) hv_last_el0_page_va);
+            FILE *pf = fopen(ppath, "wb");
+            if (pf) {
+                fwrite(pbuf, 1, sizeof pbuf, pf);
+                fclose(pf);
+                fprintf(stderr, "hengevm: dumped 16KB (from pa) at %#llx -> %s\n",
+                        (unsigned long long) hv_last_el0_page_va, ppath);
+            }
+        } else {
+            fprintf(stderr, "hengevm: physical read at pa %#llx failed\n",
+                    (unsigned long long) hv_last_el0_page_pa);
+        }
+        return;
+    }
+    uint64_t base = last & ~0x3fffull;
+    /* Walk using the address space that was live when that block ran: the CPU is on the idle
+       thread now, whose TTBR0 has no launchd mappings at all. */
+    HvCpu *probe = calloc(1, sizeof *probe);
+    if (!probe) return;
+    memcpy(probe, &g_cpus[0], sizeof *probe);
+    probe->ttbr0_el1 = hv_last_el0_ttbr0;
+    for (int pg = -1; pg <= 1; pg++) {
+        uint64_t va = base + (uint64_t)(pg * 0x4000);
+        static uint8_t buf[0x4000];
+        int bad = 0;
+        for (unsigned off = 0; off < sizeof buf; off += 0x1000) {
+            HvWalk w;
+            hv_mmu_walk(probe, va + off, HV_ACC_READ, 0, &w);
+            if (w.fsc || hv_phys_read(&g_machine, w.pa, buf + off, 0x1000) != 0) { bad = 1; break; }
+        }
+        if (bad) { fprintf(stderr, "hengevm: page %#llx not mapped\n", (unsigned long long) va); continue; }
+        char path[128];
+        snprintf(path, sizeof path, "/tmp/el0_%llx.bin", (unsigned long long) va);
+        FILE *f = fopen(path, "wb");
+        if (!f) continue;
+        fwrite(buf, 1, sizeof buf, f);
+        fclose(f);
+        fprintf(stderr, "hengevm: dumped 16KB at %#llx -> %s\n", (unsigned long long) va, path);
+    }
+    free(probe);
+}
+
 void hv_android_scan_procs(void) {
     scan_proc_names();
     scan_kernel_log();
     hv_trace_dump();
+    dump_last_el0();
     /* Did the boot ever run a kext? __PRELINK_TEXT holds every device driver on this platform, so
        kext=0 with kernel>0 means the boot never got as far as driving a device -- which is what the
        mmio histogram (no pcie, no uart) already suggested. */

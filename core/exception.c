@@ -1,4 +1,32 @@
 #include "exception.h"
+#include "machine.h"
+
+/* The syscall log: see hv_exception_insn(). */
+#define HV_SVC_CAP 4096u
+uint64_t hv_svc_pc[HV_SVC_CAP];
+uint64_t hv_svc_x16[HV_SVC_CAP], hv_svc_x0[HV_SVC_CAP], hv_svc_x1[HV_SVC_CAP];
+uint32_t hv_svc_imm[HV_SVC_CAP], hv_svc_el[HV_SVC_CAP];
+uint64_t hv_svc_n;
+/* Set when a syscall traps and cleared when userland runs again: a syscall still pending at the
+   end is the one the kernel never returned from.  The value written on the way out is x0, which
+   is the result the caller got. */
+uint64_t hv_svc_ret[HV_SVC_CAP];
+/* The path of every open/execve, read out of the guest's own address space at the trap.  Which
+   file a process stops after opening is the difference between "it loaded its config and went
+   idle" and "it never found what it was looking for". */
+char hv_svc_path[HV_SVC_CAP][96];
+/* Per CPU: with two CPUs running, a single global "pending" is cleared by whichever CPU returns
+   to userland first, which is exactly the information the flag exists to preserve. */
+/* Only exceptions taken FROM userland, kept separately: the general ring above holds 128 entries
+   and the idle loop fills it with timer interrupts within milliseconds, so a userland fault is
+   overwritten long before anyone looks.  These are the ones that end a process. */
+#define HV_UEXC_CAP 64u
+uint64_t hv_uexc_n;
+uint64_t hv_uexc_elr[HV_UEXC_CAP], hv_uexc_far[HV_UEXC_CAP], hv_uexc_pc[HV_UEXC_CAP];
+uint32_t hv_uexc_esr[HV_UEXC_CAP], hv_uexc_type[HV_UEXC_CAP];
+
+int hv_svc_pending[HV_MAX_CPUS];
+uint64_t hv_svc_last_slot[HV_MAX_CPUS];
 
 #include <sched.h>
 #include <stdio.h>
@@ -52,6 +80,14 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
         HvExcRec *r = &hv_exc_ring[hv_exc_at++ & (HV_EXC_RING - 1)];
         r->elr = ret, r->far = far, r->sp = cpu->sp, r->esr = esr;
         r->el = (uint32_t) cpu->el, r->type = (uint32_t) type;
+    }
+    if (cpu->el == 0) {
+        uint64_t k = hv_uexc_n++ & (HV_UEXC_CAP - 1);
+        hv_uexc_elr[k] = ret;
+        hv_uexc_far[k] = far;
+        hv_uexc_pc[k] = cpu->pc;
+        hv_uexc_esr[k] = esr;
+        hv_uexc_type[k] = (uint32_t) type;
     }
     /* Every exception and interrupt the engine delivers, while diagnosing: a guest that ends up in
        its own vector with no log of how leaves nothing to go on. */
@@ -155,6 +191,25 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                mapped the page read-only on purpose or this walk is reading the wrong table.
                Nothing used to dump anything for these -- the diagnostics below keyed on
                translation faults -- and these are permission faults. */
+            /* An EL0 translation fault in the shared-cache / dylib window: walk the faulting
+               address through the guest's own tables. If this walk finds a valid mapping, then
+               the guest did map the page and the fault came from our fast path (stale TLB
+               entry), which is a different bug from "the page was never mapped". */
+            if (((esr >> 26) & 0x3f) == 0x24 && far >= 0x100000000ull && far < 0x110000000ull &&
+                cpu->m->log >= 2) {
+                static int n;
+                if (n < 10) {
+                    n++;
+                    FILE *saved0 = hv_walk_dbg;
+                    HvWalk fw;
+                    hv_walk_dbg = stderr;
+                    hv_mmu_walk(cpu, far, HV_ACC_READ, 0, &fw);
+                    hv_walk_dbg = saved0;
+                    fprintf(stderr, "hengevm: el0 fault far %llx walk: fsc 0x%x pa %llx L3 %llx\n",
+                            (unsigned long long) far, fw.fsc, (unsigned long long) fw.pa,
+                            (unsigned long long) fw.table);
+                }
+            }
             if ((esr & 0x3c) == 0x0c && cpu->m->log >= 2) {
                 FILE *saved = hv_walk_dbg;
                 HvWalk fw;
@@ -378,14 +433,21 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                  * and the translation dropped it, or the memory itself held a host address.
                  */
                 {
-                    uint64_t at = cpu->x[0] + 0x1C0, word = 0;
-                    HvWalk ww;
-                    hv_mmu_walk(cpu, at, HV_ACC_READ, 0, &ww);
-                    if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 8) == 0)
-                        fprintf(stderr, "hengevm: [x0+0x1c0] = %016llx (pa %llx)\n",
-                                (unsigned long long) word, (unsigned long long) ww.pa);
-                    else
-                        fprintf(stderr, "hengevm: [x0+0x1c0] unreadable (fsc %u)\n", ww.fsc);
+                    /* This probe was written for one specific EL0 fault; running it on every
+                       fault during a userland bring-up costs a page walk plus a line of stderr
+                       per page-in, which dominates the run.  Keep it behind an explicit switch
+                       (or -v log level 3) and cap it, so a normal run pays nothing. */
+                    static int shown;
+                    if ((cpu->m->log >= 3 || getenv("HV_EL0_DUMP")) && shown++ < 8) {
+                        uint64_t at = cpu->x[0] + 0x1C0, word = 0;
+                        HvWalk ww;
+                        hv_mmu_walk(cpu, at, HV_ACC_READ, 0, &ww);
+                        if (ww.fsc == 0 && hv_phys_read(cpu->m, ww.pa, &word, 8) == 0)
+                            fprintf(stderr, "hengevm: [x0+0x1c0] = %016llx (pa %llx)\n",
+                                    (unsigned long long) word, (unsigned long long) ww.pa);
+                        else
+                            fprintf(stderr, "hengevm: [x0+0x1c0] unreadable (fsc %u)\n", ww.fsc);
+                    }
                 }
                 /*
                  * The executed path, not the bytes before it. A linear window before the fault
@@ -861,6 +923,35 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         hv_debug_args(cpu);
     }
     if (opc == 0 && ll == 1) { /* SVC: ELR is the next instruction */
+        /* Every syscall the guest makes, in order.  A trajectory of block addresses says where
+           userland was but not what it asked for; the failures that matter ("launchd died") are
+           visible only here, as one call whose result the caller never accepted.  Eight stores per
+           syscall is nothing next to the trap itself. */
+        {
+            uint64_t slot = hv_svc_n++ & (HV_SVC_CAP - 1);
+            hv_svc_pc[slot] = pc;
+            hv_svc_imm[slot] = imm16;
+            hv_svc_x16[slot] = cpu->x[16];
+            hv_svc_x0[slot] = cpu->x[0];
+            hv_svc_x1[slot] = cpu->x[1];
+            hv_svc_el[slot] = cpu->el;
+            hv_svc_ret[slot] = 0;
+            hv_svc_path[slot][0] = 0;
+            if (imm16 == 0x80 && (cpu->x[16] == 5 || cpu->x[16] == 59 || cpu->x[16] == 338)) {
+                uint64_t va = cpu->x[0];
+                int k = 0;
+                for (; k < 95; k++) {
+                    uint8_t ch = 0;
+                    HvWalk w;
+                    hv_mmu_walk(cpu, va + (uint64_t) k, HV_ACC_READ, (int) cpu->el, &w);
+                    if (w.fsc || hv_phys_read(cpu->m, w.pa, &ch, 1) || ch == 0) break;
+                    hv_svc_path[slot][k] = (char) ch;
+                }
+                hv_svc_path[slot][k] = 0;
+            }
+            hv_svc_last_slot[cpu->index] = slot;
+            hv_svc_pending[cpu->index] = 1;
+        }
         hv_take_exception(cpu, HV_EXC_SYNC, HV_EC_SVC64 << 26 | 1u << 25 | imm16, 0, 0, pc + 4);
         return 1;
     }

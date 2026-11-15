@@ -18,6 +18,37 @@
 #include "sysreg.h"
 #include "translate.h"
 
+/* Where userland was when it last ran, kept at zero cost: one store per block.  A full
+   HV_TRACE_PC buffer is only needed to replay history; when all that is wanted is "where was
+   userland when it stopped", paying 8 bytes per block doubles the runtime of a restore that
+   already takes minutes.  hv_last_el0_ttbr0 is the address space that was live at that moment:
+   the page cannot be read later from the idle CPU, which runs a kernel thread with no user
+   mappings at all. */
+uint64_t hv_last_el0_va;
+uint64_t hv_last_el0_ttbr0;
+/* The physical page holding that block, resolved while the mapping was still live.  Walking the
+   page tables afterwards does not work: the process that owned the address space (launchd) exits
+   when its startup fails, its tables are freed, and the translation is gone by the time anyone
+   looks.  One walk per userland page (not per block) keeps this free. */
+uint64_t hv_last_el0_page_va;
+uint64_t hv_last_el0_page_pa;
+/* A handful of registers from the last userland block, captured per page change rather than per
+   block.  The final block in the trace is a dyld jump stub whose destination is computed from
+   x22/x23, so without these the page content alone cannot say where control went. */
+uint64_t hv_last_el0_x0, hv_last_el0_x22, hv_last_el0_x23, hv_last_el0_lr, hv_last_el0_sp;
+/* x16 carries the Darwin syscall number, and x0..x3 its first arguments: the stop happens on an
+   svc, so these are what identify the call the kernel never returned from. */
+uint64_t hv_last_el0_x16, hv_last_el0_x1, hv_last_el0_x2, hv_last_el0_x3, hv_last_el0_x8;
+
+/* The whole EL0 trajectory, not just its tail.  "Where did userland stop" is useless on its own:
+   the answer is always "on some syscall", and what matters is which calls led there.  Two stores
+   per userland block keeps this affordable; the last 16K blocks are enough to see the failure. */
+#define HV_EL0_TRACE_CAP 16384u
+uint64_t hv_el0_trace_va[HV_EL0_TRACE_CAP];
+uint64_t hv_el0_trace_x16[HV_EL0_TRACE_CAP];
+uint64_t hv_el0_trace_n;         /* total EL0 blocks ever run */
+uint64_t hv_el0_trace_first_va;  /* the first one: the process entry point */
+
 void hv_flush_blocks(HvMachine *m) {
     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
     if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
@@ -2347,6 +2378,62 @@ static int run_loop(HvCpu *cpu, int one) {
                 dc_last = v;
             }
         }
+        /* HV_WATCH=<lo>:<hi> -- stop the host process (SIGSTOP) the first time the guest runs a
+           block whose pc is in that range.  A JIT never returns to host C code between guest
+           instructions, so an ordinary debugger breakpoint cannot observe guest registers; pausing
+           the process at a known guest pc is the equivalent, and gdb can then be attached and
+           told to read the HvCpu (`g_cpus[0]`) of the thread it stops in. */
+        {
+            static uint64_t w_lo, w_hi;
+            static int w_read, w_hit;
+            if (!w_read) {
+                const char *w = getenv("HV_WATCH");
+                w_read = 1;
+                if (w && *w) {
+                    w_lo = strtoull(w, (char **) &w, 16);
+                    if (w && *w == ':') w_hi = strtoull(w + 1, 0, 16);
+                    else w_hi = w_lo;
+                }
+            }
+            /* Compare the low 32 bits, the way every pc in the log is printed: kernel addresses
+               are 0xfffffe00xxxxxxxx and userland ones are below 2 GB, so one range covers both. */
+            if (w_lo && !w_hit && cpu->index == 0 &&
+                (uint32_t) cpu->pc >= (uint32_t) w_lo && (uint32_t) cpu->pc <= (uint32_t) w_hi) {
+                w_hit = 1;
+                fprintf(stderr, "hengevm: HV_WATCH break at guest pc %#llx (el %u, pid %d)\n",
+                        (unsigned long long) cpu->pc, (unsigned) cpu->el, (int) getpid());
+                for (int r = 0; r < 31; r += 4) {
+                    fprintf(stderr, "hengevm:  %s x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
+                            "watch", r, (unsigned long long) cpu->x[r],
+                            r + 1, (unsigned long long) cpu->x[r + 1],
+                            r + 2, (unsigned long long) cpu->x[r + 2],
+                            r + 3, (unsigned long long) cpu->x[r + 3]);
+                }
+                fprintf(stderr, "hengevm:  watch sp=%#llx lr=%#llx pc=%#llx el=%u ttbr0=%#llx\n",
+                        (unsigned long long) cpu->sp, (unsigned long long) cpu->x[30],
+                        (unsigned long long) cpu->pc, (unsigned) cpu->el,
+                        (unsigned long long) cpu->ttbr0_el1);
+                /* The stack, in the guest's own address space: the saved return addresses are what
+                   turn a bare pc into a call chain. */
+                if (cpu->sp) {
+                    for (int k = 0; k < 12; k++) {
+                        uint64_t va = cpu->sp + (uint64_t) k * 8, w = 0;
+                        HvWalk sw;
+                        hv_mmu_walk(cpu, va, HV_ACC_READ, 0, &sw);
+                        int r = sw.fsc ? -1 : hv_phys_read(cpu->m, sw.pa, &w, 8);
+                        if (r) fprintf(stderr, "hengevm:  watch [sp+%2d] unreadable (fsc %u)\n",
+                                       k * 8, sw.fsc);
+                        else fprintf(stderr, "hengevm:  watch [sp+%2d] = %#018llx\n", k * 8,
+                                    (unsigned long long) w);
+                    }
+                }
+                if (getenv("HV_WATCH_ATTACH")) {
+                    fprintf(stderr, "hengevm:  HV_WATCH stopped; kill -CONT %d to resume\n",
+                            (int) getpid());
+                    raise(SIGSTOP);
+                }
+            }
+        }
         /* A one-shot dump at a pc chosen from outside (HV_PCHK=start:end): an inline check keeps
            its operands in registers, and by the time it panics and the fault is seen they are
            gone, so this is the only place the arguments can still be read. */
@@ -2532,6 +2619,47 @@ static uint32_t pc_hist_at[HV_MAX_CPUS];
 
 void hv_pc_hist_note(HvCpu *cpu) {
     if (!cpu) return;
+    /* el == 0 and no address test.  Both halves of the obvious test are wrong: the kernel also
+       runs below 4 GB (it executes kernelcache pages at their physical address early in boot), so
+       an address-only filter records EL1 blocks as userland; and macOS user code starts at
+       0x100000000, so an address filter also throws away real userland -- launchd included. */
+    if (cpu->el == 0) {
+        /* Back in userland: whatever x0 holds is the result of the syscall that trapped. */
+        {
+            extern uint64_t hv_svc_ret[], hv_svc_last_slot[];
+            extern int hv_svc_pending[];
+            if (cpu->index < HV_MAX_CPUS && hv_svc_pending[cpu->index]) {
+                hv_svc_ret[hv_svc_last_slot[cpu->index]] = cpu->x[0];
+                hv_svc_pending[cpu->index] = 0;
+            }
+        }
+        hv_last_el0_va = cpu->pc;
+        hv_last_el0_ttbr0 = cpu->ttbr0_el1;
+        uint64_t pg = cpu->pc & ~0x3fffull;
+        if (pg != hv_last_el0_page_va) {
+            HvWalk w;
+            hv_last_el0_page_va = pg;
+            hv_mmu_walk(cpu, pg, HV_ACC_EXEC, 0, &w);
+            hv_last_el0_page_pa = w.fsc ? 0 : w.pa;
+        }
+        /* Registers every block, not every page: the stub that matters is at a fixed offset inside
+           its page, so a page-granular snapshot shows the values from wherever in that page control
+           entered, not from the block that actually stopped.  Five stores. */
+        hv_last_el0_x0 = cpu->x[0];
+        hv_last_el0_x22 = cpu->x[22];
+        hv_last_el0_x23 = cpu->x[23];
+        hv_last_el0_lr = cpu->x[30];
+        hv_last_el0_sp = cpu->sp_el0;
+        hv_last_el0_x16 = cpu->x[16];
+        hv_last_el0_x1 = cpu->x[1];
+        hv_last_el0_x2 = cpu->x[2];
+        hv_last_el0_x3 = cpu->x[3];
+        hv_last_el0_x8 = cpu->x[8];
+        if (hv_el0_trace_n == 0) hv_el0_trace_first_va = cpu->pc;
+        uint64_t slot = hv_el0_trace_n++ & (HV_EL0_TRACE_CAP - 1);
+        hv_el0_trace_va[slot] = cpu->pc;
+        hv_el0_trace_x16[slot] = cpu->x[16];
+    }
     hv_pc_hist_note_va(cpu->index, cpu->pc);
 }
 
@@ -2558,6 +2686,20 @@ static uint64_t *trace_buf;
 static uint32_t trace_cap, trace_n;
 static int trace_on = -1;
 void hv_trace_dump(void);
+
+
+/* The last N recorded block addresses below `limit`.  Used after the guest has stopped: walking
+   the trace backwards for the final userspace block tells the debugger which instruction dyld
+   was in when it handed control to the kernel for the last time, without needing a symbol file
+   or a live debugger.  Returns how many were written. */
+int hv_trace_last_below(uint64_t limit, uint64_t *out, int n) {
+    if (!trace_on || !trace_buf || !trace_n || n <= 0) return 0;
+    int got = 0;
+    for (uint32_t i = trace_n; i-- > 0 && got < n; ) {
+        if (trace_buf[i] < limit) out[got++] = trace_buf[i];
+    }
+    return got;
+}
 void hv_trace_note(uint64_t va) {
     if (trace_on < 0) {
         const char *e = getenv("HV_TRACE_PC");
@@ -2587,10 +2729,26 @@ void hv_trace_dump(void) {
 
 void hv_pc_hist_note_va(int index, uint64_t va) {
     if (index < 0 || index >= HV_MAX_CPUS) return;
+    /* hv_pc_hist_note() records the va, its address space and its physical page; this entry
+       point only carries the va, so leave everything else to that path. */
     hv_seg_note(va);
     hv_trace_note(va);
     uint32_t i = pc_hist_at[index]++ & (PC_HIST - 1);
     pc_hist[index][i] = va;
+}
+
+/* The last n blocks this CPU ran, oldest first.  When the guest stops, the tail of that ring is
+   the only record of what the kernel was doing: the EL0 side says which syscall never returned,
+   and this says where inside the kernel it is stuck. */
+int hv_pc_hist_export(int index, uint64_t *out, int n) {
+    if (index < 0 || index >= HV_MAX_CPUS || n <= 0) return 0;
+    uint32_t at = pc_hist_at[index];
+    if (at == 0) return 0;
+    int cnt = (int) (at < PC_HIST ? at : PC_HIST);
+    if (n > cnt) n = cnt;
+    for (int i = 0; i < n; i++)
+        out[i] = pc_hist[index][(at - (uint32_t) n + (uint32_t) i) & (PC_HIST - 1)];
+    return n;
 }
 
 uint64_t hv_pc_hist_last(int index) {
