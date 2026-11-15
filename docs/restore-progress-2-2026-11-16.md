@@ -370,3 +370,50 @@ MSI 地址写数据」，落点是 `VMAPPLE_GIC_MSI`（`0x1fff0000`）那个 gic
 `hv_mmio_lookup()` + 该区间的 write 回调即可，不需要绕过 MMIO。
 
 只对 `106b:1a01` 打开（`virtio-input` 现在的路径是通的，不要动它）。
+
+## 15. 更正与再收窄（MSI 基础设施其实是通的）
+
+### 15.1 两处错误判断，先纠正
+
+1. **「gic-msi 帧被访问 0 次」是 grep 错前缀**。MMIO 直方图里明确有
+   `gic-msi +0x0008 r 1 w 0` —— guest **确实**读了 MSI 帧的 type 寄存器，
+   说明 `AppleVirtualPlatformPCIEMSIController` **被创建了**。
+2. 因此「MSI controller 没起来」不成立；相应的 §14 结论要从「根因」降级为
+   「必要但不充分」。
+
+### 15.2 init 的实际条件（反汇编 `AppleVirtualPlatformPCIEMSIController::init`，`0x906a4c8`）
+
+```
+cbz  x1, <fail>                     ; provider 必须非 NULL
+blraa [provider+0x308], "msi-frame-index"   ; 取 DT 属性
+cbz  x0, <fail>                     ; 属性必须存在（我们的 DT 有：msi-frame-index = 2）
+...
+ldr  x23, [x19+0xc0] ; str x0,[x19+0xc0]    ; 保存/替换 MSI 内存映射
+...
+blraa [provider+0x710], index, 0    ; 初始化
+```
+
+创建后读 `gic-msi +0x8`：我们返回 `1<<31 | 96<<16 | 64` = `0x80600040`
+→ base INTID 96、**上限 64 个向量**，`addDeviceInterruptProperties` 的
+`cmp w8,w2 / b.ls` 不会挡住 2 个队列。
+
+### 15.3 所以剩下的唯一闸门
+
+`AppleVirtIOPCITransport::findNextMSIInterruptIndex`（`0x902450c`）里
+`blraa [provider+0x738]`（provider = IOPCIDevice，x0=索引，x2=输出），
+**返回非 0 即失败**。这个 `+0x738` 是对象虚表内的槽位，静态无法映射到符号名，
+需要运行期证据：
+
+- 在 `devices/pcie.c` 的 `ecam_read` 里对 vusb 的 `0x80..0x9f`（MSI cap 区）打印，
+  确认 `IOPCIDevice` 到底有没有读我们新加的 MSI capability；不依赖 `HV_PCI_LOG` 的 slot 参数
+- 若从未读 → cap 链没被遍历到（检查 `0x71` 的 next 指针与 `wmask`）
+- 若读了但值不对 → 修 cap 内容，再跑
+
+### 15.4 现状（宿主与设备一致）
+
+```
+vusb-cfg: status = 0x0 → 0x1(ACKNOWLEDGE) → 读 status → 停
+gic-msi: +0x8 读过一次，门铃 +0x40 从未写（没有 MSI 中断发生）
+```
+
+宿主（glibc）与设备（bionic，Android CLI 已重建）**逐行一致**。
