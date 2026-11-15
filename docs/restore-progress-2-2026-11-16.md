@@ -1282,3 +1282,46 @@ launchd (RunAtLoad)
 **结论：`restored_external` 没有成功走到 `_IOUSBDeviceControllerSetDescription`。**
 下一步查它是否被 launchd 启动、以及 `IOUSBDeviceControllerCreate` 的返回值
 （`IOUSBDeviceControllerCreate failed: 0x%x` 会打到 console）。
+
+## 35. `restored_external` 的前置条件只有 "IOUSBDeviceController 服务存在"，但它没被启动
+
+### 35.1 从二进制看它做什么（字符串 + 依赖）
+
+```
+IOUSBDeviceControllerCreate failed: 0x%x        → 创建 controller 的 user client
+IOUSBDeviceControllerSendCommand failed: 0x%x
+standardRestore                                  → 应用 USBDeviceConfiguration.plist 里的配置
+RestoredMuxMessage / RestoredMuxSocketConnection  → 之后走 AppleUSBMux 与 host 通信
+USBLog
+```
+
+即：它先 `_IOUSBDeviceControllerCreate` → `_IOUSBDeviceControllerSetDescription(standardRestore)`，
+内核据此构建 USB 设备（含 `AppleUSBMux`/`AppleUSBNCM*` 接口），随后 host 才能通过 mux 通信。
+
+**前置条件**就是"内核里有 `IOUSBDeviceController` 这个 IOService"。实测该服务存在
+（`AppleVirtIOUSBDeviceController` 已 start，`prepareDefaults` 已打印），所以创建本该成功。
+
+（顺带：它的 39 个动态库依赖在 ramdisk 中逐一核对，0 缺失。）
+
+### 35.2 但它没有运行
+
+判据：
+
+- 它的 launchd 配置是 `RunAtLoad=true`、`StandardOutPath=/dev/console`
+- guest 的 userland console **确实能到串口**（能看到 `hello: hello from launchd.1`、
+  `ignition sequence complete` 这类 libignition/launchd 的用户态输出）
+- 而所有运行日志里 **没有** 任何 `restored_external` / `USBLog` /
+  `IOUSBDeviceControllerCreate failed` 字样
+
+### 35.3 结论与下一步
+
+问题已经推进到"launchd 层"：`restored_external` 这个 LaunchDaemon 没有被执行。
+
+下一步应确认：
+1. launchd 是否加载了 ramdisk 里的 `System/Library/LaunchDaemons/*.plist`
+   （会话类型 / `LimitLoadToSessionType` / ramdisk 的 launchd 配置差异）
+2. 若尝试执行但失败，失败原因（代码签名 / AMFI、`POSIXSpawnType=Interactive` 的限制等）
+3. 我们的内核模拟是否缺少它启动所需的某个服务/设备（例如它先要等某个内核服务上线）
+
+注意：这条链与 vusb 设备模型无关 —— 设备模型一侧该做的（PCI、virtio 通知、MSI、INTx）
+已经就位，缺的是 guest 用户态不去驱动它。
