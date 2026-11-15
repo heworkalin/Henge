@@ -178,15 +178,23 @@ static void load_segment(HvXhci *x, struct HvXhciIntr *it) {
 
 static void event_to(HvXhci *x, int target, uint64_t param, uint32_t status, uint32_t control) {
     struct HvXhciIntr *it = &x->intr[target < HV_XHCI_INTRS ? target : 0];
-    if (!it->erstsz || !it->seg_size) return;
-    /* The controller writes at the software's dequeue pointer. Keep the index in step with
-       ERDP: once the driver consumes an event it advances ERDP, and an index that only ever
-       increments would then write into a slot already consumed, where the cycle bit no longer
-       matches and the event is invisible ("command did not generate an event"). */
-    if (it->erdp >= it->seg_base && it->erdp < it->seg_base + 16ull * it->seg_size) {
-        it->index = (uint32_t)((it->erdp - it->seg_base) / 16);
+    if (!it->erstsz || !it->seg_size) {
+        /* An event that cannot be written is silently lost by design (no segment table yet),
+           but on a boot that expects completions it is worth naming once. */
+        static int warned;
+        if (!warned && getenv("HV_XHCI_LOG")) {
+            warned = 1;
+            fprintf(stderr, "xhci: event dropped: erstsz %u seg_size %u erstba %llx seg_base %llx\n",
+                    it->erstsz, it->seg_size, (unsigned long long)it->erstba,
+                    (unsigned long long)it->seg_base);
+        }
+        return;
     }
     uint32_t trb[4] = {(uint32_t)param, (uint32_t)(param >> 32), status, (control & ~1u) | (uint32_t)it->pcs};
+    if (xlog())
+        fprintf(stderr, "xhci: event -> base %llx idx %u pcs %u ctl %08x (erdp %llx)\n",
+                (unsigned long long)it->seg_base, it->index, it->pcs, trb[3],
+                (unsigned long long)it->erdp);
     wr(x, it->seg_base + 16ull * it->index, trb, 16);
     if (++it->index == it->seg_size) { /* next segment, or wrap and flip the cycle */
         if (++it->seg_index >= it->erstsz) {
