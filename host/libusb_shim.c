@@ -73,19 +73,40 @@ static void dev_unref(struct libusb_device *d) {
 }
 
 /* Read the descriptors of a fresh connection. */
+/* How long an enumeration may hold the event path (tests/test_usb_link.c measures this).
+   The reset is only a courtesy: the boot ROM and iBEC answer it, the restore kernel's
+   AppleVirtIOUSBDeviceController consumes it and never replies, and neither needs it for the
+   descriptor reads that follow. At the old 2000 ms the unanswered reset blocked
+   libusb_handle_events() -- and with it every queued transfer completion -- for two seconds per
+   attempt, which is what made the host look hung (all threads parked on one mutex) instead of
+   simply waiting for the restore-mode device. */
+#define SHIM_RESET_TIMEOUT_MS 150
+#define SHIM_DESC_TIMEOUT_MS  500
+
+/* No vendor reset before the descriptor reads. It is not needed for them, and after the handoff
+   it is actively harmful: the restore kernel's device end (a standard packet-level controller)
+   stops posting receive buffers when it gets one, so every later GET_DESCRIPTOR sits in the
+   request ring unanswered and enumeration fails forever. The boot ROM and iBEC did answer it,
+   which is why this only shows up once the kernel is running (HV_RESET_ENUM=1 restores the old
+   behaviour for comparison). */
+static int enum_wants_reset(void) {
+    return getenv("HV_RESET_ENUM") != NULL;
+}
+
 static struct libusb_device *enumerate(uint32_t session) {
-    if (hv_usb_reset(g_usb, 2000) != 0) return NULL;
+    if (enum_wants_reset() && hv_usb_reset(g_usb, SHIM_RESET_TIMEOUT_MS) != 0 && g_log)
+        fprintf(stderr, "libusb shim: reset got no reply, enumerating anyway\n");
     struct libusb_device *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->refs = 1;
     d->session = session;
-    if (hv_usb_control(g_usb, 0x80, 6, 0x100, 0, &d->desc, 18, 2000) != 18) goto fail;
+    if (hv_usb_control(g_usb, 0x80, 6, 0x100, 0, &d->desc, 18, SHIM_DESC_TIMEOUT_MS) != 18) goto fail;
     for (int i = 0; i < d->desc.bNumConfigurations && i < 8; i++) {
         uint8_t head[9];
-        if (hv_usb_control(g_usb, 0x80, 6, (uint16_t)(0x200 | i), 0, head, 9, 2000) < 4) goto fail;
+        if (hv_usb_control(g_usb, 0x80, 6, (uint16_t)(0x200 | i), 0, head, 9, SHIM_DESC_TIMEOUT_MS) < 4) goto fail;
         uint16_t total = (uint16_t)(head[2] | head[3] << 8);
         d->configs[i] = malloc(total);
-        if (!d->configs[i] || hv_usb_control(g_usb, 0x80, 6, (uint16_t)(0x200 | i), 0, d->configs[i], total, 2000) != total)
+        if (!d->configs[i] || hv_usb_control(g_usb, 0x80, 6, (uint16_t)(0x200 | i), 0, d->configs[i], total, SHIM_DESC_TIMEOUT_MS) != total)
             goto fail;
         d->config_len[i] = total;
     }
@@ -121,12 +142,38 @@ static void fire(struct libusb_device *d, int event) {
     for (int i = 0; i < n; i++) list[i]->cb(NULL, d, (libusb_hotplug_event)event, list[i]->user);
 }
 
+/* Failed enumerations are retried from the event loop, which runs often (usbmuxd polls in the
+   milliseconds). Without a floor, a guest that is not ready yet -- the restore kernel's device
+   end still booting -- would have every event call spend its whole descriptor timeout enumerating
+   again, and the completion queue would never drain. */
+#define SHIM_ENUM_RETRY_MS 250.0
+
+static double shim_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec * 1000.0 + (double) ts.tv_nsec / 1e6;
+}
+
+static double g_last_enum_fail;
+
 /* Bring g_dev up to date with the guest: called from the device list and the
    event loop. */
 static void refresh(void) {
     if (!g_usb) return;
     uint32_t session;
     int on = hv_vusb_online(g_usb, &session);
+    /* The bus going off without a device is the difference between "the guest is re-initialising
+       its USB controller" and "enumeration is failing"; without this line the two look the same
+       from the host (no device, no events). */
+    static int last_on = -1;
+    static uint32_t last_session;
+    if (on != last_on || session != last_session) {
+        if (g_log)
+            fprintf(stderr, "libusb shim: guest bus %s, session %u (was %u)\n",
+                    on ? "on" : "off", session, last_session);
+        last_on = on;
+        last_session = session;
+    }
     pthread_mutex_lock(&g_mu);
     struct libusb_device *old = g_dev;
     int stale = old && (!on || old->session != session);
@@ -150,12 +197,18 @@ static void refresh(void) {
     pthread_mutex_lock(&g_mu);
     int still = !g_dev;
     pthread_mutex_unlock(&g_mu);
-    if (still) d = enumerate(session);
+    if (still && shim_now_ms() - g_last_enum_fail >= SHIM_ENUM_RETRY_MS) d = enumerate(session);
+    if (still && !d) {
+        pthread_mutex_unlock(&enum_mu);
+        return;                     /* tried and failed (or backing off): nothing to report */
+    }
     if (d) {
         pthread_mutex_lock(&g_mu);
         g_dev = d;
         pthread_mutex_unlock(&g_mu);
         fire(d, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED);
+    } else if (still) {
+        g_last_enum_fail = shim_now_ms();
     }
     pthread_mutex_unlock(&enum_mu);
 }

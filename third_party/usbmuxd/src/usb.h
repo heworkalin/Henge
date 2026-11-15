@@ -52,6 +52,14 @@
 #define PID_APPLE_T2_COPROCESSOR 0x8600
 #define PID_APPLE_SILICON_RESTORE_LOW 0x1901
 #define PID_APPLE_SILICON_RESTORE_MAX 0x1905
+/* HengeVM: the virtual Mac exposes itself in restore mode as an Apple device with one of these
+   product IDs (0x1281 was what the guest reported). The upstream table only knows the
+   normal-mode range (0x1290..0x12af) and Apple Silicon restore (0x1901..0x1905), so without
+   this entry usb_device_add() returns early, usbmuxd never lists the device, and
+   idevicerestore's restore_check_mode() sees an empty device list and times out waiting for
+   "device in restore mode". */
+#define PID_APPLE_RESTORE_MODE_LOW 0x1280
+#define PID_APPLE_RESTORE_MODE_MAX 0x1283
 
 #define ENV_DEVICE_MODE "USBMUXD_DEFAULT_DEVICE_MODE"
 #define APPLE_VEND_SPECIFIC_GET_MODE 0x45

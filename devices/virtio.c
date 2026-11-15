@@ -41,8 +41,24 @@ static void reset(HvVirtio *v) {
     hv_pci_set_intx(&v->pci, 0);
 }
 
+/* HV_VIRTIO_CFG_LOG=1 traces what a driver asks the virtio transport, narrowly: only the USB
+   device (PCI 1af4:1052) and only its common configuration. The restore flow's handover is
+   exactly "did the kernel's AppleVirtIOUSBDeviceController get past prepareDefaults", so the
+   order of these accesses (device features -> status -> queue setup -> DRIVER_OK) says which
+   step it stopped at. */
+static int vtrace_usb(HvVirtio *v) {
+    static int on = -1;
+    if (on < 0) on = getenv("HV_VIRTIO_CFG_LOG") != NULL;
+    /* 106b:1a01 -- the USB device port. (1af4:1052 is virtio-input; tracing that one instead
+       shows the keyboard's driver, which resets for its own reasons and says nothing about the
+       restore handover.) */
+    return on && v->pci.config[0] == 0x6b && v->pci.config[1] == 0x10 &&
+           v->pci.config[2] == 0x01 && v->pci.config[3] == 0x1a;
+}
+
 static uint64_t common_read(HvVirtio *v, uint64_t off) {
     HvVirtq *q = v->qsel < v->nq ? &v->q[v->qsel] : NULL;
+    if (vtrace_usb(v)) fprintf(stderr, "vusb-cfg: read +%#llx\n", (unsigned long long) off);
     switch (off) {
     case 0x00: return v->dfsel;
     case 0x04: return v->dfsel < 2 ? (uint32_t)(v->features >> (32 * v->dfsel)) : 0;
@@ -85,11 +101,29 @@ static void common_write(HvVirtio *v, uint64_t off, uint64_t val, unsigned size)
         }
         break;
     case 0x14:
+        if (vtrace_usb(v)) {
+            /* Who wrote it: the guest PC, so the writer can be looked up in the kernelcache.
+               The ACKNOWLEDGE write is where the USB device controller stops, and knowing the
+               function that made it turns "somewhere in a kext" into a symbol. */
+            unsigned long long pc = 0;
+            if (v->m && v->m->cpu) pc = (unsigned long long) v->m->cpu->pc;
+            fprintf(stderr, "vusb-cfg: status = %#llx (pc %llx)\n", (unsigned long long) val, pc);
+        }
+        /* The USB device controller raises its interrupt line on a state change, as the hardware
+           does when a device is attached: AppleVirtIOUSBDeviceController writes ACKNOWLEDGE and
+           then leaves its start routine waiting for that event before it reads device features.
+           Without it the negotiation never proceeds past 0x1, the guest never enables a queue,
+           and the host has nothing to talk to (experiment, HV_VUSB_INTX=0 disables). */
+        if (vtrace_usb(v) && (val & 1) && !getenv("HV_VUSB_INTX")) {
+            hv_pci_set_intx(&v->pci, 1);
+            hv_pci_set_intx(&v->pci, 0);
+        }
         if ((uint8_t)val == 0) reset(v);
         else v->status = (uint8_t)val;
         break;
     case 0x16: v->qsel = (uint16_t)val; break;
     case 0x18:
+        if (vtrace_usb(v)) fprintf(stderr, "vusb-cfg: queue %u size = %llu\n", v->qsel, (unsigned long long) val);
         if (q && val && val <= HV_VIRTQ_MAX_SIZE && !(val & (val - 1))) q->size = (uint16_t)val;
         else if (q) /* the driver would index its rings by a size we do not use: say so */
             fprintf(stderr, "virtio %04x: queue %u size %llu refused (max %d)\n", v->pci.config[2] | v->pci.config[3] << 8,
@@ -97,7 +131,10 @@ static void common_write(HvVirtio *v, uint64_t off, uint64_t val, unsigned size)
         if (getenv("HV_VIRTIO_CFG_LOG"))
             fprintf(stderr, "virtio %04x: queue %u size %llu\n", v->pci.config[2] | v->pci.config[3] << 8, v->qsel, (unsigned long long)val);
         break;
-    case 0x1c: if (q) q->enabled = val & 1; break;
+    case 0x1c:
+        if (vtrace_usb(v)) fprintf(stderr, "vusb-cfg: queue %u enable = %llu\n", v->qsel, (unsigned long long) val);
+        if (q) q->enabled = val & 1;
+        break;
     case 0x20: case 0x24: if (q) set64(&q->desc, off, val, size); break;
     case 0x28: case 0x2c: if (q) set64(&q->avail, off, val, size); break;
     case 0x30: case 0x34: if (q) set64(&q->used, off, val, size); break;

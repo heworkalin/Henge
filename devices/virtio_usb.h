@@ -55,6 +55,7 @@ typedef struct HvVirtioUsb {
     int pci_on;                    /* the PCI front-end saw DRIVER_OK */
     int rom_on;                    /* the ROM's front-end (bdif) owns the port; off once the kernel's driver takes it */
     int log;
+    int nopost_logged;             /* the no-receive-buffer note was printed */
 } HvVirtioUsb;
 
 HvVirtioUsb *hv_virtio_usb_create(HvMachine *m, HvPcie *bus);
@@ -78,6 +79,7 @@ void hv_vusb_flush(HvVirtioUsb *d);
    over Apple's MMIO transport): connect or disconnect, take the next request
    (1 if there was one; free m->data), hand over a response. */
 void hv_vusb_set_online(HvVirtioUsb *d, int on);
+void hv_vusb_force_rescan(HvVirtioUsb *d); /* re-enumerate host-side, leave guest state alone */
 int hv_vusb_take_request(HvVirtioUsb *d, HvVusbMsg *m);
 void hv_vusb_put_response(HvVirtioUsb *d, uint8_t type, uint8_t ep, const void *data, uint32_t len);
 

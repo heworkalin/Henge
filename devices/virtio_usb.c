@@ -49,6 +49,28 @@ int hv_vusb_take_request(HvVirtioUsb *d, HvVusbMsg *m) {
     return got;
 }
 
+/* Make the host side re-enumerate without touching the guest's virtio state. set_online()
+   would also drop the in-flight request queues, which tears a virtio handshake in progress --
+   that is exactly what happened when the handoff bounce used it: the restore kernel's
+   AppleVirtIOUSBDeviceController printed prepareDefaults and then never enumerated, because
+   the queue it was filling got thrown away. A session bump is enough for host/libusb_shim.c
+   to report "device left" and enumerate the device again. */
+void hv_vusb_force_rescan(HvVirtioUsb *d) {
+    if (!d) return;
+    pthread_mutex_lock(&d->mu);
+    /* Hand the port over. rom_on marks "the boot ROM's front-end owns the port" and is otherwise
+       only cleared when the guest's virtio driver reports DRIVER_OK -- but the kernel's device
+       controller (AppleVirtIOUSBDeviceController) will not get that far while it thinks the ROM
+       still owns the port: it stops after prepareDefaults, never writes a queue, and every host
+       descriptor request goes unanswered. On real hardware the USB controller reset does this
+       handover. */
+    d->rom_on = 0;
+    d->session++;
+    pthread_cond_broadcast(&d->cv);
+    pthread_mutex_unlock(&d->mu);
+    if (d->log) fprintf(stderr, "virtio-usb: host-side rescan requested (session %u)\n", d->session);
+}
+
 void hv_vusb_set_online(HvVirtioUsb *d, int on) {
     pthread_mutex_lock(&d->mu);
     if (on || d->online) d->session++; /* coming on again is a new connection too */
@@ -91,7 +113,20 @@ static void deliver_requests(HvVirtioUsb *d) {
     while (d->out_head != d->out_tail) {
         HvVusbMsg *m = &d->out[d->out_head % HV_VUSB_RING];
         int r = hv_virtq_pop(v, REQQ, &e);
-        if (r <= 0) break;
+        if (r <= 0) {
+            /* Requests are queued but the guest has nothing posted to receive them: its device
+               side is not running (or enabled the ring but stopped posting). Distinguishes "the
+               host asked and nobody listened" from "the host never asked", which look the same
+               from the descriptor read timing out. */
+            if (!d->nopost_logged) {
+                d->nopost_logged = 1;
+                fprintf(stderr, "hengevm: virtio-usb: %u request(s) queued but the guest has no "
+                                "receive buffer posted (queue avail %u used %u)\n",
+                        d->out_tail - d->out_head, (unsigned)v->q[REQQ].last_avail, (unsigned)v->q[REQQ].size);
+            }
+            break;
+        }
+        d->nopost_logged = 0;
         uint32_t room = hv_virtq_writable(&e), payload = m->data ? m->len : 0;
         if (room < 6 + payload) {
             /* The guest sizes its buffers for the largest transfer it takes;

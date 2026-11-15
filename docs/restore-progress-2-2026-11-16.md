@@ -167,3 +167,100 @@ host: "Waiting for device to enter restore mode"      ✗ 5 分钟超时
    的下游症状：先修页映射，再看它是否自行恢复；不要同时改设备模型。
 5. Android 移植层还缺一块没触发但一定会挡的：`HV_HALT_RESET` → 重新引导
    （iOS 版有 `HENGE_VM_OUTCOME_RESTART`；`android/install.c` 收到 halt 直接停）。
+
+---
+
+# 第三轮补充（20:00）：el0 fault 被排除，卡点收窄到 vusb 的 ACKNOWLEDGE
+
+## 6. el0 translation fault 不是 bug（已排除）
+
+给 fault 的 `far` 加了一层 walk 输出后，判据很清楚：
+
+```
+far 102548000 walk: fsc 0x7 pa 0 L3 9cc58000          ← 首次访问：L3 未映射
+far 102548000 walk: fsc 0x0 pa 9d698000 L3 9cc58000   ← 同一地址第二次：已映射，pa 有效
+far 10254c008 walk: fsc 0x7 ... → fsc 0x0 pa 9d658008
+far 102550000 walk: fsc 0x7 ... → fsc 0x0 pa 9dbc8000
+```
+
+同一个地址第一次 translation fault、第二次 walk 成功 —— guest 的 fault handler 确实在
+page-in，我们的 MMU 也正确读到了新页表项。1655 次 fault 是 dyld 逐页加载 dylib 的正常过程
+（`far` 递增）。**「共享库映射失败」这条线到此关闭。**
+
+因此第二轮文档 §4 里「el0 fault 最像根因」的判断作废。
+
+## 7. 卡点收窄：vusb 的 virtio 协商停在 ACKNOWLEDGE
+
+给 virtio 的 common config 加 trace 后（`HV_VIRTIO_CFG_LOG=1`），两个设备的差别一目了然：
+
+| 设备 | 序列 |
+|---|---|
+| virtio-input `1af4:1052` | `status 0x1 → 0x3 → 读 features → 0xb → 设队列 → 0xf(DRIVER_OK) → reset`（协商完整） |
+| **vusb `106b:1a01`** | `status 0x0 → 0x1(ACKNOWLEDGE) → 读 status → 停`（**从未读 device features**） |
+
+（注意：`1af4:1052` 是 virtio-input，config 里那个字符串是 `HengeVM`；把 trace 对准 vusb
+需要匹配 `106b:1a01`。第一版 trace 就错在这里，看的是键盘的复位循环。）
+
+## 8. 反汇编定位（符号表可用）
+
+`AppleVirtIOUSBDeviceController` 不在 `AppleVirtIO`，而在
+**`com.apple.driver.AppleVirtualPlatform`**（kernelcache fileoff `0x3325b0`，
+`__TEXT_EXEC` vmaddr `0xfffffe000904ddd0`）；transport 在 `com.apple.driver.AppleVirtIO`
+（fileoff `0x32d7d0`）。两个 kext 都有完整符号表，关键符号：
+
+```
+AppleVirtIOUSBDeviceController::start                 0xfffffe000905b904
+AppleVirtIOUSBDeviceController::goOnBus               0xfffffe000905c16c
+AppleVirtIOUSBDeviceController::prepareConfiguration  0xfffffe000905cf8c
+AppleVirtIOUSBDeviceController::handleUSBReset        0xfffffe000905d77c
+AppleVirtIOUSBDeviceController::startNonIsocEndpoint  0xfffffe000905d57c
+AppleVirtIOPCITransport::start                        0xfffffe00090232b8
+AppleVirtIOPCITransport::configureQueueInterrupt      0xfffffe00090242fc
+AppleVirtIOPCITransport::assignInterruptAction        0xfffffe00090240f4
+AppleVirtIOPCITransport::findNextMSIInterruptIndex    0xfffffe000902450c
+AppleVirtIOPCITransport::usesMultipleInterruptVectors 0xfffffe00090245ec
+```
+
+`usesMultipleInterruptVectors()` 的判据（反汇编）：
+
+```asm
+ldrh w8, [x0, #0x132] ; cmp #1        → 必须是 1
+ldrh w8, [x0, #0x130] ; cmp 0x1af4    → 只对标准 virtio vendor 用多向量
+```
+
+vusb 的 vendor 是 **`106b`（Apple）**，所以它走**单向量 INTx**；键盘（`1af4`）走多向量且
+成功了。所以中断类型不是直接原因，但 `configureQueueInterrupt` / `assignInterruptAction`
+在 ACKNOWLEDGE 之后被调用，是 next candidate：我们的 `hv_pci_init` cap 链只有 virtio 的
+4 个 cap（common/ISR/device/notify），**没有 MSI(0x05) / MSI-X(0x11)**。
+
+`AppleVirtIOUSBDeviceController::start` 本身只做对象分配与虚调用（PAC 签名 `blraa`），
+virtio 初始化在父类（transport）里 —— 也就是 ACKNOWLEDGE 由 transport 写，写完后它调用的
+下一步失败，于是 `status=0` 重来。
+
+## 9. A/B 结论（宿主与设备逐行一致，排除平台）
+
+宿主（glibc）跑的 vusb 序列与设备（bionic）**逐行相同**：`status 0 → 0x1 → 停`。
+所以不是 Android 环境（bionic / 线程 / 4KB 页 / proot）的问题。
+
+- `core/translate.c` 换回 `origin/main` → 现象不变（排除 JIT 代码生成回归）
+- `core/exception.c` 换回上游 → **链接失败**（上游缺我们新增的 `hv_exc_ring`、
+  `hv_hvc_count`、`hv_hvc_last_pc` 等符号），这条 A/B 需要先补适配层
+- `devices/virtio.c`、`devices/pcie.c` 与上游**零差异**；`devices/virtio_usb.c` 只多本轮改动
+  → 设备模型不是回归源
+
+## 10. 下一步（按假设强度排序）
+
+1. **给 virtio PCI 加 MSI/MSI-X capability**（真实 virtio 设备都有；transport 里有
+   `findNextMSIInterruptIndex` / `configureQueueInterrupt`），看 vusb 是否越过 ACKNOWLEDGE。
+   这是反汇编直接支撑的假设，改动小。
+2. 若无效：确认 `AppleVirtIOQueue` + `AppleVirtIOInterruptEventSource` 在 INTx 路径下能否
+   建立（`assignInterruptAction` 需要 provider 提供中断资源；xhci 能工作说明 PCI 中断本身可用）。
+3. 若仍无效：做「上游 core + 最小适配」的整份对照（需要给上游 core 补我们新增的符号/字段，
+   工作量较大，应事先约定范围）。
+
+## 11. 环境变化（用户删除 work/ 之后）
+
+- `work/` 被删除 → **Android CLI 构建需要重建 `work/andcli` 的 curl/openssl 静态库**
+  （`tools/build-install-android.sh` 依赖它们）；宿主构建不需要
+- `work/AVPBooter.vmapple2.bin` 已从设备 `/data/local/tmp/henge/` 取回
+- `work/ca-bundle.pem` 由系统证书重建（`/etc/ssl/certs/ca-certificates.crt`）

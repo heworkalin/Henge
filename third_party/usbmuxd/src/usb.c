@@ -756,6 +756,8 @@ static int usb_device_add(libusb_device* dev)
 	if((devdesc.idProduct != PID_APPLE_T2_COPROCESSOR) &&
 	   ((devdesc.idProduct < PID_APPLE_SILICON_RESTORE_LOW) ||
 		(devdesc.idProduct > PID_APPLE_SILICON_RESTORE_MAX)) &&
+	   ((devdesc.idProduct < PID_APPLE_RESTORE_MODE_LOW) ||
+		(devdesc.idProduct > PID_APPLE_RESTORE_MODE_MAX)) &&
 	   ((devdesc.idProduct < PID_RANGE_LOW) ||
 		(devdesc.idProduct > PID_RANGE_MAX)))
 		return -1;

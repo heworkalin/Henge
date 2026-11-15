@@ -269,6 +269,28 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
 }
 
 /* Line by line, so a message arrives whole. */
+/* The board whose USB link the boot chain watchdog bounces. Set once in hv_vmapple_create. */
+static HvVmapple *g_serial_board;
+
+/* Bouncing the link at the kernel handoff (android/install.c) gets idevicerestore past
+   "Waiting for device to disconnect". The next wait, "Waiting for device to enter restore
+   mode", needs the device to enumerate *again* once `restored` is actually listening: the
+   handoff enumeration happens before userland starts, so restore_check_mode() finds no
+   restored service and client->mode never becomes MODE_RESTORE. launchd announces the end of
+   ignition right before it spawns the restore daemons, so that line is the signal to drop and
+   re-raise the link a few seconds later. Done once: after restore begins, a bounce would cut
+   a transfer in flight. */
+static void *usb_reenumerate_after_userland(void *arg) {
+    (void) arg;
+    sleep(8);
+    HvVmapple *b = __atomic_load_n(&g_serial_board, __ATOMIC_ACQUIRE);
+    if (!b || !b->vusb) return NULL;
+    fprintf(stderr, "hengevm: userland is up; bouncing the USB link so the host sees the "
+                    "restore-mode device again (usbmuxd re-enumerates)\n");
+    hv_vusb_force_rescan(b->vusb);
+    return NULL;
+}
+
 static void vmapple_serial_out(void *opaque, uint8_t c) {
     HvMachine *m = opaque;
     static char line[400];
@@ -279,6 +301,15 @@ static void vmapple_serial_out(void *opaque, uint8_t c) {
         /* log 1, not 2: the port's own words are the cheapest evidence there is, and log 2
            floods the log with per-helper lines that hide them. */
         if (m->log >= 1 && n) fprintf(stderr, "hengevm: serial: %s\n", line);
+        if (n && strstr(line, "ignition sequence complete")) {
+            static int once;
+            if (!once) {
+                once = 1;
+                pthread_t t;
+                if (pthread_create(&t, NULL, usb_reenumerate_after_userland, NULL) == 0)
+                    pthread_detach(t);
+            }
+        }
         n = 0;
         return;
     }
@@ -289,6 +320,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
     b->ram_fd = -1;
+    __atomic_store_n(&g_serial_board, b, __ATOMIC_RELEASE);
     b->m = m;
     b->cpu = cpu;
     b->ncpus = cfg->nr_cpus ? (int)cfg->nr_cpus : 1;

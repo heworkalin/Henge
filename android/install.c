@@ -418,6 +418,25 @@ static void scan_proc_names(void) {
     fprintf(stderr, "\n");
 }
 
+/* The firmware hands the machine to the restore kernel with bootx; on real hardware that also
+   resets the USB controller, so the device leaves the bus and idevicerestore's
+   recovery_enter_restore_mode() waits for exactly that ("Waiting for device to disconnect").
+   The guest never tells us: bdif only ever reports the channel going online, never offline, so
+   without this the host sits in cond_wait_timeout(30000) and reports "Failed to place device in
+   restore mode" even though the device did re-enumerate. Bouncing the link once, when the guest
+   first executes kernel code, reproduces the disconnect and also makes usbmuxd enumerate again
+   after restored is up (the early enumeration happens before userland listens). */
+static void usb_handoff_to_kernel(void) {
+    static int done;
+    if (done || !g_board.vusb) return;
+    /* 0xfffffe00... is the kernel's half; the firmware runs at 0x700xxxxx. */
+    if (!g_cpus[0].pc || g_cpus[0].pc < 0xfffffe0000000000ull) return;
+    done = 1;
+    fprintf(stderr, "hengevm: restore kernel entered; bouncing the USB link (host expects the "
+                    "device to disconnect)\n");
+    hv_vusb_force_rescan(g_board.vusb);
+}
+
 static void *kicker_thread(void *arg) {
     (void) arg;
     uint64_t n = 0;
@@ -425,6 +444,7 @@ static void *kicker_thread(void *arg) {
     fprintf(stderr, "hengevm: kicker up (scan=%s)\n", getenv("HV_SCAN_PROC") ? "yes" : "no");
     while (g_running) {
         usleep(1000);
+        usb_handoff_to_kernel();
         hv_machine_kick_all(&g_machine);
         n++;
         /* Once, a few seconds in: early enough that restored would have been forked by then when
