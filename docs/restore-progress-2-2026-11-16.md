@@ -771,3 +771,29 @@ w19 = 0                              ; 成功
 2. 从 DT/IORegistry 侧检查 `port-virtual-1` 是否缺"设备已连接"相关的属性
    （串口显示 `IOPortTransportStateUSB dataRole=Device`、`USB2@` registerService 成功，
    port 层是通的，缺的是让 device controller 认为 host 已连上）
+
+## 23. `readyForHost()` 的内容 + 槽 281 无调用点（2026-11-16 晚）
+
+`IOUSBDeviceController::readyForHost()`（`0x9b92360`）做的事（手工解码 bl）：
+
+```
+call [this+0x2d8](<string>)                      ; 槽 91
+USBStringIndex::newUSBStringIndex()              ; 0x9b945b0
+call [this+0xa40](this)                          ; 槽 328
+IOUSBDeviceControlRequest::getScratchBufferPtr(&this->0xe8) ; 0x9b88f9c
+   → str x0,[this+0xe0]
+IOUSBDeviceController::createUSBDevice(OSDictionary*)       ; 0x9b9ad7c
+```
+
+即：建立字符串索引、取 scratch buffer、**构造 USB 设备对象**。所以 `start()` 结束时
+guest 侧是「设备对象已建好、等 host 来枚举」的状态，缺的只是 virtio 通道。
+
+`goOnBus(bool)`（vtable 槽 281 / 偏移 `0x8d8`）的调用者：搜遍全部 kext 的 `__TEXT_EXEC`，
+`ldr/add #0x8d8` 的命中只有无关的 `stopThreadCallGated` 等 → **它不通过 vtable 偏移调用**，
+触发机制是别的（函数指针字段或基类内部状态机）。
+
+### 下一步（工具已就绪）
+
+slide 实测为 `0x14b14000`（`0x1db37934 − 0x9023934`），所以 `HV_PCHK` 可以重新启用：
+在 `goOnBus(bool)`（run `0x1db700b0`）和 `goOnBus()`（run `0x1db7016c`）下探针，
+确认前者是否被调用、后者是否被跳过。
