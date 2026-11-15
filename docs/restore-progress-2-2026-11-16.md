@@ -797,3 +797,49 @@ guest 侧是「设备对象已建好、等 host 来枚举」的状态，缺的�
 slide 实测为 `0x14b14000`（`0x1db37934 − 0x9023934`），所以 `HV_PCHK` 可以重新启用：
 在 `goOnBus(bool)`（run `0x1db700b0`）和 `goOnBus()`（run `0x1db7016c`）下探针，
 确认前者是否被调用、后者是否被跳过。
+
+## 24. 触发链闭合：`AppleVirtualUSBPort::finishStart` → `goOnBus(true)` → `goOnBus()`
+
+### 24.1 尾调用（决定性的那一条）
+
+`AppleVirtIOUSBDeviceController::goOnBus(bool)`（`0x905c0b0`）末尾：
+
+```asm
+0x905c130  mov x0,x19
+0x905c134  cbz w20, <0x905c154>      ; enable == 0 → bl goOffBus; return 0
+0x905c150  b   0xe39c                ; enable != 0 → 尾调用 goOnBus()（0x905c16c）
+```
+
+**即 `goOnBus(true)` 一旦被调用，协商必然执行。** 日志里协商零痕迹 ⇒ `goOnBus(true)` 没被调用。
+
+### 24.2 唯一调用者
+
+在 `AppleVirtualPlatform` 的 `__TEXT_EXEC` 里搜 `add/ldr #0x8d8`：
+
+```
+0x9060b48  add x9, x8, #0x8d8    }  AppleVirtualUSBPort::finishStart(IOService*)+0x1c/0x20
+0x9060b4c  ldr x8, [x8, #0x8d8]  }
+0x9060b58  blraa x8, x17         ; → goOnBus(enable)，x0 = *(全局+0x460) 的 deviceController，
+                                 ;   w1 保留入口的 provider 指针 → enable = true
+0x9060b5c  cbz w0, <0x9060c38>   ; 返回 0 被当作失败
+```
+
+### 24.3 完整因果链
+
+```
+AppleVirtualUSBPort::finishStart()
+   └─> [deviceController + 0x8d8](true)          = goOnBus(true)
+         └─> 尾调用 goOnBus()
+               └─> updateStatus(1) → (2) → (4)；enable 2 队列；strb 1,[this+0x1d0]
+```
+
+而 `AppleVirtIOUSBDeviceController::start` 只做到 `readyForHost()`（内部 `createUSBDevice`），
+它不会自己上线。**所以「内核在这个状态应该做什么」的答案就是：`finishStart` 必须被调用到
+`goOnBus(true)` 那一句。**
+
+### 24.4 还没确定的一环
+
+`finishStart` 在 `AppleVirtualPlatform` 内部既没有 `bl` 调用者，`__DATA_CONST` 里也没有
+指向它的函数指针 —— 说明它是**基类 `IOPort` 通过虚表调用的**（`finishStart` 是重写）。
+下一步：取 `AppleVirtualUSBPort` 的 `__ZTV` 里 `finishStart` 的槽号，再去 `IOPortFamily` /
+`AppleVirtualPlatformUSBPort` 的 `start` 链路里找该槽的调用点与前置条件。
