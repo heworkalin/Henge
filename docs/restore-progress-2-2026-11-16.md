@@ -843,3 +843,44 @@ AppleVirtualUSBPort::finishStart()
 指向它的函数指针 —— 说明它是**基类 `IOPort` 通过虚表调用的**（`finishStart` 是重写）。
 下一步：取 `AppleVirtualUSBPort` 的 `__ZTV` 里 `finishStart` 的槽号，再去 `IOPortFamily` /
 `AppleVirtualPlatformUSBPort` 的 `start` 链路里找该槽的调用点与前置条件。
+
+## 25. 执行轨迹（HV_TRACE_PC）：时序倒置，这是根因方向
+
+`HV_TRACE_PC` + `HV_SCAN_PROC=1` 跑一轮（2048 MB），trace 1 267 959 块（10 MB）。
+按块号排序的关键函数：
+
+| 块号 | 函数 |
+|---|---|
+| 155934 | `AppleVirtualUSBPort::start` |
+| 157671 | `AppleVirtualUSBPort::finishStart`（只执行 1 个块就进基类） |
+| 157672 | `IOPort::finishStart`（基类 super 调用） |
+| 157677 | `IOPortFamily::finishStart` |
+| 189778 | `AppleVirtIOPCITransport::start` |
+| 193304 | `AppleVirtIOUSBDeviceController::start` |
+| — | `goOnBus(bool)`、`goOnBus()`：**0 块** |
+| — | `goOffBus()`：0 块 |
+
+### 25.1 纠正一处误判
+
+`AppleVirtualUSBPort::finishStart` 里的 `[x8+0x8d8]` **不是** `goOnBus`，而是
+**`IOPort::finishStart`（基类调用）** —— trace 顺序直接证明（下一块就是 `IOPort::finishStart`）。
+之前那节的「finishStart calls goOnBus(true)」作废。
+
+### 25.2 真正的结论：port 比 device controller 更早上线
+
+```
+port::start ─> finishStart ─> IOPort::finishStart ...      (block ~155k-158k)
+                                    ↓  约 3.4 万块之后
+              transport::start ─> usbdc::start              (block 189k / 193k)
+```
+
+`goOnBus()` 从未执行，而它唯一的入口是 device controller 侧的上线路径。
+**port 在 controller 存在之前就完成了启动** → 上线通知落在空处。
+
+### 25.3 下一步
+
+1. 找 `goOnBus(bool)` 的真正调用者：它是 vtable 槽（`__ZTV30AppleVirtIOUSBDeviceController`
+   的 `+0x8d8`，即对象 `+0x8c8`），但 `AppleVirtualPlatform` 里 `add #0x8c8` 的三处都不是它
+   （`goOnBus()` 自身、IdentityVirtioMessenger、HIDBridge）→ 调用者在别处
+2. 更重要：确认上游是如何保证「controller 先 start、port 后 start」的顺序，
+   我们这边是否因为 DT/PCI 创建顺序（vusb 被提前创建）导致倒置
