@@ -483,7 +483,11 @@ static void run_ep0(HvXhci *x, int slot) {
             if (ioc || (isp && n < want)) transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, 1);
         } else if (type == TRB_STATUS) {
             ring_advance(r);
-            if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
+            /* The status stage ends the TD, so a Transfer Event is produced unconditionally.
+               IOC gates the interrupt, not the event: gating the event on it left the driver
+               waiting for completion, and its GET_DESCRIPTOR data was then judged invalid
+               ("device descriptor fragment is invalid" / wMaxPacketSize 0x0000). */
+            transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
         } else {
             ring_advance(r);
             if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
