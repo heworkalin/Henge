@@ -1031,3 +1031,58 @@ trace 里 device config 一次都没被读（没有 `virtio 106b:1a01 config rea
 从 guest 侧反汇编推出 device config 的确切布局：在
 `AppleVirtIOUSBDeviceController` 里找通过 `IOMemoryMap + offset (>= 0x2000)` 读取的地方，
 列出它访问的偏移与宽度，据此填充 `virtio_usb.c` 的 `config[]` 与 `config_len`。
+
+## 30. `createUSBDevice` 提前退出：设备描述从未构建
+
+### 30.1 它做了什么、走到哪里
+
+`IOUSBDeviceController::createUSBDevice(OSDictionary*)`（`0x9b9ad7c`，`0x2948` 字节）本应构建
+完整 USB 描述（`USBStringIndex`、`USBConfiguration`、`IOUSBDeviceInterface`、
+`USBInterfaceAssociation`、描述符拷贝等，见其 bl 列表）。
+
+trace 实测它只执行 7 个块：
+
+```
+202551  0x9b9ad7c  createUSBDevice
+202553  0x9b9ae28  createUSBDevice+0xac
+202555  0x9b9d428  createUSBDevice+0x26ac   ← 函数尾部（cleanup 区）
+202556  0x9b9d440  createUSBDevice+0x26c4
+→ 返回 readyForHost
+```
+
+即：`+0xac` 处直接跳到尾部，**设备描述没有被构建**。
+
+### 30.2 那条分支的判据是 boot-arg 位
+
+```
+0x9b9adc4  bl current_task
+0x9b9add8  b.eq <kernel_task>
+0x9b9ade4  bl copyClientEntitlement
+0x9b9ae10  ldr w21,[controller+0x1c4]
+0x9b9ae14  tbnz w21,#0, <0x20290 完整构建>
+0x9b9ae24  b  <0x223f4 尾部/清理>
+```
+
+`[controller+0x1c4]` 在 `IOUSBDeviceController::start` 里由 `PE_parse_boot_argn` 写入，
+参数名解码为 **`IOUSBDeviceController-debug`**（`0x9b90520`）与 **`usb_dev_nmi`**（`0x9b90554`）。
+
+### 30.3 实测：注入 `usb_dev_nmi=1` 无效
+
+```
+HV_EXTRA_BOOT_ARGS="serial=3 debug=0xA usb_dev_nmi=1"
+→ status = 0 → read ×2 → status = 0x1 → read → isr read = 0
+→ 队列寄存器/DRIVER 写入：0
+```
+
+与不注入完全一致。说明该位只是**调试开关**（控制是否走带日志的分支），
+不是"能否构建设备描述"的判据 —— 两条分支都是正常路径，区别只在日志量。
+
+### 30.4 因此现在的判断
+
+`createUSBDevice` 仍然提前返回（7 块），原因尚未确定。已知它需要的是
+`readyForHost` 传入的 **OSDictionary**（设备属性）以及 controller 自身的属性，
+而不是 virtio device config（后者是空的，但 guest 从未读取）。
+
+下一步：沿 `createUSBDevice+0xac` 之后的实际控制流（它 `b 0x223f4` 到达尾部前
+经过的少量块）确认是哪一项属性缺失导致提前返回；`0x223f4` 附近只有少数块，
+可以逐条对照反汇编判断。
