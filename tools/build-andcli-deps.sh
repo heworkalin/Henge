@@ -17,6 +17,13 @@ ROOT=$PWD
 NDK=${ANDROID_NDK_HOME:-/home/he/Android/Sdk/ndk/29.0.14206865}
 export ANDROID_NDK_ROOT=$NDK
 export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+# curl's configure caches the toolchain names; without these it silently falls back to the
+# host's gcc and then fails to link the bionic libcrypto ("OpenSSL could not be detected").
+export CC=aarch64-linux-android26-clang
+export CXX=aarch64-linux-android26-clang++
+export AR=llvm-ar
+export RANLIB=llvm-ranlib
+export STRIP=llvm-strip
 
 CURL_VER=8.23.0
 mkdir -p work/andcli

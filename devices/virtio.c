@@ -194,34 +194,61 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
     add_cap(v, 0x40, 0x50, 1, COMMON, 0x38);
     add_cap(v, 0x50, 0x60, 3, ISR, 1);
     add_cap(v, 0x60, 0x70, 4, DEVICE, 0x100);
-    /* HengeVM experiment: Apple's transport looks for a vendor-specific capability whose
-       vendor id is 0x106b (getFirstAppleVendorDataCapability) -- the virtio caps above are the
-       virtio layout, where bytes 2..3 are len/type, so that search finds nothing. Only the USB
-       device port pretends to be an Apple device (106b:1a01) and only its driver makes that
-       search, so the extra capability is added for it alone (HV_NO_APPLE_CAP=1 reverts). */
-    int apple_cap = v->pci.config[0] == 0x6b && v->pci.config[1] == 0x10 &&
-                    v->pci.config[2] == 0x01 && v->pci.config[3] == 0x1a;
-    add_cap(v, 0x70, apple_cap && !getenv("HV_NO_APPLE_CAP") ? 0x80 : 0x00, 2, NOTIFY, NOTIFY_MULT * HV_VIRTQ_MAX);
-    if (apple_cap && !getenv("HV_NO_APPLE_CAP")) {
-        uint8_t *c = v->pci.config + 0x80;
+    add_cap(v, 0x70, 0x00, 2, NOTIFY, NOTIFY_MULT * HV_VIRTQ_MAX);
+    /* The USB device port presents itself as an Apple device (106b:1a01), and that transport
+       requires MSI: IOPCIBridge::resolveMSIInterrupts asks
+       IOPCIMessagedInterruptController::getDeviceMSILimit, which reads this capability's MMC
+       field. With no capability the limit is 0, AppleVirtIOPCITransport::findNextMSIInterruptIndex
+       fails, assignInterruptAction never puts an interrupt source into the transport's OSArray,
+       and setInterruptsEnabled aborts device initialisation immediately after ACKNOWLEDGE --
+       which is exactly where this device used to stop (status 0x1, then reset, forever).
+       Standard virtio devices (1af4:xxxx) take the multi-vector branch and do not need it, so
+       this is added for 106b:1a01 only. HV_NO_MSI=1 turns it back off for comparison. */
+    if (!getenv("HV_NO_MSI") && v->pci.config[0] == 0x6b && v->pci.config[1] == 0x10 &&
+        v->pci.config[2] == 0x01 && v->pci.config[3] == 0x1a) {
+        uint8_t at = 0x80;
+        uint8_t *c = v->pci.config + at;
         memset(c, 0, 16);
-        c[0] = 0x09;                 /* PCI vendor-specific capability */
-        c[1] = 0x00;                 /* end of list */
-        c[2] = 0x6b, c[3] = 0x10;    /* vendor id 0x106b (Apple) */
-        c[4] = 0x10;                 /* capability length */
+        c[0] = 0x05;                 /* MSI capability */
+        c[1] = 0x00;                 /* end of the capability list */
+        c[2] = 0x02;                 /* Message Control: MMC=1 -> 2 vectors; MSI off until enabled */
+        v->pci.config[0x71] = at;    /* link it after the notify capability at 0x70 */
+        for (int i = 0; i < 16; i++) v->pci.wmask[at + i] = 0xff; /* the driver writes address/data here */
+        v->msi_cap = at;
     }
     reset(v);
 }
 
+/* Raise an interrupt the way the device is configured to: an MSI is a memory write carrying the
+   guest-programmed data word to the guest-programmed address (which lands in the gic-msi frame),
+   otherwise the legacy INTx line. */
+static void virtio_raise(HvVirtio *v) {
+    if (v->msi_cap) {
+        uint8_t *c = v->pci.config + v->msi_cap;
+        if (c[2] & 1) {                        /* MSI enable */
+            uint32_t addr;
+            uint16_t data;
+            memcpy(&addr, c + 4, 4);
+            memcpy(&data, c + 8, 2);
+            HvMmio *mm = addr ? hv_mmio_lookup(v->m, addr) : NULL;
+            if (mm && addr - mm->pa < mm->size && mm->write) {
+                mm->write(mm->opaque, addr - mm->pa, data, 4);
+                return;
+            }
+        }
+    }
+    hv_pci_set_intx(&v->pci, 1);
+}
+
 void hv_virtio_interrupt(HvVirtio *v) {
     v->isr |= 1;
-    hv_pci_set_intx(&v->pci, 1);
+    virtio_raise(v);
 }
 
 void hv_virtio_config_changed(HvVirtio *v) {
     v->config_gen++;
     v->isr |= 2;
-    hv_pci_set_intx(&v->pci, 1);
+    virtio_raise(v);
 }
 
 int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {

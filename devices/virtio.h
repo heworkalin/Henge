@@ -38,6 +38,7 @@ typedef struct HvVirtio {
     uint64_t features, driver_features;
     uint32_t dfsel, gfsel;
     uint8_t status, isr, config_gen;
+    uint8_t msi_cap;           /* offset of the MSI capability in config space, 0 = none */
     uint16_t qsel, nq;
     HvVirtq q[HV_VIRTQ_MAX];
     uint8_t config[256];
