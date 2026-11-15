@@ -634,3 +634,40 @@ common config 里 `0x12` 是 `num_queues`、`0x14` 才是 `device_status`。
 再对照我们的 `bar_read/bar_write` 的偏移布局，决定是「让 0x12 承载状态」还是
 「修正 transport 认为的状态偏移」。同时重新检查 `findNextMSIInterruptIndex`（`0x902450c`）
 对 `getInterruptType` 返回值的处理——之前记为「非 0 立刻失败」，需要按新解析的 vtable 复核。
+
+## 20. 实测：`m->cpu->pc` 不可用于符号定位，slide 每次不同
+
+### 20.1 vtable 解析工具（已可用）
+
+`/tmp/vt.py`：按 `DYLD_CHAINED_PTR_64_KERNEL_CACHE` 解 kernel collection 的指针，
+`目标 = 0xfffffe0007004000 + (raw & 0x3FFFFFFF)`，虚函数槽 `n` 在 `__ZTV + 0x10 + 8n`。
+校验通过（`IOPCIDevice` 前几槽 = 析构 + `OSObject::release/retain/...`）。
+
+### 20.2 已确认（确定）
+
+- `IOPCIDevice` 槽 231 = `IOService::getInterruptType(int,int*)`
+- 槽 299 = `IOPCIDevice::ioWrite8(UInt16,UInt8,IOMemoryMap*)`
+- 槽 302 = `IOPCIDevice::ioRead8(UInt16,IOMemoryMap*)`
+- `ioRead8(off)` 实现为 `*(uint8_t*)(map->getVirtualAddress() + off)`，即直接读 BAR 的 MMIO 映射
+- `AppleVirtIOTransport::updateStatus` 正常路径是 `byte[this+0x100 + 0x14] |= newbits`（直接内存写，
+  `this+0x100` 就是 BAR 映射的 VA），并**不**在正常路径上走 `ioRead8/ioWrite8(0x12)`
+  —— 后者是另一条分支（`0x90256cc`），实测从未触发（日志里没有 `read +0x12`）
+
+### 20.3 两个工具陷阱（实测）
+
+1. **`m->cpu->pc` 不是发起 MMIO 的指令地址**，而是 JIT 块的起始 pc。
+   证据：把日志里的 status 写 pc（`0x1db396ac` / `0x1e4d42fc`）按 16 KB 对齐反推 slide，
+   候选全部落在 `com.apple.kernel` 的 `__TEXT_EXEC` 内，而写 virtio status 的代码在
+   AppleVirtIO kext 里。→ **不要用这个 pc 去查符号。**
+2. **slide 不是固定的**：两次运行 pc 相差约 `0x969c850`，与 `core/dispatch.c:2542` 的注释
+   （"slide 0x14b14000，因为 random seed 关掉了所以固定"）矛盾。
+   → `HV_PCHK` 的地址必须按当次 slide 计算，否则 0 命中（本轮已实测 0 命中）。
+
+### 20.4 下一步（明确）
+
+放弃从 pc 反推，改用**栈**：
+
+- `HV_STACKSCAN=1` 在卡住时 dump 内核栈，能直接看出 `AppleVirtIOUSBDeviceController`
+  停在哪一层调用（是 `start` 里等事件，还是 `performDeviceInitialization` 里）
+- 同时确认 `common_write` 是否需要接受 `0x12` 偏移（Apple 的 legacy 布局语义），
+  但当前证据只显示 guest 访问 `0x14`，**暂不改语义**
