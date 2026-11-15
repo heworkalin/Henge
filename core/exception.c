@@ -110,6 +110,34 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
         /* 0x24 is a data abort from EL0, 0x25 from EL1: an early-boot kernel fault is the
                second, and it is the one worth seeing. */
         if (type == HV_EXC_SYNC && (((esr >> 26) & 0x3f) == 0x24 || ((esr >> 26) & 0x3f) == 0x25)) {
+            /* A EL0 fault is the only moment the userland's own page tables are known to be the
+               ones installed, so it is the moment to take the page it was executing: the restore
+               ramdisk is an APFS container with compressed files in it, so the program cannot be
+               read out of the image, but it can be read out of the guest's memory as it runs. */
+            if (cpu->el == 0 && getenv("HV_EL0_DUMP")) {
+                static int dumped;
+                if (dumped < 12) {
+                    HvWalk uw;
+                    memset(&uw, 0, sizeof uw);
+                    hv_mmu_walk(cpu, ret, HV_ACC_READ, 0, &uw);
+                    if (uw.fsc == 0) {
+                        uint8_t pg[4096];
+                        if (hv_phys_read(cpu->m, uw.pa & ~0xfffull, pg, sizeof pg) == 0) {
+                            char path[160];
+                            snprintf(path, sizeof path, "/data/local/tmp/henge/el0_%02d_%llx_%llx.bin",
+                                     dumped, (unsigned long long) ret, (unsigned long long) (uw.pa & ~0xfffull));
+                            FILE *f = fopen(path, "wb");
+                            if (f) {
+                                fwrite(pg, 1, sizeof pg, f);
+                                fclose(f);
+                                fprintf(stderr, "hengevm: el0 page pc %llx pa %llx -> %s\n",
+                                        (unsigned long long) ret, (unsigned long long) uw.pa, path);
+                                dumped++;
+                            }
+                        }
+                    }
+                }
+            }
             HvWalk w;
             hv_mmu_walk(cpu, ret, HV_ACC_READ, 1, &w);
             uint32_t insn = 0;

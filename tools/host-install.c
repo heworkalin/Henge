@@ -28,6 +28,7 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
                              const char *workdir, int ram_mb, int ncpus, uint64_t ecid,
                              const char *cache_dir, char *report, size_t cap);
 int hv_android_install_status(double *progress);
+void hv_android_scan_procs(void);
 
 /* compat_android.c synthesises the commpage the translator reads while emitting counter
    instructions. In the app this happens from the JNI entry; here it has to happen before any guest
@@ -121,6 +122,10 @@ int main(int argc, char **argv) {
             last = step;
         }
         if (step >= 100) {
+            /* Before the verdict is printed, ask the guest's own memory which processes it made:
+               the restore either never forked restored, or forked it and it never opened the USB
+               channel, and those two want different next steps. */
+            hv_android_scan_procs();
             printf("%s\n", step == 100 ? "restore finished" : "restore failed");
             fflush(stdout);
             break;

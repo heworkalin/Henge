@@ -100,6 +100,48 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
 | `HENGE_RANDOM_SEED=1` | 用宿主熵填 `/chosen/random-seed`（**默认关**，关才可复现） |
 | `HENGE_TIMEOUT_SCALE` | 放大 restore 的所有等待 |
 
+### 5.1 JIT 调试参数与地址空间（最易出错，先看这里）
+
+同一份内核镜像有**四个**地址，参数必须传对的那一个：
+
+| 名字 | 定义 | 24G90 实测（slide 固定） |
+|---|---|---|
+| `fileoff` | 镜像内文件偏移 | `__TEXT_EXEC` = `0xd78000` |
+| **link VA** | `fileoff + 0xfffffe0007004000` | `__TEXT_EXEC` = `0xfffffe0007d7c000` |
+| **run VA** | `link VA + slide`（slide = `0x14b14000`，`HENGE_RANDOM_SEED` 关时固定） | `__TEXT_EXEC` = `0xfffffe001c890000` |
+| PA | `kimage_pa + fileoff`（`kimage_pa = 0x73b18000`） | `__TEXT_EXEC` = `0x74090000` |
+
+`slide` 可由 boot_args 反推：`virtBase 0xfffffe0018a04000 − physBase 0x70a04000 = 0x14b14000`。
+
+| 参数 | 该传的地址空间 | 说明 |
+|---|---|---|
+| `HV_PCHK=start:end` | **run VA 的低 32 位**（源码比较 `(uint32_t)cpu->pc`） | 执行断点；仅 `cpu->index==0`、最多 400 次。**传 link VA 会差一个 slide，永不命中** |
+| `HV_PCHK_DST=start:end` / `HV_PCHK_LEN=hex` | run VA 低 32 位（`x22`）/ 长度阈值 | 在 `HV_PCHK` 之上的附加过滤 |
+| `HV_TRACE_PC=<file>` | **文件路径**，内容为每块 **run VA**（u64 数组，上限 4M 块） | 全量执行轨迹。**判"某函数执行没执行"用它，别用 `HV_PCHK`** |
+| `HV_BLOCK_DUMP=<file>` | 文件路径 | 每 `HV_BLOCK_DUMP_EVERY`（默认 64）块 dump 翻译后的宿主指令 |
+| `HV_DT_DUMP=<file>` / `HV_DUMP_KC=1` / `HV_DUMP_RAMDISK=1` / `HV_EL0_DUMP=1` / `HV_SCAN_PROC=1` | 路径 / 开关 | 设备树 / 运行期 `__PRELINK_TEXT`+`__PRELINK_INFO` / ramdisk / EL0 故障页 / 进程名+内核日志 |
+| `tools/disasm-raw.sh <blob> <base> <from> <to>` | **link VA**（`base=0xfffffe0007004000`） | 反汇编镜像 |
+
+三个换算式子：
+
+```
+fileoff = link_va - 0xfffffe0007004000
+run_va  = link_va + slide
+HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
+```
+
+**铁律：`HV_PCHK` 零命中不能推出"没执行"。** 先按上式换算，再用 `HV_TRACE_PC`
+统计同一范围交叉验证（trace 记的是真执行）。实测对照：
+
+| 探针 | 值 | 结果 |
+|---|---|---|
+| `HV_PCHK`（link） | `0x84eb0e0`（`InitIOKit`） | 0 次 ← **错，差 slide** |
+| `HV_PCHK`（run） | `0x1cfff0e0` | **16 次** ✓ |
+| `HV_TRACE_PC` 统计 | `__PRELINK_TEXT` `0x1bb20000..0x1c210000` | 0 次 = kext 真没执行 |
+
+注意 `com.apple.kernel` 的 `vmaddr` 就是 `0xfffffe000700c000`（`__PRELINK_TEXT` 起点），
+它属于 kernel fileset entry，所以"该段 0 块"等于"内核早期段没跑"，含义要单独判断。
+
 ## 6. 调试方法论（本项目最贵的教训）
 
 1. **推导 ≠ 证据。** 讲清机制要有 XNU 源码/实测支撑；否则标"不确定"。

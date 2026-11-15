@@ -381,13 +381,61 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
    blocks do not return to it. host/vm.c has this thread; the app and the host installer build
    their own CPU threads instead, so without it the guest gets a tick only when a block happens to
    end: one interrupt in ninety seconds, and every timeout in the restore path expires. */
+/* Which processes the kernel actually created. p_comm is a 16-byte name at a known offset in
+   struct proc, and kalloc'd procs live in the kernel heap; scanning RAM for the names is cruder
+   than walking allproc from a symbol, but it needs no symbol table and the answer it gives -- was
+   restored ever forked -- is the one that separates "restored never started" from "restored ran
+   and its USB side did not". Set HV_SCAN_PROC=1 to run it. */
+/* Process names, and the kexts whose absence would explain a kernel that runs userland and
+   touches no device: every device driver on this platform is a kext (ApplePCIe for the host
+   bridge the virtio devices sit on, IOUSBHostFamily for the port restored talks to). Counting
+   their names in RAM says whether the boot got far enough to load them. */
+static void scan_proc_names(void) {
+    static const char *const names[] = {"launchd", "restored", "AppleVM", "mobile_restore",
+                                        "watchdogd", "launchctl", "kernel_task",
+                                        "ApplePCIe", "IOUSBHost", "AppleUSBHost",
+                                        "com.apple.iokit.IOUSBHostFamily",
+                                        "AppleVirtIONetPCI", "VirtIOBlockDevice"};
+    const int n = (int)(sizeof names / sizeof names[0]);
+    int hits[16] = {0};
+    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull; pa += 0x1000) {
+        uint8_t pg[4096];
+        if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
+        for (int i = 0; i + 18 <= 4096; i++) {
+            for (int k = 0; k < n; k++) {
+                if (hits[k] >= 3) continue;
+                size_t l = strlen(names[k]);
+                if (memcmp(pg + i, names[k], l) != 0) continue;
+                if (pg[i + l] != 0 && pg[i + l] >= 32 && pg[i + l] < 127) continue;
+                hits[k]++;
+                fprintf(stderr, "hengevm: proc name \"%s\" at pa %llx\n", names[k],
+                        (unsigned long long) (pa + (uint64_t) i));
+            }
+        }
+    }
+    fprintf(stderr, "hengevm: proc scan:");
+    for (int k = 0; k < n; k++) fprintf(stderr, " %s=%d", names[k], hits[k]);
+    fprintf(stderr, "\n");
+}
+
 static void *kicker_thread(void *arg) {
     (void) arg;
     uint64_t n = 0;
+    int scanned = 0;
+    fprintf(stderr, "hengevm: kicker up (scan=%s)\n", getenv("HV_SCAN_PROC") ? "yes" : "no");
     while (g_running) {
         usleep(1000);
         hv_machine_kick_all(&g_machine);
-        if (getenv("HENGE_HEARTBEAT") && (++n % 1000) == 0)
+        n++;
+        /* Once, a few seconds in: early enough that restored would have been forked by then when
+           the ramdisk mounted, late enough that the boot has got past the first init. */
+        if (getenv("HV_SCAN_PROC") && !scanned && n >= 4000) {
+            scanned = 1;
+            fprintf(stderr, "hengevm: scanning for proc names at n=%llu\n", (unsigned long long) n);
+            scan_proc_names();
+            fprintf(stderr, "hengevm: proc scan done\n");
+        }
+        if (getenv("HENGE_HEARTBEAT") && (n % 1000) == 0)
             fprintf(stderr, "hengevm: kicked %llu times, ncpus %d\n",
                     (unsigned long long) n, g_machine.ncpus);
     }
@@ -494,6 +542,192 @@ void hv_android_install_stop(void) {
 int hv_android_install_status(double *progress) {
     if (progress) *progress = g_install_progress;
     return g_install_step;
+}
+
+/* Scan the guest's RAM for process names, on demand. Exported because the host installer's main
+   loop is the one place that is guaranteed to run after the restore has failed: the kicker
+   thread it used to live in does not get to print there (its stderr line never appeared in the
+   run that had it), and a probe that never runs is worse than none. */
+extern uint64_t hv_seg_kext_blocks, hv_seg_kernel_blocks, hv_seg_other_blocks;
+
+/* The kernel's own log, out of msgbuf in RAM. The serial console was never initialised, so every
+   IOLog/printf the kernel made is only in this buffer -- and the answer to "did it parse the
+   kext plist" is written there by name ("KernelConfigTables syntax error", "has no kext info
+   dictionaries", "can't find prelinked kext executable size", ...). */
+static void scan_kernel_log(void) {
+    static const char *const keys[] = {
+        "KernelConfigTables", "kext info dictionaries", "prelinked kext",
+        "KextLog", "OSKext", "IOKit", "koxt", "KernelBootstrap", "unsupported"
+    };
+    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull; pa += 0x1000) {
+        static uint8_t pg[4096];
+        if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
+        for (int i = 0; i + 8 < (int) sizeof pg; i++) {
+            for (unsigned k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+                size_t l = strlen(keys[k]);
+                if (memcmp(pg + i, keys[k], l) != 0) continue;
+                if (i > 0 && pg[i - 1] >= 32 && pg[i - 1] < 127) continue;  /* inside a word */
+                /* printable run around it, up to 160 chars */
+                char buf[200];
+                int n = 0;
+                int start = i > 60 ? i - 60 : 0;
+                for (int j = start; j < (int) sizeof pg && n < (int) sizeof buf - 1; j++) {
+                    uint8_t c = pg[j];
+                    if (c == 0) break;
+                    buf[n++] = (c >= 32 && c < 127) ? (char) c : ' ';
+                }
+                buf[n] = 0;
+                fprintf(stderr, "hengevm: klog pa %llx: %s\n", (unsigned long long) (pa + (uint64_t) start), buf);
+                break;
+            }
+        }
+    }
+}
+
+void hv_trace_dump(void);
+
+void hv_android_scan_procs(void) {
+    scan_proc_names();
+    scan_kernel_log();
+    hv_trace_dump();
+    /* Did the boot ever run a kext? __PRELINK_TEXT holds every device driver on this platform, so
+       kext=0 with kernel>0 means the boot never got as far as driving a device -- which is what the
+       mmio histogram (no pcie, no uart) already suggested. */
+    fprintf(stderr, "hengevm: seg blocks: kext %llu kernel %llu other %llu\n",
+            (unsigned long long) hv_seg_kext_blocks,
+            (unsigned long long) hv_seg_kernel_blocks,
+            (unsigned long long) hv_seg_other_blocks);
+    /* Where the guest is at the moment the restore gives up, and how it got there. With this
+       boot's slide the kext code lives at 0xfffffe001bb20000..0xfffffe001c210000 and the kernel's
+       own code at 0xfffffe001c890000.., so the pc says at once whether the boot ever entered a
+       kext at all: the mmio histogram showed no device touched, and "never ran a kext" and "ran
+       one and it failed" want different next steps. */
+    for (int i = 0; i < g_board.ncpus; i++) {
+        HvCpu *c = &g_cpus[i];
+        fprintf(stderr, "hengevm: cpu %d pc %llx el%u icount %llu halted %d stop %d\n", i,
+                (unsigned long long) c->pc, c->el, (unsigned long long) c->icount, c->halted,
+                g_machine.stop ? 1 : 0);
+    }
+    hv_pc_hist_dump(&g_cpus[0]);
+    /* The kernel collection as the guest actually received it, against the same blob decrypted
+       from the IPSW: __PRELINK_TEXT (kext code, file offset 0x8000, 1.7 MB) is where a residual
+       decompression error would show up first, and it is exactly the region whose blocks never
+       run. If these match, "the data is wrong" is ruled out and the problem is in what the kernel
+       does with correct data. */
+    if (getenv("HV_DUMP_KC") && g_machine.kimage_pa) {
+        /* __PRELINK_INFO: the 3.1 MB XML plist listing all 238 kexts and their personalities.
+           libsa/bootstrap.cpp turns it into OSKext objects, and that is the step before any kext
+           code can run (which it never does). Same test as __PRELINK_TEXT: dump what the guest
+           holds and compare it with the IPSW plaintext, so "the data is wrong" and "the parser
+           never saw correct data" stay separate hypotheses. */
+        {
+            enum { IOFF = 0x33b4000, ILEN = 0x31c000 };
+            FILE *inf = fopen("/data/local/tmp/henge/kc_prelink_info.bin", "wb");
+            if (inf) {
+                enum { CH = 1 << 20 };
+                uint8_t *buf = malloc(CH);
+                uint64_t done = 0;
+                int bad = 0;
+                while (buf && done < ILEN && !bad) {
+                    uint64_t n = ILEN - done < CH ? ILEN - done : CH;
+                    if (hv_phys_read(&g_machine, g_machine.kimage_pa + IOFF + done, buf, (uint32_t) n) != 0) { bad = 1; break; }
+                    if (fwrite(buf, 1, n, inf) != n) { bad = 1; break; }
+                    done += n;
+                }
+                free(buf);
+                fclose(inf);
+                fprintf(stderr, "hengevm: kc prelink_info %llu/%llu bytes from pa %llx%s\n",
+                        (unsigned long long) done, (unsigned long long) ILEN,
+                        (unsigned long long) (g_machine.kimage_pa + IOFF), bad ? " (read error)" : "");
+            }
+        }
+        enum { KOFF = 0x8000, KLEN = 0x6f0000 };
+        FILE *kf = fopen("/data/local/tmp/henge/kc_prelink_text.bin", "wb");
+        if (kf) {
+            enum { CH = 1 << 20 };
+            uint8_t *buf = malloc(CH);
+            uint64_t done = 0;
+            int bad = 0;
+            while (buf && done < KLEN && !bad) {
+                uint64_t n = KLEN - done < CH ? KLEN - done : CH;
+                if (hv_phys_read(&g_machine, g_machine.kimage_pa + KOFF + done, buf, (uint32_t) n) != 0) { bad = 1; break; }
+                if (fwrite(buf, 1, n, kf) != n) { bad = 1; break; }
+                done += n;
+            }
+            free(buf);
+            fclose(kf);
+            fprintf(stderr, "hengevm: kc prelink_text %llu/%llu bytes from pa %llx%s\n",
+                    (unsigned long long) done, (unsigned long long) KLEN,
+                    (unsigned long long) (g_machine.kimage_pa + KOFF), bad ? " (read error)" : "");
+        }
+    }
+    /* The restore ramdisk itself: the device tree says RAMDisk @ 0x783ac000, size 0xb400000, and
+       that is where restored lives. Its first page names the filesystem; the rest is the program
+       the boot was running. Dumped from guest RAM, so it does not depend on the userland page
+       tables still being installed at this point (the walk above finds nothing after stop). */
+    {
+        const char *wd = getenv("HV_BLOCK_DUMP");
+        if (wd && *wd) {
+            /* HV_DUMP_RAMDISK writes the whole thing (180 MB): the ramdisk is an APFS container,
+               which cannot be mounted here, but the programs inside it are Mach-O images and can
+               be found by their magic. Off by default -- it is 180 MB of I/O per run. */
+            if (getenv("HV_DUMP_RAMDISK")) {
+                FILE *rf = fopen("/data/local/tmp/henge/ramdisk.img", "wb");
+                if (rf) {
+                    enum { CH = 1 << 20 };
+                    uint8_t *buf = malloc(CH);
+                    uint64_t done = 0, total = 0xb400000ull;
+                    int bad = 0;
+                    while (buf && done < total && !bad) {
+                        uint64_t n = total - done < CH ? total - done : CH;
+                        if (hv_phys_read(&g_machine, 0x783ac000ull + done, buf, (uint32_t) n) != 0) { bad = 1; break; }
+                        if (fwrite(buf, 1, n, rf) != n) { bad = 1; break; }
+                        done += n;
+                    }
+                    free(buf);
+                    fclose(rf);
+                    fprintf(stderr, "hengevm: ramdisk image %llu/%llu bytes%s\n",
+                            (unsigned long long) done, (unsigned long long) total, bad ? " (read error)" : "");
+                }
+            }
+            uint8_t hdr[4096];
+            if (hv_phys_read(&g_machine, 0x783ac000ull, hdr, sizeof hdr) == 0) {
+                size_t n = strlen(wd);
+                char path[600];
+                snprintf(path, sizeof path, "%.*s/ramdisk_hdr.bin", (int)(n - 11 > 0 ? n - 11 : 0), wd);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(hdr, 1, sizeof hdr, f); fclose(f); }
+                fprintf(stderr, "hengevm: ramdisk hdr %02x %02x %02x %02x at 783ac000 -> %s\n",
+                        hdr[0], hdr[1], hdr[2], hdr[3], path);
+            }
+        }
+    }
+    /* What the guest's userland was actually executing. Without a console the only account of
+       restored is its own code, and the faulting pcs the log already printed say where it was:
+       pull those pages out of guest RAM and disassemble them offline. */
+    {
+        static const uint64_t va[] = {0x10284a9a0ull, 0x1027fcf90ull, 0x102818eb8ull,
+                                      0x1028742b8ull, 0x1027fd3b8ull, 0x1027fbe44ull};
+        const char *wd = getenv("HV_BLOCK_DUMP");
+        if (wd && *wd) {
+            for (unsigned k = 0; k < sizeof va / sizeof va[0]; k++) {
+                HvWalk w;
+                memset(&w, 0, sizeof w);
+                hv_mmu_walk(&g_cpus[0], va[k], HV_ACC_READ, 0, &w);
+                if (w.fsc) continue;
+                uint8_t pg[4096];
+                if (hv_phys_read(&g_machine, w.pa & ~0xfffull, pg, sizeof pg) != 0) continue;
+                size_t n = strlen(wd);
+                char path[600];
+                snprintf(path, sizeof path, "%.*s/el0_%llx.bin", (int)(n - 11 > 0 ? n - 11 : 0), wd,
+                         (unsigned long long) va[k]);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(pg, 1, sizeof pg, f); fclose(f); }
+                fprintf(stderr, "hengevm: el0 pc %llx -> pa %llx page dumped\n",
+                        (unsigned long long) va[k], (unsigned long long) w.pa);
+            }
+        }
+    }
 }
 
 int hv_android_install_running(void) { return g_running; }

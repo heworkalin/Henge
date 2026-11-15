@@ -1539,6 +1539,54 @@ static int run_loop(HvCpu *cpu, int one) {
                                 static int dt_done;
                                 if (!dt_done) {
                                     dt_done = 1;
+                                    /* Everything below used to go to stderr, and stderr loses
+                                       output exactly at the hand-off to the kernel, so none of it
+                                       had ever been seen. The tree goes to a file instead: the
+                                       /chosen/memory-map in it is what tells the kernel where
+                                       the ramdisk and the kernelcache are, and rd=md0 cannot work
+                                       without it. */
+                                    {
+                                        const char *dp = getenv("HV_DT_DUMP");
+                                        if (dp && *dp) {
+                                            /* The tree starts at deviceTreeP (0x78324000) and its ADT
+                                               length is 0x878c0, so the window has to start there and
+                                               be at least that big: a dump that began at 0x78300000
+                                               and stopped at 0x78340000 cut the tree off before
+                                               /chosen, which is the only node that matters here. */
+                                            static uint8_t tree[0x90000];
+                                            FILE *df = fopen(dp, "wb");
+                                            int ok = hv_phys_read(cpu->m, 0x78324000ull, tree, sizeof tree) == 0;
+                                            if (df) {
+                                                if (ok) fwrite(tree, 1, sizeof tree, df);
+                                                fclose(df);
+                                            }
+                                            FILE *mf = fopen(dp, "ab");
+                                            if (mf) {
+                                                fprintf(mf, "\n# read %s, %zu bytes from PA 0x78324000 (ADT length 0x878c0)\n",
+                                                        ok ? "ok" : "FAILED", sizeof tree);
+                                                /* boot_args at 0x837f0000 (what the kernel is handed).
+                                                   arm64 layout: Revision/Version 0, virtBase 8,
+                                                   physBase 0x10, memSize 0x18, topOfKernelData 0x20,
+                                                   Video 0x28 (6 ulong = 0x30), machineType 0x58,
+                                                   deviceTreeP 0x60, deviceTreeLength 0x68,
+                                                   CommandLine 0x6c. Written as raw hex so the offsets
+                                                   can be checked against the struct rather than
+                                                   guessed. */
+                                                static uint8_t ba[0x1000];
+                                                if (hv_phys_read(cpu->m, 0x837f0000ull, ba, sizeof ba) == 0) {
+                                                    fprintf(mf, "# boot_args 0x837f0000 (%zu bytes)\n", sizeof ba);
+                                                    for (size_t k = 0; k < sizeof ba; k += 32) {
+                                                        fprintf(mf, "%04zx ", k);
+                                                        for (size_t j = 0; j < 32 && k + j < sizeof ba; j++) fprintf(mf, "%02x", ba[k + j]);
+                                                        fprintf(mf, "\n");
+                                                    }
+                                                } else {
+                                                    fprintf(mf, "# boot_args 0x837f0000 unreadable\n");
+                                                }
+                                                fclose(mf);
+                                            }
+                                        }
+                                    }
                                     uint32_t m4 = 0;
                                     (void) hv_phys_read(cpu->m, 0x78324000ull, &m4, 4);
                                     fprintf(stderr, "hengevm: dt magic at 78324000 = %08x\n", m4);
@@ -2473,8 +2521,60 @@ void hv_pc_hist_note(HvCpu *cpu) {
     hv_pc_hist_note_va(cpu->index, cpu->pc);
 }
 
+/* How many blocks were ever run out of each part of the kernel image. The ring above keeps only
+   the recent past, which cannot answer "did the boot ever enter a kext at all" -- and that is the
+   question the mmio histogram raises: no device touched, restored forked, and not one exception
+   from the kext text. Two comparisons per block, so it can stay on.
+   With this build's slide (0x14b14000, fixed because the random seed is off) __PRELINK_TEXT is
+   0xfffffe001bb20000..0xfffffe001c210000 and __TEXT_EXEC is 0xfffffe001c890000..; anything else
+   is firmware or userland. */
+uint64_t hv_seg_kext_blocks, hv_seg_kernel_blocks, hv_seg_other_blocks;
+void hv_seg_note(uint64_t va) {
+    if (va >= 0xfffffe001bb20000ull && va < 0xfffffe001c210000ull) hv_seg_kext_blocks++;
+    else if (va >= 0xfffffe001c890000ull && va < 0xfffffe001eecc000ull) hv_seg_kernel_blocks++;
+    else hv_seg_other_blocks++;
+}
+
+/* HV_TRACE_PC=<file>: every block's pc, in order, straight into a flat buffer. The 4096-entry
+   ring above only knows the last instant before the guest stops, which is all userland; the
+   question "when did the kernel hand control to userland" needs the whole boot. 4M entries
+   (32 MB) covers it; once full it just stops recording. */
+#define TRACE_CAP (4u << 20)
+static uint64_t *trace_buf;
+static uint32_t trace_cap, trace_n;
+static int trace_on = -1;
+void hv_trace_dump(void);
+void hv_trace_note(uint64_t va) {
+    if (trace_on < 0) {
+        const char *e = getenv("HV_TRACE_PC");
+        trace_on = (e && *e) ? 1 : 0;
+        if (trace_on) {
+            trace_buf = malloc(sizeof(uint64_t) * TRACE_CAP);
+            trace_cap = trace_buf ? TRACE_CAP : 0;
+            if (!trace_buf) trace_on = 0;
+        }
+    }
+    if (!trace_on || trace_n >= trace_cap) return;
+    trace_buf[trace_n++] = va;
+}
+
+void hv_trace_dump(void) {
+    if (!trace_on || !trace_buf || !trace_n) return;
+    const char *p = getenv("HV_TRACE_PC");
+    FILE *f = p && *p ? fopen(p, "wb") : NULL;
+    if (f) {
+        fwrite(trace_buf, sizeof(uint64_t), trace_n, f);
+        fclose(f);
+        fprintf(stderr, "hengevm: pctrace %u blocks -> %s\n", trace_n, p);
+    } else {
+        fprintf(stderr, "hengevm: pctrace %u blocks (open failed)\n", trace_n);
+    }
+}
+
 void hv_pc_hist_note_va(int index, uint64_t va) {
     if (index < 0 || index >= HV_MAX_CPUS) return;
+    hv_seg_note(va);
+    hv_trace_note(va);
     uint32_t i = pc_hist_at[index]++ & (PC_HIST - 1);
     pc_hist[index][i] = va;
 }
