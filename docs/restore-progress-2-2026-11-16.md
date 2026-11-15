@@ -1325,3 +1325,47 @@ USBLog
 
 注意：这条链与 vusb 设备模型无关 —— 设备模型一侧该做的（PCI、virtio 通知、MSI、INTx）
 已经就位，缺的是 guest 用户态不去驱动它。
+
+## 36. 用执行轨迹证明：`restored_external` 从未执行 —— 整个用户态停在 dyld
+
+### 36.1 方法
+
+不需要给 guest 挂调试器：`HV_TRACE_PC` 记录每个执行块的 VA，
+而 `restored_external` 的 `__TEXT` 基址正好是 `0x100000000`（从 Mach-O 段表读出）。
+
+### 36.2 结果
+
+```
+restored_external 的 __TEXT (0x100000000..0x10240000)  → 0 块
+所有用户程序的 __TEXT 区 (0x100000000)                  → 0 块
+0x0..16MB（AVPBooter/iBoot 阶段，block 0~14898）        → 14899 块
+dyld shared cache (0x700000000)                        → 59607 块（block 14899~185455）
+此后                                                   → 只有 kernel
+```
+
+dyld 的最后一个执行块是 `0x74898370`，紧接着就是内核块
+（`_assert_wait_timeout` / `_Switch_context` 附近，符号名不可靠，因为那些是内核内部函数），
+**此后用户态再没有任何一个块被执行。**
+
+### 36.3 这意味着什么
+
+- `restored_external` **完全没有执行**
+- 更广地说：**所有用户程序（launchd 及其服务）都没有开始执行**
+- 串口里 `hello: hello from launchd.1` / `ignition sequence complete` 是
+  **restore kernel 内置的 libignition** 打印的，不是 launchd 进程
+- 因此"ramdisk 挂载成功、ignition complete"只证明内核侧正常，
+  **不能证明用户态启动成功**
+
+### 36.4 修正一个长期假设
+
+此前把「ignition sequence complete」当作「用户态已经跑起来」，据此认为
+vusb 的 userland 驱动链"应该"会启动。实际上用户态停在 dyld，
+所以 `restored_external`（以及任何 launchd 服务）从未运行。
+
+**vusb 卡在 ACKNOWLEDGE 只是这个更上层问题的下游表现。**
+
+### 36.5 下一步
+
+排查 userland 启动失败：dyld 在 `0x74898370` 之后不再返回用户态，
+需要确认它请求的是哪个服务/系统调用（这需要 dyld shared cache 的符号，
+而 ramdisk 里没有该 cache 文件，可能要从主系统 dmg 里取）。
