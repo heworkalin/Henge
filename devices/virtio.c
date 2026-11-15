@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mmu.h"   /* hv_mmu_walk: reading the guest stack needs the guest's own page tables */
+
 /* Layout of the one BAR (BAR 4, 16 KB), as QEMU's virtio-pci lays it out. */
 #define BAR 4
 #define COMMON 0x0000
@@ -56,9 +58,37 @@ static int vtrace_usb(HvVirtio *v) {
            v->pci.config[2] == 0x01 && v->pci.config[3] == 0x1a;
 }
 
+/* Debug: the guest's real state at the moment it touches the USB port's status word.  The MMIO
+   callback runs while the guest is stopped on that access, so the general purpose registers are
+   still the guest's -- unlike cpu->pc, which is the start of the translated block and therefore
+   points somewhere else entirely.  Walking the stack for kernel return addresses turns "status
+   changed at some pc" into a call chain, which is what says who is driving the negotiation. */
+static void vusb_state_dump(HvVirtio *v, const char *what) {
+    HvCpu *c = v->m->cpu;
+    if (!c) return;
+    fprintf(stderr, "vusb@ %s: el %d sp %llx lr %llx pc(block) %llx\n", what, (int)c->el,
+            (unsigned long long)c->sp, (unsigned long long)c->x[30], (unsigned long long)c->pc);
+    for (int i = 0; i < 8; i++) fprintf(stderr, "vusb@   x%d %llx\n", i, (unsigned long long)c->x[i]);
+    uint64_t base = c->sp & ~7ull;
+    int shown = 0;
+    for (uint64_t at = base; at < base + 0x1000 && shown < 24; at += 8) {
+        HvWalk w;
+        uint64_t val = 0;
+        hv_mmu_walk(c, at, HV_ACC_READ, 1, &w);
+        if (w.fsc || hv_phys_read(v->m, w.pa, &val, 8)) continue;
+        /* Kernel code addresses only: 0xfffffe.. and halfword aligned. */
+        if ((val >> 40) == 0xfffffe && (val & 3) == 0) {
+            fprintf(stderr, "vusb@   stack+%#llx = %llx\n", (unsigned long long)(at - base),
+                    (unsigned long long)val);
+            shown++;
+        }
+    }
+}
+
 static uint64_t common_read(HvVirtio *v, uint64_t off) {
     HvVirtq *q = v->qsel < v->nq ? &v->q[v->qsel] : NULL;
     if (vtrace_usb(v)) fprintf(stderr, "vusb-cfg: read +%#llx\n", (unsigned long long) off);
+    if (off == 0x14 && vtrace_usb(v)) vusb_state_dump(v, "read status");
     switch (off) {
     case 0x00: return v->dfsel;
     case 0x04: return v->dfsel < 2 ? (uint32_t)(v->features >> (32 * v->dfsel)) : 0;
@@ -102,22 +132,24 @@ static void common_write(HvVirtio *v, uint64_t off, uint64_t val, unsigned size)
         break;
     case 0x14:
         if (vtrace_usb(v)) {
-            /* Who wrote it: the guest PC, so the writer can be looked up in the kernelcache.
-               The ACKNOWLEDGE write is where the USB device controller stops, and knowing the
-               function that made it turns "somewhere in a kext" into a symbol. */
-            unsigned long long pc = 0;
-            if (v->m && v->m->cpu) pc = (unsigned long long) v->m->cpu->pc;
-            fprintf(stderr, "vusb-cfg: status = %#llx (pc %llx)\n", (unsigned long long) val, pc);
+            /* Who wrote it: the guest's own state at the access, so the writer can be looked up
+               in the kernelcache.  The ACKNOWLEDGE write is where the USB device controller
+               stops, and knowing the function that made it turns "somewhere in a kext" into a
+               symbol. */
+            vusb_state_dump(v, (uint8_t)val ? "write status (nonzero)" : "write status (reset)");
+            fprintf(stderr, "vusb-cfg: status = %#llx\n", (unsigned long long) val);
         }
         /* The USB device controller raises its interrupt line on a state change, as the hardware
            does when a device is attached: AppleVirtIOUSBDeviceController writes ACKNOWLEDGE and
            then leaves its start routine waiting for that event before it reads device features.
            Without it the negotiation never proceeds past 0x1, the guest never enables a queue,
-           and the host has nothing to talk to (experiment, HV_VUSB_INTX=0 disables). */
-        if (vtrace_usb(v) && (val & 1) && !getenv("HV_VUSB_INTX")) {
+           and the host has nothing to talk to (experiment, HV_VUSB_INTX=0 disables).
+
+           The line is left asserted: the guest clears it by reading the ISR window (see bar_read),
+           which is what the real device does.  A one-shot pulse was tried first and the guest
+           never saw it -- the assertion and the deassertion landed in the same JIT block. */
+        if (vtrace_usb(v) && (val & 1) && !getenv("HV_VUSB_INTX"))
             hv_pci_set_intx(&v->pci, 1);
-            hv_pci_set_intx(&v->pci, 0);
-        }
         if ((uint8_t)val == 0) reset(v);
         else v->status = (uint8_t)val;
         break;
@@ -150,6 +182,10 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         uint8_t isr = v->isr;
         v->isr = 0;
         hv_pci_set_intx(&v->pci, 0);
+        /* The only evidence that the guest actually took the interrupt we raised: the spec
+           requires reading the ISR window to clear it, so a run with no "isr read" line means
+           the line never reached this driver, not that the driver ignored it. */
+        if (vtrace_usb(v)) fprintf(stderr, "vusb-cfg: isr read = %#x\n", isr);
         return isr;
     }
     if (off < NOTIFY) {
