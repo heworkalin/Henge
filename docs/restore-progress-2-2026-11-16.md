@@ -503,3 +503,78 @@ ldr x1,[global+0xfe8] ; call [name+0x208]   ; setDeviceInterruptsFunctionName
 `0x3c/0x3d`（interrupt line / pin）和 `0x80..0x9f`（MSI cap）加定点日志。resolver 要算
 INTID 必须读 interrupt pin；如果 guest 连 `0x3d` 都没读过，说明它压根没进 resolve 流程（①②③ 之一），
 而不是我们的 PCI 设备哪里不对。
+
+## 18. INTx specifier 链与 ACKNOWLEDGE 之后（2026-11-16 下午，实测 + 反汇编）
+
+### 18.1 MSI capability 之前根本没装到 vusb 上（真 bug，已修，提交 2f2b5c9）
+
+`hv_virtio_init()` 建的每个 virtio 设备都是 `1af4:xxxx`，`virtio_usb.c` 之后才把 id 改成
+`106b:1a01`；而 MSI cap 的构造写在 `hv_virtio_init()` 里，条件是 `config[0]==0x6b`，**那一刻
+vendor 还是 `0x1af4`**，所以永远不命中。实测证据（修前）：`pci vusb: read 080 (1) = 4`
+（cap id `0x04` = Slot ID，不是 MSI 的 `0x05`）。修后：`read 080 (4) = 0x00020005`
+（MSI，MMC=1，next=0），guest 随后 `read 082 (2) = 2` 解析了 Message Control。
+
+**但 status 仍然停在 `0x1`** —— 因为 `usesMultipleInterruptVectors()` 只在 PCI vendor
+为 `0x1af4` 时为真，vusb 走**单向量 INTx** 路径，MSI cap 对它无用。这个修复本身有价值
+（能力描述合法了），但不是解锁点。
+
+### 18.2 INTx specifier 确实被安装了（实测 + 反汇编）
+
+`IOPCIBridge::resolveLegacyInterrupts(bridge, service, dev)`（`0x99a3c48`）：
+
+```asm
+w1 = 0x3d ; bl <configRead8>              ; 读 interrupt pin
+sub w8,w0,#5 ; cmn w8,#-4 ; b.lo <err>    ; pin 必须 1..4
+w21 = pin - 1
+ubfx x4,[dev+0xa8],#11,#5                 ; slot
+call [bridge+0x6e8]("ResolvePCIInterrupt", 0, service, pin-1, &out)
+cbz  w0, <0x11d3c>                        ; 成功
+  否则：读 0x3c(interrupt line) & 0xf 当 specifier
+<0x11e88>:
+call [bridge+0x6e8]("SetDeviceInterrupts", 0, dev, &spec, 1)   ; count == 1
+```
+
+两条路径**都会**走到 `SetDeviceInterrupts(count=1)`。实测 `pci vusb: read 03d (1) = 1`
+（只读一次，就在 `status = 0` 之前）证明这条函数**确实为 vusb 跑过**。
+→ **specifier 不是瓶颈**，之前「vusb 没有 interrupt source」的推断需要修正：
+`IOService::getInterruptType` 检查的 `this+0x80` 是 `registerInterrupt` 之后才填的数组，
+不是 `IOInterruptSpecifiers` 属性。
+
+### 18.3 ACKNOWLEDGE 之后的分支（`AppleVirtIOTransport::performDeviceInitialization`，`0x9038be0`）
+
+```asm
+call [this+0x900]()            ; 读 status
+cmp  w0,#2 ; b.hs <0x30d10>    ; 已 >= 2 就跳过
+call [this+0x908](this, 1)     ; updateStatus(1) = ACKNOWLEDGE
+tbz  w0,#0, <0x30bf4>          ; 返回值 bit0 == 0 → 中止
+call [this+0x908](this, 2)     ; DRIVER
+<0x30bf4/0x9038d94>:           ; 中止路径
+    call [this+0x908](this, 0x80)   ; updateStatus(FAILED)
+    return 0xe00002e9
+```
+
+`updateStatus`（`0x9025680`）是：
+
+```asm
+status = byte[cfg+0x14] | newbits      ; OR，不是赋值
+byte[cfg+0x14] = status
+x0 = [this+0xb0]                       ; provider
+call [provider+0x970](this, 0x12)
+call [provider+0x958](this, 0x12, status|new)
+→ 返回值就是 updateStatus 的返回值（即上面那个 bit0 判据）
+```
+
+### 18.4 观测与反汇编的矛盾（下一步要解的）
+
+- 日志有 `status = 0x1`（updateStatus(1) 生效）
+- 日志**没有** `status = 0x81` → 没走中止路径
+- 日志**没有** `status = 0x2` → 也没走 DRIVER
+
+所以 `performDeviceInitialization` 两次 `updateStatus` 之间就停了，**或者** vusb 的
+`status = 0x1` 写入根本不是这条路径发出的（`status = 0` 与 `status = 0x1` 的 guest pc
+相差 `0x118`，是两处不同代码，说明 reset 与 update 分开写，符合预期）。
+
+**下一步（静态，可控）**：反汇编 provider `[this+0xb0]` 的槽 `0x958` / `0x970`（参数 `0x12`），
+看它在什么条件下返回 bit0=0。若 `[this+0xb0]` 是 `AppleVirtualPlatformPCIE`，
+`0x970`/`0x958` 就是平台侧对 "device status 变化" 的处理（很可能是
+`getVendorDataCapabilities` 或 virtio 配置空间的转发，失败即返回错误）。
