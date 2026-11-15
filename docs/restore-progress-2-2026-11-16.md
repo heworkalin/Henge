@@ -417,3 +417,49 @@ gic-msi: +0x8 读过一次，门铃 +0x40 从未写（没有 MSI 中断发生）
 ```
 
 宿主（glibc）与设备（bionic，Android CLI 已重建）**逐行一致**。
+
+## 16. 「就绪」的判定条件（反汇编确认，这是继续修的依据）
+
+### 16.1 `IOService::getInterruptType(index, out)`（`0xfffffe00084fe198`，内核主二进制）
+
+```asm
+ldr  x8, [x0, #0x80]        ; interruptSources 数组
+cbz  x8, <error 0xe00002df>          ; ①
+tbnz w20, #0x1f, <error>             ; ② index < 0
+ldr  w8, [x21, #0x78]
+cmp  w8, w20 ; b.le <error>          ; ③ index >= count
+ldr  x0, [x8, #0x80] 经 ubfiz(index*16)  ; ④ sources[index] == NULL
+cbz  x0, <error>
+... controller->getInterruptType(+0x890)
+```
+
+四条全满足才算就绪，否则返回 `0xe00002df`。
+
+### 16.2 MSI controller 恒成功
+
+```asm
+AppleVirtualPlatformPCIEMSIController::getInterruptType (0x906a758):
+    cbz x3, <err 0xe00002c2>
+    w0 = 0 ; *out = 0x10000    ; byte[+2]=1 → findNextMSIInterruptIndex 的 bit0 判据通过
+```
+
+### 16.3 specifier 的安装方
+
+```asm
+AppleVirtualPlatformPCIEInterruptResolver::setDeviceInterrupts(service, spec, count)  (0x90664e4)
+    cbz x1 <err>; cbz x2 <err>; cmp w3,#1 ; b.ne <err>    ; count 必须正好 1
+AppleVirtualPlatformPCIEInterruptResolver::resolvePCIInterrupt(...)                  (0x9066384)
+    ... blraa [x21+0x160] ; cmp w0,#4 ; b.ne <err>        ; 要求返回 4 才继续
+AppleVirtualPlatformPCIE::deviceInterruptController()                                (0x9069dd4)
+_gIOInterruptSpecifiersKey  / _gIOInterruptControllersKey  (IOPCIFamily 的键)
+```
+
+### 16.4 当前结论
+
+vusb 的 `IOPCIDevice` 上**没有 interrupt source**（数组空 / count 0 / `sources[0]==NULL`），
+因此 `IOService::getInterruptType(0)` 返回 `0xe00002df`，
+`findNextMSIInterruptIndex` 的 `cbnz w0` 直接失败（**不是**循环），
+`assignInterruptAction` 不建中断源 → `OSArray` 空 → `setInterruptsEnabled` false →
+`ACKNOWLEDGE` 之后中止。这也解释了为什么加 MSI capability 单独无用。
+
+要修的是「让 resolver 给 vusb 装上 interrupt specifier」，而不是继续加 PCI capability。
