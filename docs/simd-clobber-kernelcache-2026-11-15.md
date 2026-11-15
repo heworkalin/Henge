@@ -224,3 +224,53 @@ HV_LOG=2            # 注意：HV_LOG=1 时有些 log>=2 才走的逻辑不执�
 3. `grep -c "data abort: esr"` → 465 左右说明到了 pmap 阶段
 4. `grep "restore finished"` → `0` 才是成功，`-2` 是 `recovery_enter_restore` 失败
 5. 日志最后一条是不是 `el0` —— 是的话，问题已经在用户态，不在内核 mm
+
+## 十一、更正：`HV_NO_KFIX=1` 会崩，这条结论已经过时（2026-11-15 晚实测）
+
+旧文（`kernel-panic-investigation-2026-11-15.md` 第五节）与本文档的验证清单里都写着
+"`HV_NO_KFIX=1` 关掉 rebase，guest 早期就崩"。**那是 SIMD bug 还没修的时候测的**，当时的
+崩是 LZFSE 解压本身错了（解码器状态被 helper 破坏），内核在错误数据上跑，当然崩 —— 跟
+rebase 没关系。
+
+同一时期的另一条结论也一并作废："`__DATA` 必须我们补，否则内核跑不起来" 只在**数据本身**
+正确的前提下才谈得上。现在的实测：
+
+| 配置 | restore | kext 块数 | MMIO 设备 | 崩溃 |
+|---|---|---|---|---|
+| 默认（我们补 rebase） | failed | 0 | bdif/cfg/gic/pvpanic | 无 |
+| **`HV_NO_KFIX=1`（完全不补）** | **failed** | **0** | **完全一样** | **无** |
+
+也就是说：
+
+1. **内核自己会把 chained fixup 走完**（关掉我们的补丁也不崩，一路跑到 userland）。
+   我们那份补丁现在是**冗余**的，但**无害**（内核看到已经处理就直接跳过）。
+2. **rebase 不是当前任何问题的原因。** 关不关它，`kext=0`、设备零访问都不变。
+3. kernelcache 的 fixup 链只有两段，**都是 format 8（`DYLD_CHAINED_PTR_64_KERNEL_CACHE`，
+   没有 PAC auth）**，所以"我们写回时丢掉 bit63/auth 位"这件事也彻底无关 —— format 8 本来
+   就没有 auth。
+
+**读旧文档时的规则**：凡是写着"关掉 X 就崩"的结论，先确认它是在 SIMD 修复**之后**测的；
+否则一律当成"当时的崩另有原因"。
+
+## 十二、当前唯一确凿的异常：`kext 块数 = 0`
+
+两次独立运行（是否 rebase 都一样）都得到：
+
+```
+seg blocks: kext 0   kernel ~330k-550k   other ~95k
+```
+
+`__PRELINK_TEXT`（arm64 上 kext **不**会搬去 basement —— `KEXT_ALLOC_BASE` 只在
+`osfmk/mach/i386/vm_param.h` 里定义，所以 arm64 的 `CONFIG_KEXT_BASEMENT` 是关的）被执行
+的次数是 **0**，而同一时刻：
+
+- `launchd` / `restored` 等用户态进程都在（探针扫内存得到）
+- 内核主干跑了几十万块
+- **PCIe / UART / GFX 的 MMIO 访问次数是 0**（histogram 是完整的：`bdif` 记录了 1600 万次）
+
+三者是同一件事：**没有设备驱动被启动，于是没有任何设备被访问，restored 于是永远等不到
+USB 通道。** restore 的 -2（`recovery_enter_restore` 超时）是这个的结果，不是原因。
+
+下一步（下次接着做）：在 `__PRELINK_TEXT` 起点 `0xfffffe001bb20000` 下 `HV_PCHK` 断点，
+用一次运行区分"内核根本没跳进 kext"（→ 查 `IOCatalogue` 匹配 / `OSKext::start` 的调用链）
+和"跳进去了但走飞"（→ 按 SIMD 那套办法逐条对拍指令语义）。
