@@ -996,3 +996,38 @@ guest 的 vusb 驱动在 `readyForHost` 之后**等待上层提交第一个 IO �
 定位 `IOUSBDeviceController::io()` 的调用方（USB device 侧的上层驱动，通常是
 `AppleUSBDevice`/`IOUSBDevice` 系列），确定它在什么条件下提交第一个 EP0 请求 ——
 这也是设备模型需要促成的事件。
+
+## 29. 明确的模型缺口：vusb 的 device config 从未实现（config_len = 0）
+
+`devices/virtio_usb.c` 的 `hv_virtio_usb_create()` 只设了 PCI id / class / MSI cap，
+**从未设置 `v->config_len`**，因此 `HvVirtio.config[256]` 整体为 0、长度为 0。
+
+对照其它 virtio 设备，全都实现了 device config：
+
+| 设备 | config_len |
+|---|---|
+| `virtio_blk` | 96 |
+| `virtio_input` | 136 |
+| `virtio_net` | 12 |
+| `virtio_snd` | 12 |
+| `virtio_balloon` | 8 |
+| **`virtio_usb`** | **未设置（0）** |
+
+而 PCI capability 里 DEVICE 窗口声明长度是 `0x100` ——
+guest 认为有 256 字节可读，实际读到 0。
+
+### 29.1 与 trace 结论的关系
+
+trace 里 device config 一次都没被读（没有 `virtio 106b:1a01 config read` 日志），
+而 `AppleVirtIOUSBDeviceController` 的 `start` 在 `readyForHost` 之后就停了。
+两者一致地指向同一件事：**设备控制器没有从 device config 拿到它需要的设备描述，
+因此没有进入 EP0 队列建立（`io()`→`ioGated`→`startEp0In` 全为 0 块）。**
+
+这是**已确认的模型缺口**（不是已证实的唯一根因）：设备配置区是空的，
+而真实 Virtualization.framework 的 vusb 会在这里提供 USB 设备描述与端口状态。
+
+### 29.2 下一步
+
+从 guest 侧反汇编推出 device config 的确切布局：在
+`AppleVirtIOUSBDeviceController` 里找通过 `IOMemoryMap + offset (>= 0x2000)` 读取的地方，
+列出它访问的偏移与宽度，据此填充 `virtio_usb.c` 的 `config[]` 与 `config_len`。
