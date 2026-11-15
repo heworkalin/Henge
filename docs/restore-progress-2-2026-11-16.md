@@ -884,3 +884,26 @@ port::start ─> finishStart ─> IOPort::finishStart ...      (block ~155k-158k
    （`goOnBus()` 自身、IdentityVirtioMessenger、HIDBridge）→ 调用者在别处
 2. 更重要：确认上游是如何保证「controller 先 start、port 后 start」的顺序，
    我们这边是否因为 DT/PCI 创建顺序（vusb 被提前创建）导致倒置
+
+## 26. 排除：vusb 的 PCI 创建顺序不是原因（2026-11-16 深夜）
+
+我们的 `devices/vmapple.c` 把 `hv_virtio_usb_create()` 提到了 block 设备之前
+（注释说明是为了让它的 INTx 走 `interrupt-base + slot` 的低 slot），
+`origin/main` 则是最后创建。`HV_VUSB_LATE=1` 可切回上游顺序。
+
+实测（2048 MB，`HV_VUSB_LATE=1`）：
+
+```
+status = 0 → read 0x14 ×2 → status = 0x1（ACK）→ read 0x14 → isr read = 0
+队列寄存器 / DRIVER_OK 写入：0 次
+```
+
+与"提前创建"完全一致。**结论：PCI slot / 创建顺序无关**，
+trace 里观察到的「port 先于 controller start」在上游顺序下同样成立（我们这次就是上游顺序），
+所以那是正常流程，不是回归点。
+
+至此「谁应该调 `goOnBus()`」仍是唯一未闭合项：它是
+`__ZTV30AppleVirtIOUSBDeviceController` 的 vtable 槽（对象 `+0x8c8`），
+调用者必须持有一个该类型的对象；`AppleVirtualPlatform` 里三处 `add #0x8c8` 都不是它。
+下一步据此在其它 kext（IOPortFamily / IOUSBDeviceFamily / IOUSBHostFamily）里按
+「对象是 AppleVirtIOUSBDeviceController」这一类型线索定位调用点。
