@@ -463,3 +463,43 @@ vusb 的 `IOPCIDevice` 上**没有 interrupt source**（数组空 / count 0 / `s
 `ACKNOWLEDGE` 之后中止。这也解释了为什么加 MSI capability 单独无用。
 
 要修的是「让 resolver 给 vusb 装上 interrupt specifier」，而不是继续加 PCI capability。
+
+## 17. specifier 安装链的完整反汇编（结论补全）
+
+### 17.1 `IOPCIBridge::resolveMSIInterrupts(bridge, service, dev, slot, pin)`（`0x99a3b04`，IOPCIFamily）
+
+```asm
+ldrb  w8,[global+0x641] ; tbnz w8,#4, 0x11ba8     ; ① 全局 MSI 使能位
+ldr   x1,[global+0x668] ; call [dev+0x2c8](x1)    ; ② 设备是否已带 MSI 属性
+cbnz  x0, 0x11c5c                                 ;    有 → 用现成
+ldr   x8,[bridge+0x98]  ; cbz x8, 0x11c04         ; ③ bridge 的中断控制器
+ldr   x9,[x8+0x20]      ; cbnz x9, 0x11c04        ;    已初始化 → 放弃
+ldr   x1,[x8+0x6c0]                               ; ④ 平台函数名
+call  [bridge+0x6e8](x1, slot, 0, 0, 0)           ;    callPlatformFunction
+```
+
+### 17.2 `AppleVirtualPlatformPCIEInterruptResolver::callPlatformFunction`（`0x9066264`）
+
+按 **OSSymbol 名** 分派：
+
+```asm
+ldr x1,[global+0xfe0] ; call [name+0x208]   ; resolvePCIInterruptFunctionName
+cbz w0, <下一个> ; 匹配 → 0x185b4 (resolvePCIInterrupt)
+ldr x1,[global+0xfe8] ; call [name+0x208]   ; setDeviceInterruptsFunctionName
+匹配 → 0x18598 (setDeviceInterrupts)
+```
+
+### 17.3 五个可能的断点
+
+| # | 断点 | 归属 |
+|---|---|---|
+| ① | 全局 MSI 使能位（`[global+0x641]` bit4） | guest 内部状态 |
+| ② | 设备已带 MSI 属性（`[dev+0x2c8]` 非 0） | guest 内部状态 |
+| ③ | `[bridge+0x98]` 为空 / `[+0x20]` 非空 | guest 内部状态 |
+| ④ | platform function 名不匹配 | **可被我们的设备模型影响** |
+| ⑤ | `resolvePCIInterrupt` 的 `cmp w0,#4` 失败（`0x9066444`） | **可被我们的设备模型影响** |
+
+成功率最高的下一步是**运行期确认 ④/⑤ 有没有发生**：在 `devices/pcie.c` 里对 vusb 的
+`0x3c/0x3d`（interrupt line / pin）和 `0x80..0x9f`（MSI cap）加定点日志。resolver 要算
+INTID 必须读 interrupt pin；如果 guest 连 `0x3d` 都没读过，说明它压根没进 resolve 流程（①②③ 之一），
+而不是我们的 PCI 设备哪里不对。
