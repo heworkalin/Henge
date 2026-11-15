@@ -1731,17 +1731,27 @@ static int run_loop(HvCpu *cpu, int one) {
                             *len = 16u << 20;
                             fprintf(stderr, "hengevm: boot_args dt length %u -> %u (pa 837f0000 fixed)\n",
                                     was, *len);
-                            /* The kernel prints nothing without -v, and its own words about what
-                               it does next are worth more than anything inferred from registers.
-                               The command line follows the device tree fields at 0x6c. */
-                            char *cmd = (char *) q + 0x6c;
-                            if (!getenv("HV_QUIET_BOOT") && !strstr(cmd, "-v")) {
-                                size_t n = strnlen(cmd, 1000);
-                                if (n + 3 < 1024) { memcpy(cmd + n, " -v", 4); }
-                                fprintf(stderr, "hengevm: boot-args now \"%s\"\n", cmd);
-                            }
                         } else {
                             fprintf(stderr, "hengevm: boot_args at 837f0000 has dt length %u; scan found none\n", was);
+                        }
+                        /* The kernel prints nothing without -v, and its own words about what it
+                           does next are worth more than anything inferred from registers. The
+                           command line follows the device tree fields at 0x6c. Do this whether or
+                           not the length was just patched above: the scan above already rewrote
+                           the length, so gating on it silently skipped the injection. */
+                        char *cmd = (char *) q + 0x6c;
+                        if (!getenv("HV_QUIET_BOOT")) {
+                            size_t n = strnlen(cmd, 1000);
+                            if (!strstr(cmd, "-v") && n + 3 < 1024) { memcpy(cmd + n, " -v", 4); n += 3; }
+                            /* DEBUG (temporary): ask for the serial console so kprintf/IOLog reach
+                               the PL011 model (which fputc()s to stdout) instead of being dropped.
+                               SERIALMODE_OUTPUT (0x2) is what switch_to_serial_console() needs. */
+                            const char *extra = getenv("HV_EXTRA_BOOT_ARGS");
+                            if (extra && *extra) {
+                                size_t en = strlen(extra);
+                                if (n + en + 2 < 1024) { cmd[n] = ' '; memcpy(cmd + n + 1, extra, en + 1); n += en + 1; }
+                            }
+                            fprintf(stderr, "hengevm: boot-args now \"%s\"\n", cmd);
                         }
                     } else {
                         fprintf(stderr, "hengevm: boot_args: scan found none and 837f0000 is not RAM here\n");

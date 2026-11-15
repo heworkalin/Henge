@@ -557,9 +557,28 @@ extern uint64_t hv_seg_kext_blocks, hv_seg_kernel_blocks, hv_seg_other_blocks;
 static void scan_kernel_log(void) {
     static const char *const keys[] = {
         "KernelConfigTables", "kext info dictionaries", "prelinked kext",
-        "KextLog", "OSKext", "IOKit", "koxt", "KernelBootstrap", "unsupported"
+        "KextLog", "OSKext", "IOKit", "koxt", "KernelBootstrap", "unsupported",
+        /* Personalities only exist as heap objects once they entered the IOCatalogue; the
+           same words also live in __PRELINK_INFO at 0x76ecc000 (PA kimage_pa+0x33b4000),
+           which the scan skips, so a hit below 0x90000000 is a real copy. */
+        "IOProviderClass", "IONameMatch", "personalities sent", "sent to the IOCatalogue",
+        "matching started", "IOService matching",
+        /* OSUnserialize copies every plist key into the heap, so these prove the prelink
+           plist was actually parsed (not merely present in __PRELINK_INFO). */
+        "CFBundleIdentifier", "IOKitPersonalities", "IOProbeScore", "pcie,vmapple1",
+        /* The DT root's compatible strings. IORegistryEntry::init(old,plane) copies the root's
+           property table into gRootNub, so these must appear as heap copies; and
+           AppleVirtualPlatformARMPE's IONameMatch is exactly one of them. */
+        "AppleVirtualPlatformARM", "VirtualMac2,1", "VMA2MACOSAP", "device-tree",
+        /* Set by IOService only when a personality actually matched a nub. If none of these
+           exist on the heap, matching never produced a hit (candidates: traversal found no
+           nub, or the compare failed), and no kext could ever be probed. */
+        "IOMatchedPersonality", "IOMatchedServiceCount", "IOMatchedAtBoot",
+        "IOProbeScore", "IOResourceMatch", "omitting its personalities"
     };
-    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull; pa += 0x1000) {
+    /* Start above the kernel image (loaded at 0x73b18000, ~19 MB plus __PRELINK_INFO at
+       0x76ecc000): everything the image itself contains would otherwise match here. */
+    for (uint64_t pa = 0x80000000ull; pa < 0x90000000ull; pa += 0x1000) {
         static uint8_t pg[4096];
         if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
         for (int i = 0; i + 8 < (int) sizeof pg; i++) {

@@ -150,6 +150,13 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 **kext 一个都不 start 的排查现状与完整地址表见 `docs/kext-start-matching-2026-11-16.md`**
 （已排除项、已确认执行链路、复现命令）。
 
+**内核日志（kprintf/IOLog）默认全部丢弃**，要看到必须同时给
+`HV_EXTRA_BOOT_ARGS="serial=3 debug=0xA"`（`serial=3` 触发 `switch_to_serial_console`，
+`debug` 的 `DB_PRT=0x2`/`DB_KPRT=0x8` 打开 `disable_serial_output`）。
+注入点在 `core/dispatch.c` 的 `boot_args->CommandLine`（PA `0x837f0000`，偏移 `0x6c`），
+**注入必须写在长度修补的 if/else 之外**，否则会被跳过。完整配方与排错表见
+`docs/kernel-log-2026-11-16.md`。日志行形如 `hengevm: serial: ...`。
+
 ## 6. 调试方法论（本项目最贵的教训）
 
 1. **推导 ≠ 证据。** 讲清机制要有 XNU 源码/实测支撑；否则标"不确定"。
