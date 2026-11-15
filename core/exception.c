@@ -680,8 +680,12 @@ static int vmapple_hvc(HvCpu *cpu, uint32_t fn) {
         if (off) return 0;   /* the pre-PV behaviour: not handled, the kernel sees a failure */
         uint64_t id = (uint32_t) cpu->x[1];
         cpu->x[0] = 0;
-        if (id < (uint64_t) cpu->m->ncpus) {
-            HvCpu *t = &cpu->m->cpus[id];
+        /* m->cpus is an array of pointers, so the target is cpus[id], not &cpus[id]. The latter
+           compiled with only a warning (-w hides it here) and made t point at the slot instead of
+           the CPU: t->pc_state then read whatever the neighbouring slots contained, and a kick to
+           any id other than 0 died inside the host as SIGSEGV right after "hvc #28 fn c3000006". */
+        if (id < (uint64_t) cpu->m->ncpus && cpu->m->cpus[id]) {
+            HvCpu *t = cpu->m->cpus[id];
             pthread_mutex_lock(&t->pc_state->wake_mu);
             t->pc_state->wake_pending = 1;
             pthread_cond_signal(&t->pc_state->wake_cv);
