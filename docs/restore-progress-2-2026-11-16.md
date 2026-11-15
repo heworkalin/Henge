@@ -1122,3 +1122,56 @@ vusb 的 USB 设备描述无法构建，因为 `[+0x1c4]` 的 bit30 未置；
 2. 反汇编 `0x9b9b240`（bit30 之后）到 `0x9b9d398`（成功标志）之间，确认
    `createUSBDevice` 需要哪些 controller 属性，判断是否只需我们补 device config
    / DT 属性即可满足。
+
+## 32. 根因链闭合到属性：`getProperty("DeviceDescription")` 返回 NULL
+
+### 32.1 `readyForHost` 的第一步
+
+```asm
+0x9b92394  adrp x1, .. ; add x1, x1, #0xdeb   → "DeviceDescription"
+0x9b923a4  call [this+0x2d8](x1)               ; IORegistryEntry::getProperty(const char*)
+0x9b923b8  x20 = 返回值
+0x9b923fc  call [this+0xa40](this)
+0x9b92418  createUSBDevice(x20)                 ; ← 参数就是该属性
+```
+
+`createUSBDevice(dict)` 用这个 dict 构建 USB 设备描述（字符串索引、配置、接口关联、描述符）。
+**dict 为 NULL 时它无法构建**，于是 `[controller+0x1c4]` 的 bit30 永不置位，
+后续每次进入都直接走尾部返回 —— 与 trace（7 块、`0xe00002c1`）完全一致。
+
+### 32.2 实测：属性没有被任何人提供
+
+- guest 串口日志：`DeviceDescription` 出现 **0 次**
+- DT（原厂 IPSW 的 ADT）里**没有** `device-description` / `DeviceDescription` 属性：
+  - `/device-tree/port-virtual-1`: `port-type`, `transports-supported`, `port-number`, `device_type="port-virtual"`
+  - `/device-tree/product/usb-device`: `vendor-id=0x05ac`, `product-string="macOS Virtual Machine"`,
+    `configuration-string`, `ncm-self-name-unit`, `ncm-interrupt-ep-disabled`, `ncm-control-ecid-mac`
+- 且全 DT 中**没有任何节点引用 `usb-device` 节点的 phandle（0x46）**
+
+### 32.3 因此完整因果链（自顶向下）
+
+```
+AppleVirtualUSBPort::start/finishStart           OK（trace 有块）
+AppleVirtIOUSBDeviceController::start            OK
+IOUSBDeviceController::start (prepareDefaults)   OK（串口有打印）
+IOUSBDeviceController::readyForHost              OK
+  getProperty("DeviceDescription") -> NULL       ← 断点
+createUSBDevice(NULL) -> 0xe00002c1              ← 立即返回
+[controller+0x1c4] bit30 永不置位               
+EP0 队列永不建立 (io -> ioGated -> startEp0In 全 0 块)
+virtio status 永远停在 ACKNOWLEDGE(0x1)
+host 的 GET_DESCRIPTOR 无处投递 -> "Waiting for device to enter restore mode"
+```
+
+### 32.4 下一步
+
+确认 `DeviceDescription` 在正常 VMAPPLE 上由谁生成。候选：
+
+1. `AppleVirtualUSBPort`（从 DT 的 `product/usb-device` 与 `port-virtual-1` 拼装）——
+   需要看它是否读 DT 子节点；它当前只有 `start`/`finishStart` 两个方法，
+   说明这项工作在 `IOPort` 基类或 `AppleVirtualPlatform` 的其它驱动里；
+2. 端口服务（`IOPortTransportStateUSB`）在设备 attach 时把描述写进 IORegistry；
+3. guest 内的某个服务（userland）通过 `IOUSBDeviceInterfaceUserClient` 提交。
+
+若属 1/2，那我们缺的是让 port 正确识别 vusb 为其设备来源（DT/PCI 关联）；
+若属 3，则需要 restore 环境里对应的用户态组件。
