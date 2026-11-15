@@ -1086,3 +1086,39 @@ HV_EXTRA_BOOT_ARGS="serial=3 debug=0xA usb_dev_nmi=1"
 下一步：沿 `createUSBDevice+0xac` 之后的实际控制流（它 `b 0x223f4` 到达尾部前
 经过的少量块）确认是哪一项属性缺失导致提前返回；`0x223f4` 附近只有少数块，
 可以逐条对照反汇编判断。
+
+## 31. `createUSBDevice` 提前返回的真正判据：`[+0x1c4]` 的 bit30（不是 bit0）
+
+### 31.1 两条门
+
+```asm
+0x9b9ae14  tbnz w21, #0,    <0x20290>    ; bit0  = debug 位
+0x9b9b240  tbz  w21, #0x1e, <0x2062c>    ; bit30 = 功能位（设备描述能否构建）
+```
+
+第 30 节把 bit0 当成功能判据是错的：bit0 只决定走带日志的版本。
+真正的门是 **bit30**，所以 `usb_dev_nmi=1`（只影响 bit0）实测无效是必然的。
+
+### 31.2 `[controller+0x1c4]` 的三个写入点
+
+| 地址 | 函数 | 写入内容 |
+|---|---|---|
+| `0x9b90518` / `0x9b90540` | `IOUSBDeviceController::start` | `|= PE_parse_boot_argn("IOUSBDeviceController-debug"/"usb_dev_nmi")` |
+| `0x9b8e754` | `handleUserlandCommand+0x294` | `|= w20`（userland 传入的标志） |
+| `0x9b9d398` | `createUSBDevice+0x261c` | 成功路径末尾设置 |
+
+另：`createUSBDevice` 开头有 `copyClientEntitlement` 检查（`0x9b9ade4`，NULL 则失败返回）。
+
+### 31.3 结论与下一步
+
+vusb 的 USB 设备描述无法构建，因为 `[+0x1c4]` 的 bit30 未置；
+该位要么由 **userland 经 `IOUSBDeviceInterfaceUserClient` → `handleUserlandCommand`** 提供，
+要么由前一次成功的 `createUSBDevice` 设置。
+
+下一步（两选一，都很具体）：
+1. 反汇编 `handleUserlandCommand` 的调用链，确认它期望 userland 提供什么
+   （对应 guest 里 `IOUSBDeviceInterfaceUserClient` 的 external method），
+   再查 restore 环境里是否有该 userland 组件；
+2. 反汇编 `0x9b9b240`（bit30 之后）到 `0x9b9d398`（成功标志）之间，确认
+   `createUSBDevice` 需要哪些 controller 属性，判断是否只需我们补 device config
+   / DT 属性即可满足。
