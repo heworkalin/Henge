@@ -1813,6 +1813,10 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         return 0;
     }
     case HV_INSN_WAIT:
+        /* classify_hint() routes only WFE(2)/WFI(3) here, plus WFxT from CRn=1;
+           SEV(4)/SEVL(5) are HV_INSN_COPY ("runs unchanged") and execute natively,
+           which is what our WFE needs: it waits on the host's own wfe, so a natively
+           executed sev does reach it. */
         if (((insn >> 5) & 7) == 3 || ((insn >> 12) & 0xf) == 1) put_helper(e, pc, insn, HV_OP_WFI); /* WFI, WFIT, WFET */
         else { /* WFE: waiting for another CPU; the helper waits for the monitored word, then the block goes on */
             put_helper(e, pc, insn, HV_OP_WFE);
