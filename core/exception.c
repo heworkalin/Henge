@@ -24,6 +24,19 @@ char hv_svc_path[HV_SVC_CAP][96];
 uint64_t hv_uexc_n;
 uint64_t hv_uexc_elr[HV_UEXC_CAP], hv_uexc_far[HV_UEXC_CAP], hv_uexc_pc[HV_UEXC_CAP];
 uint32_t hv_uexc_esr[HV_UEXC_CAP], hv_uexc_type[HV_UEXC_CAP];
+/* The register file as it stood at an EL0 fault.  The base register of a bad load, or the
+   destination of a branch into garbage, exists only in the CPU at that instant: by the time
+   anything else looks the process has exited and its address space is gone (walking the page
+   tables then fails, which is exactly why the last-block snapshot in dispatch.c also stores a
+   physical page).  SVC (EC 0x15) is the normal path and is excluded; 0x20/0x21 are instruction
+   aborts from EL0 and 0x24/0x25 data aborts.  Ring of 8: the fault that ends a process is
+   usually the last one, but the ones just before say whether it was the first bad pointer or a
+   retry loop. */
+#define HV_EL0_FLT 8u
+uint64_t hv_el0_flt_n;
+uint64_t hv_el0_flt_pc[HV_EL0_FLT], hv_el0_flt_ret[HV_EL0_FLT], hv_el0_flt_far[HV_EL0_FLT];
+uint64_t hv_el0_flt_sp[HV_EL0_FLT], hv_el0_flt_x[HV_EL0_FLT][31];
+uint32_t hv_el0_flt_esr[HV_EL0_FLT];
 
 int hv_svc_pending[HV_MAX_CPUS];
 uint64_t hv_svc_last_slot[HV_MAX_CPUS];
@@ -88,6 +101,27 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
         hv_uexc_pc[k] = cpu->pc;
         hv_uexc_esr[k] = esr;
         hv_uexc_type[k] = (uint32_t) type;
+        if (type == HV_EXC_SYNC && ((esr >> 26) & 0x3f) != 0x15) {
+            uint64_t fi = hv_el0_flt_n++ & (HV_EL0_FLT - 1);
+            hv_el0_flt_pc[fi] = cpu->pc;
+            hv_el0_flt_ret[fi] = ret;
+            hv_el0_flt_far[fi] = far;
+            hv_el0_flt_sp[fi] = cpu->sp;
+            hv_el0_flt_esr[fi] = esr;
+            for (int r = 0; r < 31; r++) hv_el0_flt_x[fi][r] = cpu->x[r];
+            if (cpu->m->log >= 1) {
+                fprintf(stderr, "hengevm: el0 fault #%llu ec %llx pc %llx far %llx lr %llx sp %llx"
+                                " x0 %llx x1 %llx x8 %llx x19 %llx x20 %llx x21 %llx x22 %llx\n",
+                        (unsigned long long) hv_el0_flt_n,
+                        (unsigned long long) ((esr >> 26) & 0x3f),
+                        (unsigned long long) cpu->pc, (unsigned long long) far,
+                        (unsigned long long) cpu->x[30], (unsigned long long) cpu->sp,
+                        (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
+                        (unsigned long long) cpu->x[8], (unsigned long long) cpu->x[19],
+                        (unsigned long long) cpu->x[20], (unsigned long long) cpu->x[21],
+                        (unsigned long long) cpu->x[22]);
+            }
+        }
     }
     /* Every exception and interrupt the engine delivers, while diagnosing: a guest that ends up in
        its own vector with no log of how leaves nothing to go on. */

@@ -18,6 +18,8 @@
 #include "sysreg.h"
 #include "translate.h"
 
+void hv_el0_note(HvCpu *cpu);   /* cheap userland-block record, always on */
+
 /* Where userland was when it last ran, kept at zero cost: one store per block.  A full
    HV_TRACE_PC buffer is only needed to replay history; when all that is wanted is "where was
    userland when it stopped", paying 8 bytes per block doubles the runtime of a restore that
@@ -36,6 +38,10 @@ uint64_t hv_last_el0_page_pa;
    block.  The final block in the trace is a dyld jump stub whose destination is computed from
    x22/x23, so without these the page content alone cannot say where control went. */
 uint64_t hv_last_el0_x0, hv_last_el0_x22, hv_last_el0_x23, hv_last_el0_lr, hv_last_el0_sp;
+/* x19/x20/x21 as well: x20 is callee-saved and is what the restore helper kept its object pointer
+   in at the block where it stopped, so without it the last-block record cannot say what that
+   load was reading. Three more stores, once per userland block. */
+uint64_t hv_last_el0_x19, hv_last_el0_x20, hv_last_el0_x21;
 /* x16 carries the Darwin syscall number, and x0..x3 its first arguments: the stop happens on an
    svc, so these are what identify the call the kernel never returned from. */
 uint64_t hv_last_el0_x16, hv_last_el0_x1, hv_last_el0_x2, hv_last_el0_x3, hv_last_el0_x8;
@@ -1492,6 +1498,7 @@ static int run_loop(HvCpu *cpu, int one) {
            where the guest died, not how it got there. Kept only while diagnosing (log >= 2), and
            it is one store per block, which is why it can be on at all. */
         if (m->log >= 2) hv_pc_hist_note(cpu);
+        hv_el0_note(cpu);
         /* The kernel's own execution order, from its entry to wherever it stops: with no symbols
            and no console, the sequence of blocks is the only account of what the initialisation
            actually did, and where it departed from what it should have done. */
@@ -2416,10 +2423,28 @@ static int run_loop(HvCpu *cpu, int one) {
         {
             static uint64_t pc_lo, pc_hi;
             static int pc_read, pc_n;
+            /* HV_PCHK_CPU: which CPUs the probe fires on. Unset means cpu 0, which is what every
+               existing log was taken with; "all" (or -1) means every CPU, and a number means that
+               one. Userland does not always run on cpu 0 -- the restore helper ran on cpu 1 in the
+               runs that stalled -- so a single-CPU probe can miss the block entirely. */
+            static int pc_cpu, pc_cpu_read;
+            /* HV_PCHK_MAX: how many hits to print (default 400, as before). */
+            static int pc_max, pc_max_read;
             if (!pc_read) {
                 const char *e = getenv("HV_PCHK");
                 pc_read = 1;
                 if (e) pc_lo = strtoull(e, (char **) &e, 16), e && *e == ':' ? pc_hi = strtoull(e + 1, 0, 16) : 0;
+            }
+            if (!pc_cpu_read) {
+                const char *c = getenv("HV_PCHK_CPU");
+                pc_cpu_read = 1;
+                pc_cpu = 0;
+                if (c) pc_cpu = (!strcmp(c, "all") || !strcmp(c, "-1")) ? -2 : (int) strtol(c, NULL, 0);
+            }
+            if (!pc_max_read) {
+                const char *mx = getenv("HV_PCHK_MAX");
+                pc_max_read = 1;
+                pc_max = mx ? (int) strtol(mx, NULL, 0) : 400;
             }
             /* The range is given as the low 32 bits, the way every other pc in the log is
                printed: the high half is always 0xfffffe00 for the kernel image. */
@@ -2443,10 +2468,24 @@ static int run_loop(HvCpu *cpu, int one) {
             uint64_t dstv = (uint32_t) cpu->x[22];
             if (dst_lo && (dstv < dst_lo || dstv > dst_hi)) goto skip_pchk;
             if (len_lo && (uint32_t) cpu->x[24] < len_lo) goto skip_pchk;
-            if (pc_lo && pc_n < 400 && cpu->index == 0 && plow >= pc_lo && plow <= pc_hi) {
+            if (pc_lo && pc_n < pc_max && (pc_cpu == -2 || cpu->index == pc_cpu) &&
+                plow >= pc_lo && plow <= pc_hi) {
                 uint64_t wx = 0, nm = 0, slid = 0;
                 HvWalk wpc;
                 pc_n++;
+                if (cpu->el == 0) {
+                    /* The dump below dereferences x21 as a proc and x26 as the kernel's slide
+                       base: true for the kernel's own probes, meaningless for userland. Print
+                       the register file instead -- a userland stop is about finding out which
+                       base register pointed where, and where the call came from. */
+                    fprintf(stderr, "hengevm: pchk c%u user pc %llx lr %llx sp %llx\n  x:",
+                            cpu->index, (unsigned long long) cpu->pc,
+                            (unsigned long long) cpu->x[30], (unsigned long long) cpu->sp);
+                    for (int r = 0; r < 30; r++)
+                        fprintf(stderr, " %d=%llx", r, (unsigned long long) cpu->x[r]);
+                    fprintf(stderr, "\n");
+                    goto pchk_done;
+                }
                 hv_mmu_walk(cpu, cpu->x[21] + 0x48, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &wx, 4);
                 hv_mmu_walk(cpu, cpu->x[21] + 0x10, HV_ACC_READ, 1, &wpc);
@@ -2459,9 +2498,9 @@ static int run_loop(HvCpu *cpu, int one) {
                 (void) hv_phys_read(m, cpu->x[21] + 0x10 - 0xfffffdffa8000000ull, &nmpa, 8);
                 hv_mmu_walk(cpu, cpu->x[26] + 0x8c0, HV_ACC_READ, 1, &wpc);
                 (void) hv_phys_read(m, wpc.pa, &slid, 8);
-                fprintf(stderr, "hengevm: pchk pc %llx x0 %llx x1 %llx x21 %llx x22 %llx x23 %llx x24 %llx "
+                fprintf(stderr, "hengevm: pchk c%u pc %llx x0 %llx x1 %llx x21 %llx x22 %llx x23 %llx x24 %llx "
                                 "w27 %llx flags48 %llx name10 %llx namePA %llx x8 %llx x9 %llx x10 %llx x26 %llx slide %llx namePA %llx icount %llu\n",
-                        (unsigned long long) cpu->pc, (unsigned long long) cpu->x[0],
+                        cpu->index, (unsigned long long) cpu->pc, (unsigned long long) cpu->x[0],
                         (unsigned long long) cpu->x[1], (unsigned long long) cpu->x[21],
                         (unsigned long long) cpu->x[22],
                         (unsigned long long) cpu->x[23],
@@ -2471,6 +2510,7 @@ static int run_loop(HvCpu *cpu, int one) {
                         (unsigned long long) cpu->x[8], (unsigned long long) cpu->x[9],
                         (unsigned long long) cpu->x[10], (unsigned long long) cpu->x[26],
                         (unsigned long long) slid, (unsigned long long) nmpa, (unsigned long long) cpu->icount);
+            pchk_done:;
             }
         }
     skip_pchk:
@@ -2593,13 +2633,14 @@ static int run_loop(HvCpu *cpu, int one) {
 static uint64_t pc_hist[HV_MAX_CPUS][PC_HIST];
 static uint32_t pc_hist_at[HV_MAX_CPUS];
 
-void hv_pc_hist_note(HvCpu *cpu) {
-    if (!cpu) return;
-    /* el == 0 and no address test.  Both halves of the obvious test are wrong: the kernel also
-       runs below 4 GB (it executes kernelcache pages at their physical address early in boot), so
-       an address-only filter records EL1 blocks as userland; and macOS user code starts at
-       0x100000000, so an address filter also throws away real userland -- launchd included. */
-    if (cpu->el == 0) {
+/* The cheap half, run on every userland block regardless of log level: the last block, the
+   registers it had, and a ring of userland blocks with their syscall numbers.  The comment that
+   used to sit here said "one store per block" and then the whole thing was gated on log >= 2,
+   which meant a run at the normal log level recorded nothing at all -- and the syscall return
+   values read back as zero because the pending-slot fix-up below never ran either. */
+void hv_el0_note(HvCpu *cpu) {
+    if (!cpu || cpu->el != 0) return;
+    {
         /* Back in userland: whatever x0 holds is the result of the syscall that trapped. */
         {
             extern uint64_t hv_svc_ret[], hv_svc_last_slot[];
@@ -2624,6 +2665,9 @@ void hv_pc_hist_note(HvCpu *cpu) {
         hv_last_el0_x0 = cpu->x[0];
         hv_last_el0_x22 = cpu->x[22];
         hv_last_el0_x23 = cpu->x[23];
+        hv_last_el0_x19 = cpu->x[19];
+        hv_last_el0_x20 = cpu->x[20];
+        hv_last_el0_x21 = cpu->x[21];
         hv_last_el0_lr = cpu->x[30];
         hv_last_el0_sp = cpu->sp_el0;
         hv_last_el0_x16 = cpu->x[16];
@@ -2636,7 +2680,10 @@ void hv_pc_hist_note(HvCpu *cpu) {
         hv_el0_trace_va[slot] = cpu->pc;
         hv_el0_trace_x16[slot] = cpu->x[16];
     }
-    hv_pc_hist_note_va(cpu->index, cpu->pc);
+}
+
+void hv_pc_hist_note(HvCpu *cpu) {
+    if (cpu) hv_pc_hist_note_va(cpu->index, cpu->pc);
 }
 
 /* How many blocks were ever run out of each part of the kernel image. The ring above keeps only
