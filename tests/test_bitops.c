@@ -21,6 +21,8 @@
 #include <ucontext.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "cpu.h"
 #include "dispatch.h"
@@ -71,8 +73,16 @@ static void *exec_page(const void *code, size_t len) {
  * The buffer starts with the same bytes for both runs, because a program that only partly fills it
  * would otherwise report the untouched tail as a difference.
  */
+/* `reloc`: the program stores pointers into the buffer. Native and JIT run over two
+   different buffers, so those words differ by the buffer base alone; subtract each run's
+   own base before comparing, or the test reports the buffer address as a difference. */
+static uint64_t rebase(uint64_t v, const void *base) {
+    uint64_t b = (uint64_t) (uintptr_t) base;
+    return (v >= b && v < b + OUT_BYTES) ? v - b : v;
+}
+
 static int run_one(const char *name, void *code_run, size_t off, size_t len, HvMachine *m,
-                   int bytes) {
+                   int bytes, int reloc) {
     static uint8_t want[8192] __attribute__((aligned(4096)));
     for (int i = 0; i < OUT_BYTES; i++) {
         want[i] = (uint8_t) (i * 7 + 3);
@@ -121,6 +131,10 @@ static int run_one(const char *name, void *code_run, size_t off, size_t len, HvM
         uint64_t a, b;
         memcpy(&a, want + i, 8);
         memcpy(&b, out_buf + i, 8);
+        if (reloc) {
+            a = rebase(a, want);
+            b = rebase(b, out_buf);
+        }
         if (a != b) {
             if (diffs < 16)
                 printf("  %s +%4d native %016llx jit %016llx\n", name, i, (unsigned long long) a,
@@ -131,6 +145,90 @@ static int run_one(const char *name, void *code_run, size_t off, size_t len, HvM
     printf("%-7s %s (%zu bytes of program, %d bytes compared)\n", name, diffs ? "FAIL" : "ok", len,
            bytes);
     return diffs != 0;
+}
+
+/*
+ * Multi-core scheduler handoff: two vCPUs, two host threads, one shared guest buffer.
+ *
+ * The programs under test are in tests/bitops_prog.s (sched_mc_waiter / sched_mc_waker);
+ * this is only the scaffolding that starts two CPUs at once, because a pthread cannot be
+ * created from assembly.
+ *
+ * It reproduces the guest's stall shape: the waiter publishes TH_WAIT and spins for TH_RUN,
+ * the waker clears TH_WAIT and sets TH_RUN. If the wake does not reach the other core, the
+ * waiter never leaves its spin -- the test times out and says so, instead of hanging.
+ */
+struct mc_ctx {
+    HvCpu *cpu;
+    int ret;
+};
+
+static void *mc_thread(void *arg) {
+    struct mc_ctx *c = arg;
+    c->ret = hv_run(c->cpu);
+    return NULL;
+}
+
+static int run_mc(HvMachine *m, void *code_run) {
+    static HvCpu cpus[2];
+    static struct mc_ctx ctx[2];
+    pthread_t th[2];
+
+    memset(out_buf, 0, 0x40);
+
+    for (int i = 0; i < 2; i++) {
+        hv_cpu_reset(&cpus[i], m);
+        cpus[i].index = (unsigned) i;
+        cpus[i].cpacr_el1 = 3u << 20;
+        /* One stack per CPU, far enough apart that a deep spin cannot touch the other. */
+        cpus[i].sp = (uint64_t)(uintptr_t) out_stack + (i ? 16384 : 32768) - 256;
+        cpus[i].x[0] = (uint64_t)(uintptr_t) out_buf;
+        cpus[i].x[30] = (uint64_t)(uintptr_t) code_run + LANDING;
+        cpus[i].pc = (uint64_t)(uintptr_t) code_run + (i == 0 ? MCW_OFF : MCT_OFF);
+        ctx[i].cpu = &cpus[i];
+        ctx[i].ret = -99;
+    }
+    m->stop_pc = (uint64_t)(uintptr_t) code_run + LANDING;
+
+    if (pthread_create(&th[0], NULL, mc_thread, &ctx[0]) != 0 ||
+        pthread_create(&th[1], NULL, mc_thread, &ctx[1]) != 0) {
+        printf("mc: cannot start a thread\n");
+        return 1;
+    }
+
+    /* Wait for both sides, with a bound: a waiter that never observes TH_RUN is the bug. */
+    int ticks = 0, both = 0;
+    for (; ticks < 300; ticks++) {
+        uint32_t w, t;
+        memcpy(&w, out_buf + 8, 4);
+        memcpy(&t, out_buf + 12, 4);
+        if (w && t) {
+            both = 1;
+            break;
+        }
+        usleep(10000);   /* 10 ms, 300 times: 3 s */
+    }
+
+    uint32_t state, ready, wd, td;
+    memcpy(&state, out_buf + 0, 4);
+    memcpy(&ready, out_buf + 4, 4);
+    memcpy(&wd, out_buf + 8, 4);
+    memcpy(&td, out_buf + 12, 4);
+
+    if (!both) {
+        /* The spinning CPU is still inside hv_run and cannot be joined; leave it and report.
+           The process exits below, so no thread is left holding the machine. */
+        printf("mc: TIMEOUT after %.1f s: state 0x%x ready %u waker %u waiter %u\n",
+               ticks * 0.01, state, ready, wd, td);
+        return 1;
+    }
+    pthread_join(th[0], NULL);
+    pthread_join(th[1], NULL);
+    int ok = (state & 0x4) && !(state & 0x1) && td == 1 && wd == 1;
+    printf("mc: state 0x%x (TH_RUN %s, TH_WAIT %s) ready %u waker %u waiter %u -> %s\n",
+           state, (state & 0x4) ? "set" : "CLEAR", (state & 0x1) ? "still set" : "cleared",
+           ready, wd, td, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 /* One iteration: fill the operands the same way for both runs, run both, compare results. */
@@ -213,13 +311,17 @@ int main(void) {
 
     const char *only = getenv("ONLY");
     if (!only || !strcmp(only, "bitops"))
-        failed += run_one("bitops", code_run, BITOPS_OFF, BITOPS_LEN, &m, 768);
+        failed += run_one("bitops", code_run, BITOPS_OFF, BITOPS_LEN, &m, 768, 0);
     if (!only || !strcmp(only, "memops"))
-        failed += run_one("memops", code_run, MEMOPS_OFF, MEMOPS_LEN, &m, OUT_BYTES);
+        failed += run_one("memops", code_run, MEMOPS_OFF, MEMOPS_LEN, &m, OUT_BYTES, 0);
     if (!only || !strcmp(only, "mathops"))
-        failed += run_one("mathops", code_run, MATHOPS_OFF, MATHOPS_LEN, &m, 25 * 8);
+        failed += run_one("mathops", code_run, MATHOPS_OFF, MATHOPS_LEN, &m, 25 * 8, 0);
     if (!only || !strcmp(only, "atomics"))
-        failed += run_one("atomics", code_run, ATOMICS_OFF, ATOMICS_LEN, &m, 32 * 8);
+        failed += run_one("atomics", code_run, ATOMICS_OFF, ATOMICS_LEN, &m, 32 * 8, 0);
+        /* The scheduler's list operations: enqueue, dequeue, clear_wait. */
+        failed += run_one("sched", code_run, SCHED_OFF, SCHED_LEN, &m, 0x90, 1);
+    if (!only || !strcmp(only, "mc"))
+        failed += run_mc(&m, code_run);
     printf("%d of 4 programs differ\n", failed);
     return failed != 0;
 }

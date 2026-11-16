@@ -454,3 +454,148 @@ atomics_prog:
     ldp     x19, x20, [sp], #32
     ret
     .size   atomics_prog, .-atomics_prog
+
+// Scheduler list operations: the multi-step store sequences thread_block/thread_go
+// perform on a thread structure, and nothing else.
+//
+//   enqueue : 2 loads, 3 stores (circle_enqueue_tail)
+//   dequeue : 2 loads, 3 stores (circle_dequeue)
+//   clear_wait : one read-modify-write of `state`
+//
+// The same bytes run natively and through the JIT, so a store the translator drops
+// or places at the wrong offset shows up as a difference in the buffer.
+//
+// buffer (x0):
+//   +0x000 head
+//   +0x020 t0.next   +0x028 t0.prev   +0x080 t0.state
+//   +0x040 t1.next   +0x048 t1.prev   +0x084 t1.state
+//   +0x060 t2.next   +0x068 t2.prev   +0x088 t2.state
+
+    .text
+    .globl  sched_prog
+    .type   sched_prog, %function
+sched_prog:
+    stp     x19, x20, [sp, #-32]!
+    stp     x21, x22, [sp, #16]
+    mov     x19, x0
+
+    // circle_queue_init: head = NULL
+    str     xzr, [x19]
+
+    // Three nodes, links self-looped (= on no queue), state = TH_WAIT|TH_UNINT.
+    mov     w9, #9
+    add     x1, x19, #0x20
+    str     x1, [x1]
+    str     x1, [x1, #8]
+    str     w9, [x19, #0x80]
+    add     x1, x19, #0x40
+    str     x1, [x1]
+    str     x1, [x1, #8]
+    str     w9, [x19, #0x84]
+    add     x1, x19, #0x60
+    str     x1, [x1]
+    str     x1, [x1, #8]
+    str     w9, [x19, #0x88]
+
+    // enqueue t0 into the empty queue
+    add     x1, x19, #0x20
+    str     x1, [x19]
+    str     x1, [x1]
+    str     x1, [x1, #8]
+
+    // enqueue t1: tail = head->prev; elt.next = tail.next; elt.prev = tail;
+    //             tail.next = elt; elt.next->prev = elt
+    add     x2, x19, #0x40
+    ldr     x3, [x19]
+    ldr     x4, [x3, #8]
+    ldr     x5, [x4]
+    str     x5, [x2]
+    str     x4, [x2, #8]
+    str     x2, [x4]
+    str     x2, [x5, #8]
+
+    // enqueue t2
+    add     x2, x19, #0x60
+    ldr     x3, [x19]
+    ldr     x4, [x3, #8]
+    ldr     x5, [x4]
+    str     x5, [x2]
+    str     x4, [x2, #8]
+    str     x2, [x4]
+    str     x2, [x5, #8]
+
+    // dequeue t1 (the middle one): prev.next = elt.next; elt.next->prev = elt.prev;
+    //                              elt.next = elt.prev = elt
+    add     x6, x19, #0x40
+    ldr     x7, [x6]
+    ldr     x8, [x6, #8]
+    str     x7, [x8]
+    str     x8, [x7, #8]
+    str     x6, [x6]
+    str     x6, [x6, #8]
+
+    // clear_wait on t0 and t2: state = (state & ~TH_WAIT) | TH_RUN
+    ldr     w3, [x19, #0x80]
+    and     w3, w3, #0xfffffffe
+    orr     w3, w3, #0x4
+    str     w3, [x19, #0x80]
+    ldr     w3, [x19, #0x88]
+    and     w3, w3, #0xfffffffe
+    orr     w3, w3, #0x4
+    str     w3, [x19, #0x88]
+
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #32
+    ret
+    .size   sched_prog, .-sched_prog
+
+// Multi-core scheduler handoff, two halves that run on two vCPUs at the same time.
+//
+// This is the shape of the deadlock seen in the guest: one CPU stands in for the
+// thread being woken and one for whoever calls wakeup/clear_wait. The waiting side
+// publishes TH_WAIT and spins on TH_RUN; the waking side clears TH_WAIT and sets
+// TH_RUN. If the store that publishes the wake never reaches the other core, or the
+// spin never observes it, the waiter never finishes -- which is exactly the guest's
+// symptom (TH_WAIT still set, no TH_RUN, nothing runnable).
+//
+// Per-side instructions are the ones XNU uses: plain ldr/str around dmb, plus
+// ldar/stlr for the state word.
+//
+// buffer (x0):
+//   +0x00 state        +0x04 ready        +0x08 waker_done    +0x0c waiter_done
+
+    .text
+    .globl  sched_mc_waiter
+    .type   sched_mc_waiter, %function
+sched_mc_waiter:
+    mov     w1, #9                  // TH_WAIT|TH_UNINT
+    str     w1, [x0]                // thread_block: publish the wait
+    dmb     sy
+    mov     w1, #1
+    str     w1, [x0, #4]            // ready = 1
+    dmb     sy
+1:
+    ldar    w1, [x0]                // acquire the state word
+    tbz     w1, #2, 1b              // spin until TH_RUN
+    mov     w1, #1
+    str     w1, [x0, #12]           // waiter_done = 1
+    ret
+    .size   sched_mc_waiter, .-sched_mc_waiter
+
+    .text
+    .globl  sched_mc_waker
+    .type   sched_mc_waker, %function
+sched_mc_waker:
+    add     x2, x0, #4
+2:
+    ldar    w1, [x2]                // acquire ready
+    cbz     w1, 2b                  // spin until the waiter published
+    ldar    w1, [x0]
+    and     w1, w1, #0xfffffffe     // state &= ~TH_WAIT
+    and     w1, w1, #0xfffffff7     // state &= ~TH_UNINT   (clear_wait does both)
+    orr     w1, w1, #0x4            // state |=  TH_RUN
+    stlr    w1, [x0]                // release the state (the wake)
+    mov     w1, #1
+    str     w1, [x0, #8]            // waker_done = 1
+    ret
+    .size   sched_mc_waker, .-sched_mc_waker
