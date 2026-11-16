@@ -93,7 +93,7 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
 | `HENGE_LOG_FILE` / `HENGE_LOG_RATE` | 日志文件路径 / 限速 |
 | `HENGE_KICKER=0` | 关掉 1 ms kicker（对照实验） |
 | `HV_RESTORE_BOOT_ARGS` | iBoot boot-args（如 `serial=3 -v startup_debug=1`） |
-| `HV_NO_KFIX=1` / `HV_KFIX_DC=1` | 关掉整段 rebase / 强制补 `__DATA_CONST` |
+| `HV_KFIX=1` / `HV_KFIX_DC=1` | 打开 rebase（默认不补，对照用）/ 强制补 `__DATA_CONST` |
 | `HV_BLOCKTIME=1` | 单块耗时采样（默认关，因为每块两次读计数器） |
 | `HV_STACKSCAN=1` | 卡住时 dump 内核栈 |
 | `HV_PTW_LOG` / `HV_PTW_SNAP` / `HV_DUMP_DC` / `HV_BLOCK_DUMP` | 页表写历史 / 段 dump |
@@ -180,8 +180,9 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
   （宿主 x16 保存 guest x16 到 slot，借用会污染 guest x16）。
 - **PAC 模型**：签名 no-op；`AUT*`/`XPAC*` = 把 bits[62:48] 置成 bit55 的符号扩展
   （`BFM #16,#14`；`#16,#6` 只清半段 → 权限异常风暴）。bit63 未处理，属已知缺口。
-- **内核镜像 rebase**：`__DATA` **必须我们补**（`arm_init` 前半段在 `kernel_collection_slide` 之前就读它）；
-  `__DATA_CONST` **绝不能补**（内核自己会补，补两次得到 `base+pointer`）。
+- **内核镜像 rebase**：**默认不补** —— 内核自己会走完 fixup，`HV_NO_KFIX=1`（完全不补）与补过的
+  两种情形实测行为完全一致（`docs/kext-start-matching-2026-11-16.md` 排除项 #3）。补 rebase 现为
+  对照用开关 `HV_KFIX=1`；打开时 `__DATA_CONST` 必须保持不补（补两次得到 `base+pointer`）。
 - **HVC 成功判据是 `x0` 非负**；PAC 键的汇编是 `cbnz x0, .`（失败即静默自旋）。
   OEM 调用要求 UID 等于 `3B878185-AA62-4E1F-9DC9-D6799CBB6EBB`、REVISION major=1，
   否则内核放弃全部 OEM 调用。

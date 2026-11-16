@@ -744,7 +744,12 @@ unsigned long long hv_hvc_count, hv_hvc_last_fn, hv_hvc_last_pc;
    call that comes back unsupported is a silent hang with no console output at all. HengeVM's PAC is
    a no-op, so the key calls only have to report success.
    Return values follow the firmware ABI the kernel checks: x0 >= 0 means success. */
+/* The vmapple OEM hypercall range (UID/REVISION/FEATURES, MABS offset, boot session UUID,
+   the PV ticket-lock WFK/VCPU_KICK). The kernel only needs an answer if it asks; a guest that
+   gets no answer behaves as it would on a hypervisor without OEM support, which is the normal
+   path and what this engine runs by default. HENGE_OEM=1 answers them, for a comparison run. */
 static int vmapple_hvc(HvCpu *cpu, uint32_t fn) {
+    if (!getenv("HENGE_OEM")) return 0;
     switch (fn) {
     /* The PAC keys (0xc100000x) are handled by psci() below: that block predates this one and
        also fills in the default key ids, so there is only one implementation of them. */

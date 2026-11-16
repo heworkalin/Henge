@@ -41,6 +41,7 @@
 #include "install.h"
 #include "machine.h"
 #include "vmapple.h"
+#include "net_slirp.h"   /* net_min.c implements this API; net_slirp.c needs libslirp */
 
 /* Bytes of the auxiliary storage image: 32 MB of data after a 16 KB header block. */
 #define AUX_BYTES 33570816ull
@@ -342,6 +343,13 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
     }
     hv_vmapple_reset_cpu(&g_board);
 
+    /* The guest's network has no backend unless one is attached: without it the
+       interface never finishes DHCP and its first wait never returns. */
+    if (g_board.net && hv_net_attach(&g_machine, g_board.net) != 0)
+        fprintf(stderr, "hengevm: no network backend attached\n");
+    else if (g_board.net)
+        fprintf(stderr, "hengevm: network backend attached (net_min)\n");
+
     /* Nothing has been reported by this run yet: keeping the previous verdict here is what made
        the attempt after a failure look like it had already failed. */
     g_install_step = -1;
@@ -450,6 +458,7 @@ static void *kicker_thread(void *arg) {
     while (g_running) {
         usleep(1000);
         usb_handoff_to_kernel();
+        hv_net_poll();                  /* frames the backend owes the guest */
         hv_machine_kick_all(&g_machine);
         n++;
         /* Once, a few seconds in: early enough that restored would have been forked by then when

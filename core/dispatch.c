@@ -1671,19 +1671,17 @@ static int run_loop(HvCpu *cpu, int one) {
                                     (unsigned long long) pa, (unsigned long long) (m->kimage_pa ? m->kimage_pa : pa));
                             cpu->m->kimage_pa = pa, cpu->m->kimage_va = pa + off_k;
                             if (getenv("HV_SLOW_MEM")) cpu->m->slow_mem = 1;
-                            /* HV_NO_KFIX=1 skips the rebase. iBoot is supposed to have done it
-                               already, and doing it twice adds the base twice; which of the two
-                               is true for a given firmware is exactly what this switch is for. */
-                            /* __DATA has to be rebased here: arm_init's early code (pc
-                               0x1d177058 on this kernel) reads pointers out of it before
-                               kernel_collection_slide() runs, and iBoot hands the image over with
-                               the raw chain words still in place -- the guest dereferenced
-                               0x00c000000379cf90, which is exactly the word the file holds at that
-                               slot. __DATA_CONST is the opposite case and kernel_fixups() skips
-                               it: the kernel rebases those itself, and doing it twice produced
-                               0x38c7c5a0 out of a valid 0x1d1645a0. HV_NO_KFIX=1 disables the
-                               whole pass for comparison. */
-                            if (!getenv("HV_NO_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
+                            /* The kernel rebases its own image: with this pass off
+                               (HV_NO_KFIX=1) and on, the guest behaved identically in the
+                               comparison recorded in docs/kext-start-matching-2026-11-16.md, so
+                               the image is left alone by default. HV_KFIX=1 turns the pass on
+                               for a comparison run; it is not something the engine does to the
+                               guest's kernel.
+                               Historical note, kept because it is what motivated the pass: with
+                               it applied, __DATA_CONST must stay untouched (kernel_fixups()
+                               already skips it) -- rebasing it too produced 0x38c7c5a0 out of a
+                               valid 0x1d1645a0. */
+                            if (getenv("HV_KFIX")) kernel_fixups(cpu->m, pa, pa + off_k);
                             /* The moment worth keeping: the firmware has finished with the image
                                and the kernel has not run yet, so whatever is wrong in it is the
                                firmware's doing alone. */
@@ -1735,60 +1733,38 @@ static int run_loop(HvCpu *cpu, int one) {
             /* From the kernel's first block on, every load and store goes through the emulator, so
                the writes of the init sequence can be listed. Blocks already translated for the
                firmware keep their fast paths, which is what keeps the install itself quick. */
-            /* iBEC appends nodes to the device tree and leaves boot_args' length at the older,
-               smaller value, so the kernel parses a truncated tree. Try the true length. */
+            /* boot_args belongs to the guest. Nothing here rewrites it by default: the device
+               tree length in particular is iBEC's business, and patching it to 16 MB (which this
+               used to do unconditionally) makes the kernel walk past the real tree. Each change
+               is opt-in, for a diagnostic run:
+                 HV_DT_LEN_PATCH=1        rewrite boot_args' device tree length to 16 MB
+                 HV_BOOT_ARGS_VERBOSE=1   append -v
+                 HV_EXTRA_BOOT_ARGS=...   append arbitrary arguments */
             if (!boot_args_fixed) {
                 boot_args_fixed = 1;
-                for (uint64_t pa = 0; pa < (1ull << 32); pa += 0x4000) {
-                    const uint64_t *q = hv_phys_ptr(m, pa, 0x1000);
-                    if (!q) continue;
-                    const uint16_t *h = (const uint16_t *) q;
-                    if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue;
-                    if ((q[1] >> 40) != 0xfffffe) continue;
-                    uint32_t *len = (uint32_t *) (uintptr_t) (q + 13);   /* 0x68: device tree length */
-                    uint32_t was = *len;
-                    if (!was || was >= (16u << 20)) continue;            /* not the real one */
-                    *len = 16u << 20;
-                    fprintf(stderr, "hengevm: boot_args dt length %u -> %u (pa %llx)\n",
-                            was, *len, (unsigned long long) pa);
-                    break;
-                }
-                /* The scan above has not found it once in practice; iBEC places boot_args at
-                   the same physical address every boot, so fall back to that. */
-                {
-                    uint64_t *q = hv_phys_ptr(m, 0x837f0000ull, 0x1000);
-                    if (q) {
-                        uint32_t *len = (uint32_t *) (uintptr_t) (q + 13);
+                uint64_t *q = hv_phys_ptr(m, 0x837f0000ull, 0x1000);
+                if (q) {
+                    uint32_t *len = (uint32_t *)(uintptr_t)(q + 13);
+                    if (getenv("HV_DT_LEN_PATCH") && *len && *len < (16u << 20)) {
                         uint32_t was = *len;
-                        if (was && was < (16u << 20)) {
-                            *len = 16u << 20;
-                            fprintf(stderr, "hengevm: boot_args dt length %u -> %u (pa 837f0000 fixed)\n",
-                                    was, *len);
-                        } else {
-                            fprintf(stderr, "hengevm: boot_args at 837f0000 has dt length %u; scan found none\n", was);
-                        }
-                        /* The kernel prints nothing without -v, and its own words about what it
-                           does next are worth more than anything inferred from registers. The
-                           command line follows the device tree fields at 0x6c. Do this whether or
-                           not the length was just patched above: the scan above already rewrote
-                           the length, so gating on it silently skipped the injection. */
-                        char *cmd = (char *) q + 0x6c;
-                        if (!getenv("HV_QUIET_BOOT")) {
-                            size_t n = strnlen(cmd, 1000);
-                            if (!strstr(cmd, "-v") && n + 3 < 1024) { memcpy(cmd + n, " -v", 4); n += 3; }
-                            /* DEBUG (temporary): ask for the serial console so kprintf/IOLog reach
-                               the PL011 model (which fputc()s to stdout) instead of being dropped.
-                               SERIALMODE_OUTPUT (0x2) is what switch_to_serial_console() needs. */
-                            const char *extra = getenv("HV_EXTRA_BOOT_ARGS");
-                            if (extra && *extra) {
-                                size_t en = strlen(extra);
-                                if (n + en + 2 < 1024) { cmd[n] = ' '; memcpy(cmd + n + 1, extra, en + 1); n += en + 1; }
-                            }
-                            fprintf(stderr, "hengevm: boot-args now \"%s\"\n", cmd);
-                        }
-                    } else {
-                        fprintf(stderr, "hengevm: boot_args: scan found none and 837f0000 is not RAM here\n");
+                        *len = 16u << 20;
+                        fprintf(stderr, "hengevm: boot_args dt length %u -> %u (HV_DT_LEN_PATCH)\n",
+                                was, *len);
                     }
+                    char *cmd = (char *) q + 0x6c;
+                    size_t n = strnlen(cmd, 1000);
+                    if (getenv("HV_BOOT_ARGS_VERBOSE") && !strstr(cmd, "-v") && n + 3 < 1024) {
+                        memcpy(cmd + n, " -v", 4);
+                        n += 3;
+                    }
+                    const char *extra = getenv("HV_EXTRA_BOOT_ARGS");
+                    if (extra && *extra) {
+                        size_t en = strlen(extra);
+                        if (n + en + 2 < 1024) { cmd[n] = ' '; memcpy(cmd + n + 1, extra, en + 1); n += en + 1; }
+                    }
+                    fprintf(stderr, "hengevm: boot-args \"%s\" (dt length %u)\n", cmd, *len);
+                } else {
+                    fprintf(stderr, "hengevm: boot_args page 837f0000 is not RAM here\n");
                 }
             }
             /* The layout lives in the device tree, and the device tree pointer is in boot_args:

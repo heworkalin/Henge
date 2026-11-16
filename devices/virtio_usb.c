@@ -183,7 +183,11 @@ HvVirtioUsb *hv_virtio_usb_create(HvMachine *m, HvPcie *bus) {
     d->vio.pci.config[2] = 0x01, d->vio.pci.config[3] = 0x1a;  /* device 0x1a01 */
     d->vio.pci.config[0x2c] = 0x6b, d->vio.pci.config[0x2d] = 0x10;
     d->vio.pci.config[0x2e] = 0x01, d->vio.pci.config[0x2f] = 0x1a;
-    hv_virtio_add_msi(&d->vio);   /* the Apple transport needs an MSI capability */
+    /* Upstream has no MSI capability on this device (INTx only), and the Apple transport
+       chooses single-vector INTx for vendor 0x106b anyway -- advertising MSI here let the
+       driver program an MSI that this device never raises, so it waited on an interrupt
+       that could not arrive. HV_VUSB_MSI=1 keeps the old behaviour for comparison. */
+    if (getenv("HV_VUSB_MSI")) hv_virtio_add_msi(&d->vio);
     d->vio.dev = d;
     d->vio.notify = notify;
     d->log = getenv("HV_VUSB_LOG") != NULL;

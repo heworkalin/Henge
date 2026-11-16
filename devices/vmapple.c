@@ -301,7 +301,11 @@ static void vmapple_serial_out(void *opaque, uint8_t c) {
         /* log 1, not 2: the port's own words are the cheapest evidence there is, and log 2
            floods the log with per-helper lines that hide them. */
         if (m->log >= 1 && n) fprintf(stderr, "hengevm: serial: %s\n", line);
-        if (n && strstr(line, "ignition sequence complete")) {
+        /* Off by default: this thread runs 8 s later and calls hv_vusb_force_rescan() on a
+           pointer that the installer may already have freed -- the run ends with "Killed" right
+           after the line below, which is why it is opt-in now. HENGE_USB_REENUM=1 for a
+           comparison run only. */
+        if (n && strstr(line, "ignition sequence complete") && getenv("HENGE_USB_REENUM")) {
             static int once;
             if (!once) {
                 once = 1;
