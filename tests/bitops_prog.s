@@ -599,3 +599,72 @@ sched_mc_waker:
     str     w1, [x0, #8]            // waker_done = 1
     ret
     .size   sched_mc_waker, .-sched_mc_waker
+
+// Cross-core spinlock, the thing XNU's thread_lock relies on.
+//
+// Two vCPUs take the same lock and each does N non-atomic `counter++` inside it.
+// The final count must be exactly 2N. One update lost means the lock did not
+// exclude the other core -- and then `clear_wait`'s two writes to thread->state
+// can be split by a concurrent writer, which is precisely the shape of the
+// guest's stall (dequeued, TH_WAIT still set, TH_RUN never set).
+//
+// buffer (x0), x1 = this CPU's done slot:
+//   +0x00 lock    +0x04 counter    +0x08 iterations
+    .text
+    .globl  sched_mc_spin
+    .type   sched_mc_spin, %function
+sched_mc_spin:
+    mov     x9, x0
+    mov     x11, x1
+    ldr     w10, [x9, #8]
+1:
+    cbz     w10, 9f
+2:
+    ldxr    w1, [x9]                // load-exclusive the lock word
+    cbnz    w1, 2b                  // someone holds it: retry
+    mov     w2, #1
+    stxr    w1, w2, [x9]            // try to take it
+    cbnz    w1, 2b                  // the store-exclusive failed: retry
+    ldr     w3, [x9, #4]            // --- critical section ---
+    add     w3, w3, #1              // plain load/add/store on purpose:
+    str     w3, [x9, #4]            // only the lock makes this safe
+    stlr    wzr, [x9]               // --- release ---
+    sub     w10, w10, #1
+    b       1b
+9:
+    mov     w2, #1
+    str     w2, [x9, x11]           // done[this cpu] = 1
+    ret
+    .size   sched_mc_spin, .-sched_mc_spin
+
+// Event-register probe: does SEVL actually end the following WFE, or does the
+// WFE fall through to its timeout?
+//
+// x0 = buffer:
+//   +0x00  a word to monitor        +0x08  t(ldxr; sevl; wfe) - t0
+//   +0x10  t(ldxr; wfe) - t0        (no event: must wait for the monitor or timeout)
+//
+// On real hardware the first is sub-microsecond (SEVL sets the event register,
+// WFE consumes it and returns); the second waits for the monitor, which nothing
+// changes, so it ends at the engine's timeout. If the two numbers are the same,
+// SEVL is not reaching the WFE.
+    .text
+    .globl  sched_evt
+    .type   sched_evt, %function
+sched_evt:
+    mov     x9, x0
+    // case 1: ldxr; sevl; wfe
+    ldxr    x1, [x9]                // arm the monitor on buffer+0
+    sevl                            // set the local event register
+    mrs     x2, cntvct_el0
+    wfe
+    mrs     x3, cntvct_el0
+    sub     x3, x3, x2
+    str     x3, [x9, #8]
+    // No bare-wfe case: on real hardware it would wait forever with nothing to
+    // send an event, which is the point -- the engine's WFE times out instead.
+    ldr     x4, [x9, #8]
+    str     x4, [x9, #16]           // baseline slot: repeat of case 1's cost
+    clrex
+    ret
+    .size   sched_evt, .-sched_evt

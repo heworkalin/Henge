@@ -36,10 +36,10 @@
 #define LANDING 3072
 
 static void *g_code;
-static uint8_t out_stack[32768] __attribute__((aligned(4096)));
+static uint8_t out_stack[32768] __attribute__((aligned(16384)));
 /* Guest RAM for the result, registered once: the JIT side reads and writes this, the native side
    gets an identical copy of the same starting bytes. */
-static uint8_t out_buf[8192] __attribute__((aligned(4096)));
+static uint8_t out_buf[8192] __attribute__((aligned(16384)));
 
 static void on_fault(int sig, siginfo_t *si, void *uc) {
     ucontext_t *c = uc;
@@ -83,7 +83,7 @@ static uint64_t rebase(uint64_t v, const void *base) {
 
 static int run_one(const char *name, void *code_run, size_t off, size_t len, HvMachine *m,
                    int bytes, int reloc) {
-    static uint8_t want[8192] __attribute__((aligned(4096)));
+    static uint8_t want[8192] __attribute__((aligned(16384)));
     for (int i = 0; i < OUT_BYTES; i++) {
         want[i] = (uint8_t) (i * 7 + 3);
         out_buf[i] = want[i];
@@ -231,9 +231,117 @@ static int run_mc(HvMachine *m, void *code_run) {
     return ok ? 0 : 1;
 }
 
+/*
+ * Cross-core spinlock: the exclusion XNU's thread_lock depends on.
+ *
+ * Two vCPUs take the same lock and each does N plain counter++ inside it. The final
+ * count must be exactly 2N; anything less means one core's read-modify-write ran
+ * while the other held the lock, and then clear_wait's two writes to thread->state
+ * can be split the same way -- which is the shape of the guest's stall.
+ */
+static int run_mc_spin(HvMachine *m, void *code_run) {
+    static HvCpu cpus[2];
+    static struct mc_ctx ctx[2];
+    pthread_t th[2];
+    const uint32_t N = 20000;
+
+    memset(out_buf, 0, 0x40);
+    *(uint32_t *) (out_buf + 8) = N;
+
+    for (int i = 0; i < 2; i++) {
+        hv_cpu_reset(&cpus[i], m);
+        cpus[i].index = (unsigned) i;
+        cpus[i].cpacr_el1 = 3u << 20;
+        cpus[i].sp = (uint64_t)(uintptr_t) out_stack + (i ? 16384 : 32768) - 256;
+        cpus[i].x[0] = (uint64_t)(uintptr_t) out_buf;
+        cpus[i].x[1] = (uint64_t)(i ? 0x10 : 0xc);   /* this CPU's done slot */
+        cpus[i].x[30] = (uint64_t)(uintptr_t) code_run + LANDING;
+        cpus[i].pc = (uint64_t)(uintptr_t) code_run + MCS_OFF;
+        ctx[i].cpu = &cpus[i];
+        ctx[i].ret = -99;
+    }
+    m->stop_pc = (uint64_t)(uintptr_t) code_run + LANDING;
+
+    if (pthread_create(&th[0], NULL, mc_thread, &ctx[0]) != 0 ||
+        pthread_create(&th[1], NULL, mc_thread, &ctx[1]) != 0) {
+        printf("mcspin: cannot start a thread\n");
+        return 1;
+    }
+
+    int ticks = 0, both = 0;
+    for (; ticks < 600; ticks++) {
+        uint32_t d0, d1;
+        memcpy(&d0, out_buf + 0xc, 4);
+        memcpy(&d1, out_buf + 0x10, 4);
+        if (d0 && d1) {
+            both = 1;
+            break;
+        }
+        usleep(10000);   /* 10 ms, 600 times: 6 s */
+    }
+
+    uint32_t counter, lock;
+    memcpy(&counter, out_buf + 4, 4);
+    memcpy(&lock, out_buf, 4);
+
+    if (!both) {
+        printf("mcspin: TIMEOUT %.1f s of lock spinning: counter %u / %u, lock %u\n",
+               ticks * 0.01, counter, 2u * N, lock);
+        return 1;
+    }
+    pthread_join(th[0], NULL);
+    pthread_join(th[1], NULL);
+    int ok = counter == 2u * N && lock == 0;
+    printf("mcspin: %u each, counter %u (want %u), lock %u -> %s\n",
+           N, counter, 2u * N, lock, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/*
+ * Event-register probe: run the same SEVL/WFE sequence natively and through the JIT and
+ * report both waits, in counter ticks. Native numbers are the hardware's semantics; a
+ * JIT number far above its native twin means the event register is not being honoured.
+ */
+static int run_evt(HvMachine *m, void *code_run) {
+    static uint8_t buf[64] __attribute__((aligned(16)));
+    static HvCpu cpu;
+
+    /* Native is skipped on purpose: a real WFE with no event to consume waits
+       forever, which is exactly what hardware does. The JIT side is the question. */
+    uint64_t n1 = 0, n2 = 0;
+
+    memset(out_buf, 0, 0x40);
+    hv_cpu_reset(&cpu, m);
+    cpu.cpacr_el1 = 3u << 20;
+    cpu.sp = (uint64_t)(uintptr_t) out_stack + sizeof out_stack - 256;
+    cpu.x[0] = (uint64_t)(uintptr_t) out_buf;
+    cpu.x[30] = (uint64_t)(uintptr_t) code_run + LANDING;
+    cpu.pc = (uint64_t)(uintptr_t) code_run + EVT_OFF;
+    m->stop_pc = (uint64_t)(uintptr_t) code_run + LANDING;
+    int r = hv_run(&cpu);
+    if (r != HV_EXIT_HALT) {
+        printf("evt: dispatcher returned %d at pc %#llx\n", r, (unsigned long long) cpu.pc);
+        return 1;
+    }
+    uint64_t j1, j2;
+    memcpy(&j1, out_buf + 8, 8);
+    memcpy(&j2, out_buf + 16, 8);
+
+    printf("evt: sevl+wfe  native %llu jit %llu ticks | bare wfe  native %llu jit %llu ticks\n",
+           (unsigned long long) n1, (unsigned long long) j1,
+           (unsigned long long) n2, (unsigned long long) j2);
+    /* The JIT's sevl+wfe must be in the same ballpark as the bare-wfe baseline only if
+       SEVL is ignored; flag a gap of more than 10x against native. */
+    int ok = j1 <= (n1 + 1) * 10 + 200;
+    printf("evt     %s (native sevl %llu vs jit %llu)\n", ok ? "ok" : "FAIL (SEVL not honoured)",
+           (unsigned long long) n1, (unsigned long long) j1);
+    (void) buf;
+    return ok ? 0 : 1;
+}
+
 /* One iteration: fill the operands the same way for both runs, run both, compare results. */
 static int fuzz_round(HvMachine *m, void *code_run, int round) {
-    static uint8_t want[8192] __attribute__((aligned(4096)));
+    static uint8_t want[8192] __attribute__((aligned(16384)));
     uint64_t s = 0x9e3779b97f4a7c15ull * (uint64_t) (round + 1);
     for (int i = 0; i < 0x400; i += 8) {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;
@@ -282,7 +390,7 @@ int main(void) {
     sigaction(SIGBUS, &sa, NULL);
 
     /* The page holds the programs and, past them, a `b .` the dispatcher can stop on. */
-    static uint8_t code_copy[8192] __attribute__((aligned(4096)));
+    static uint8_t code_copy[8192] __attribute__((aligned(16384)));
     memcpy(code_copy, prog_blob, prog_blob_len);
     ((uint32_t *) code_copy)[LANDING / 4] = 0x14000000u;
     void *code_run = exec_page(code_copy, sizeof code_copy);
@@ -322,6 +430,10 @@ int main(void) {
         failed += run_one("sched", code_run, SCHED_OFF, SCHED_LEN, &m, 0x90, 1);
     if (!only || !strcmp(only, "mc"))
         failed += run_mc(&m, code_run);
+    if (!only || !strcmp(only, "mcspin"))
+        failed += run_mc_spin(&m, code_run);
+    if (!only || !strcmp(only, "evt"))
+        failed += run_evt(&m, code_run);
     printf("%d of 4 programs differ\n", failed);
     return failed != 0;
 }

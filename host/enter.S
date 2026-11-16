@@ -267,14 +267,14 @@ _hv_helper_thunk:
     str x15, [x28, #CPU_SP]
     ldr x15, [x28, #CPU_HOST_SP]
     mov sp, x15
+    SAVE_FLAGS_FP
     mov x0, x28
     mov x1, x7
     bl _hv_tlb_refill
     mov x7, x0
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
-    ldr x0, [x28, #CPU_NZCV]
-    msr nzcv, x0
+    LOAD_FLAGS_FP
     ldp x0, x1, [x28, #0]
     ldp x2, x3, [x28, #16]
     ldp x4, x5, [x28, #32]
@@ -337,6 +337,7 @@ _hv_ijc_thunk:
     str x15, [x28, #CPU_SP]
     ldr x15, [x28, #CPU_HOST_SP]
     mov sp, x15
+    SAVE_FLAGS_FP
     mov x0, x28
     mov x1, x7
     ldr w2, [x30]
@@ -344,8 +345,7 @@ _hv_ijc_thunk:
     mov x6, x0
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
-    ldr x0, [x28, #CPU_NZCV]
-    msr nzcv, x0
+    LOAD_FLAGS_FP
     ldp x0, x1, [x28, #0]
     ldp x2, x3, [x28, #16]
     ldp x4, x5, [x28, #32]
@@ -413,6 +413,7 @@ _hv_xjump_thunk:
     str x15, [x28, #CPU_SP]
     ldr x15, [x28, #CPU_HOST_SP]
     mov sp, x15
+    SAVE_FLAGS_FP
     mov x0, x28
     ldr x1, [x7, #8]
     ldr w2, [x7]
@@ -421,8 +422,7 @@ _hv_xjump_thunk:
     mov x6, x0
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
-    ldr x0, [x28, #CPU_NZCV]
-    msr nzcv, x0
+    LOAD_FLAGS_FP
     ldp x0, x1, [x28, #0]
     ldp x2, x3, [x28, #16]
     ldp x4, x5, [x28, #32]
