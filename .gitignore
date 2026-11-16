@@ -10,3 +10,7 @@ android/ipsw/
 work/
 # Gradle writes its own caches; they are not source.
 android/.gradle/
+
+# Per-run work directories with a suffix (workM2, workN1, workP1, ...): the
+# same guest RAM dumps, aux.img and sparse disk image as work/.
+work*/
