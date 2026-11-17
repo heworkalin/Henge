@@ -812,3 +812,67 @@ restored_external 执行 → 调进 shared cache 的一个函数（0x100f9c568�
 **前提**：偏移要可靠。目前 task 结构的偏移（+0x50/+0x58/+0x60）全部被证伪过，
 所以下一步应该先建立**可自校验的结构定位**（两个互不相关字段互相指回才算数），
 再走 `_dyld_all_image_infos`。否则又是一轮"读数看着像、结论全错"。
+
+---
+
+## 18. 最后一轮的定位尝试（都没命中）与当前最省力的下一步
+
+### 18.1 试过的四种"点名"方式
+
+| 假设 | 做法 | 结果 |
+|---|---|---|
+| 代码在 restore ramdisk | 特征字节搜 1098 个文件 | 0 命中 |
+| 代码在 `usr/lib/dyld` | 从 `043-18326` 提取后搜（含 8/16/24 字节前缀） | 0 命中 |
+| 代码在最后加载的两个库 | `libsandbox.1.dylib`(660 KB)、`libMatch.1.dylib`(88 KB) 都找到了并搜特征 | 0 命中 |
+| 共享缓存在 guest RAM 里 | 扫 `dyld_v1` 魔数、`__TEXT`、`imageLoadAddress` | 0 命中 |
+
+最后一条很关键：**guest 确实解密了它要用的内容，但共享缓存并不以 `dyld_v1` 头部的形式
+整块出现在我们 dump 的 RAM 里**（它按需映射，或头部所在页不在我们扫到的范围内）。
+
+### 18.2 但 syscall 环给出了很有用的时间线
+
+`hv_svc_path` 环里 196 条不同的 open 路径，**最后两条**是：
+
+```
+/usr/lib/libsandbox.1.dylib
+/usr/lib/libMatch.1.dylib
+```
+
+前面是大量 `/System/Library/FeatureFlags/*.plist`（Domain/Global/Profiles/Settings 各套）。
+所以 `restored_external` 在停下之前的动作序列是：
+
+```
+读一堆 FeatureFlags plist
+  → 加载 libsandbox
+    → 加载 libMatch
+      → 进入 0x100f9c568（alloca 72B/元素 + 间接调用）
+        → 内核里停在 WQT_QUEUE
+```
+
+「读 FeatureFlags → 载入 libsandbox → alloca 枚举」连起来看，最像**沙箱初始化/规则匹配**，
+而 `libMatch` 正是规则匹配库。这与"等一个不来的唤醒"一致：沙箱初始化通常在等某个
+资源（路径枚举、profile 解析、或某个服务的应答）。
+
+### 18.3 当前最省力的下一步（不需要 AEA，不需要重跑）
+
+**用 `hv_svc_path` 环里的 196 条路径反推地址空间布局**：
+`restored_external` 是 PIE，每条被 open 的 dylib 都会被 dyld 映射到某个基址。把
+"open 顺序"与"之后出现的第一次执行地址落点"（`hv_el0_trace_va` 环）对照，就能把
+某个基址与某个库对上；一旦对上，`0x100f9c568` 只要落在那个库的 `__TEXT` 范围内就点名成功。
+
+这条路完全用引擎已有的两个环（`hv_svc_path` + `hv_el0_trace_va`），不需要解 AEA、不需要新跑设备。
+
+### 18.4 本轮的技术结论（可用于收尾）
+
+```
+不是崩溃        EL0 故障全是 translation / access-flag fault
+不是 syscall 阻塞 最后 15 个调用全部有返回值
+不是磁盘        11 个块请求全部完成，inflight=0
+不是网络        hv_net_tx/rx = 0/0
+不是 ramdisk 里的任何文件（1098 个，含 dyld/libsandbox/libMatch）
+是：restored_external 在沙箱初始化阶段（FeatureFlags → libsandbox → libMatch）
+    调进一个 image，那个调用在内核里停在 WQT_QUEUE，没有唤醒方
+```
+
+**缺的是"那一次 wakeup 的触发条件"，而它属于共享缓存里的一段代码 ——
+名字还没拿到，但定位路径已经缩小到"用两个环反推基址"这一步。**
