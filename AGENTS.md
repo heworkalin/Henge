@@ -100,18 +100,71 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
 | `HENGE_RANDOM_SEED=1` | 用宿主熵填 `/chosen/random-seed`（**默认关**，关才可复现） |
 | `HENGE_TIMEOUT_SCALE` | 放大 restore 的所有等待 |
 
+### 5.0 串口（guest 的 kprintf / IOLog）—— 让内核日志可见
+
+**默认状态下 guest 内核日志全部丢弃。** 要在串口看到，必须同时满足两件事：
+
+| 条件 | 作用 |
+|---|---|
+| `serial=3` | 触发 `switch_to_serial_console()`，把 kprintf 改道到 PL011 |
+| `debug=0xA` | `DB_PRT`(0x2) + `DB_KPRT`(0x8) 打开 `disable_serial_output` |
+
+**三种注入方式（按用途选）：**
+
+1. **恢复阶段（最常用）**
+   ```bash
+   HV_EXTRA_BOOT_ARGS="serial=3" ./host-install ...
+   ```
+   注入点在 `core/dispatch.c` 的 `boot_args->CommandLine`（PA `0x837f0000`，偏移 **`0x6c`**）。
+   **注入代码必须写在长度修补的 `if/else` 之外** —— 曾因为放在分支内而永远不执行，
+   导致 `-v` 和 `serial=3` 都没生效，白查了很久。
+
+2. **iBoot 阶段**
+   ```bash
+   HV_RESTORE_BOOT_ARGS="serial=3 -v" ./host-install ...
+   ```
+
+3. **引擎自身日志**（不是 guest 串口）
+   ```bash
+   HV_LOG=1      # 0..3，Android 默认 2
+   ```
+
+**日志形态**：guest 串口行以 `hengevm: serial: ` 开头（引擎转发时加的），后面才是内核原文。
+
+**实践经验（重要）：**
+
+- **`serial=3` 单独就够了**；加上 `debug=0xA` 有时**反而走不到 `restored_external`**
+  （观察扰动）。先只用 `serial=3`。
+- 内核日志量大，必须走统一日志服务（见本节开头）：全量文件 + logcat 限速样本。
+- `HENGE_STOP_ON=<串口行子串>` 可以在**某条串口输出出现时** `raise(SIGSTOP)`，
+  相当于“串口同步断点”；支持 `|` 分隔多模式、`HENGE_STOP_EVERY` 每次匹配都停。
+  读出后必须显式 `kill -CONT <pid>`（gdb `-batch` detach 不发 SIGCONT）。
+- 配合**现场保护**：`on_install_progress` 在 `step >= HV_INSTALL_DONE` 时若设了
+  `HENGE_STOP_ON` 就不 `stop_cpus()`，机器保持可 attach，能反复扫描同一现场。
+
 ### 5.1 JIT 调试参数与地址空间（最易出错，先看这里）
 
 同一份内核镜像有**四个**地址，参数必须传对的那一个：
 
-| 名字 | 定义 | 24G90 实测（slide 固定） |
+| 名字 | 定义 | 24G90 实测（假定 `slide = 0x14b14000`） |
 |---|---|---|
 | `fileoff` | 镜像内文件偏移 | `__TEXT_EXEC` = `0xd78000` |
 | **link VA** | `fileoff + 0xfffffe0007004000` | `__TEXT_EXEC` = `0xfffffe0007d7c000` |
-| **run VA** | `link VA + slide`（slide = `0x14b14000`，`HENGE_RANDOM_SEED` 关时固定） | `__TEXT_EXEC` = `0xfffffe001c890000` |
+| **run VA** | `link VA + slide` | `__TEXT_EXEC` = `0xfffffe001c890000`（当 slide = `0x14b14000` 时） |
 | PA | `kimage_pa + fileoff`（`kimage_pa = 0x73b18000`） | `__TEXT_EXEC` = `0x74090000` |
 
 `slide` 可由 boot_args 反推：`virtBase 0xfffffe0018a04000 − physBase 0x70a04000 = 0x14b14000`。
+
+**但不要假定 slide 就是 `0x14b14000`。** 实测有多轮是 **slide = 0**（`g_cpus[0].pc` 直接等于
+kernelcache 里的 link VA，`HV_PCHK` 输出里也打印 `slide 0`）。**传错 slide 的后果是断点零命中，
+而零命中看起来像“这段代码没执行”，极易误判。**
+
+判断当前 run 的真实 slide（二选一）：
+
+```
+1) gdb: print/x g_cpus[0].pc   → 与 tools/lcfs.py 的输出对照，看它落在哪个函数的哪个偏移
+2) HV_PCHK 命中时的日志里直接有 slide 字段（引擎会打印 x26 指向的 slide 槽）
+```
 
 | 参数 | 该传的地址空间 | 说明 |
 |---|---|---|
@@ -147,15 +200,13 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 --rename-section .data=.text,code` 包一层 ELF 再 `-d`；`--adjust-vma` 对裸 binary 的分支
 目标显示不可靠，跳转目标按 `imm` 手算后再用 trace 核对。
 
-**kext 一个都不 start 的排查现状与完整地址表见 `docs/kext-start-matching-2026-11-16.md`**
-（已排除项、已确认执行链路、复现命令）。
+**关于"kext 一个都不 start"**：那是**历史现象**（SIMD clobber 在位 + 一批 opt-in 介入
+掩盖），不是当前状态。完整地址表与当时的排查过程见 `docs/kext-start-matching-2026-11-16.md`；
+`d272f3a` 把介入全部默认关掉之后 kext 就正常 start 了。**分类见
+`docs/investigation-tree.md` 的 §7.4（B 类：前提已变）。**
 
-**内核日志（kprintf/IOLog）默认全部丢弃**，要看到必须同时给
-`HV_EXTRA_BOOT_ARGS="serial=3 debug=0xA"`（`serial=3` 触发 `switch_to_serial_console`，
-`debug` 的 `DB_PRT=0x2`/`DB_KPRT=0x8` 打开 `disable_serial_output`）。
-注入点在 `core/dispatch.c` 的 `boot_args->CommandLine`（PA `0x837f0000`，偏移 `0x6c`），
-**注入必须写在长度修补的 if/else 之外**，否则会被跳过。完整配方与排错表见
-`docs/kernel-log-2026-11-16.md`。日志行形如 `hengevm: serial: ...`。
+**串口日志（guest kprintf/IOLog）怎么开、怎么停、怎么取，见上面的 §5.0。**
+完整配方与排错表见 `docs/kernel-log-2026-11-16.md`。日志行形如 `hengevm: serial: ...`。
 
 ## 6. 调试方法论（本项目最贵的教训）
 
@@ -170,6 +221,29 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 5. **一次只改一个变量**，跑完立刻把结论写进 `docs/`。
 6. **反汇编基线**：镜像 VA 基址 `0xfffffe001bb18000` ↔ PA `0x73b18000`，
    工具 `tools/disasm-raw.sh <blob> <base> [from] [to]`。PC 打印值即文件内偏移（工具按 base 载入）。
+
+7. **`HV_PCHK` 的命中数不是调用次数。** 引擎有 chaining/superblock，只在“进入新 block”时
+   检查断点，跳转落在链内部就**绕过检查点**。实测反例：EL0 同步向量入口那条指令是
+   `b 0x1c8943e4`，入口命中 12253 次而目标只 241 次。**热路径会严重偏低。**
+   要计数就用 `HV_TRACE_PC`（每块 8 字节，真实执行记录）或关掉 superblock 后再断。
+   `HV_PCHK` 只适合作**存在性**证据（“这段代码确实跑过”）。
+
+8. **`gdb` attach 时被调试进程是暂停的。** 在**同一次 attach 会话里**做多次采样，
+   看到的是同一个冻结时刻 —— “多次采样值一致”证明不了“值不随时间变化”。
+   要看变化，必须 detach → 等 → 再 attach。
+
+9. **先读 `TCR` 判 granule，再算页表索引。** guest 是 **16 KiB 页、3 级页表**
+   （`TCR.TG0 = 2`），按 4 KiB/4 级套公式会得到全错的索引。
+   同理，引擎里按 4 KiB 做的诊断（如 `ptw` 的页匹配与采样）在 16 KiB 表上
+   只能看到第一个 4 KiB 子页，后四分之三是**盲区**。
+
+10. **多进程场景必须用“事件自带的地址空间”。** fault 环是全局的，
+    `hv_last_el0_ttbr0` 只代表“最后一次”那个进程；两者混用会有一半匹配错。
+    为此 `core/exception.c` 已记录 `hv_el0_flt_ttbr0[]`，每条 fault 自带 ttbr0。
+
+11. **“被推翻”要分三种**：① 观察对、归因错；② **前提已变**（当时确实如此，
+    底层修好/开关关掉后不再复现）；③ 真误判（读错数据、用错工具）。
+    ② 必须保留并记下它的有效前提，否则以后重新打开某个开关时会把历史现象当“新问题”重查一遍。
 
 ## 7. 关键不变量（改这些会静默爆炸）
 
@@ -201,6 +275,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 
 | 文档 | 内容 |
 |---|---|
+| **`docs/investigation-tree.md`** | **排查总索引**：走过的分支、站得住的结论、被推翻的结论（含"前提已变"类）、方法论铁律。**接手先看这份** |
 | `docs/architecture.md` | 引擎结构 |
 | `docs/kernel-boot-exclusions.md` | 内核启动已排除的假设 E1–E18 + H1/H2 + 工具清单（**排障先看这里，避免重走**） |
 | `docs/semantic-deviations.md` | 与上游的语义等效性审计（E/X/D/U 四级） |
@@ -214,20 +289,62 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 （名称 / 取值 / 默认 / 作用）；凡是会改变 guest 所见的开关，默认必须是关的，并在表里写明。
 这份表是「有哪些开关」的唯一出处，不要在别处另开清单造成两份不一致。
 
-## 10. 当前状态（2026-11，随时会变，以最新提交与 docs/ 为准）
+## 10. 当前状态（2026-11-17，随时会变，以最新提交与 docs/ 为准）
 
-**已修好**：`hv_enter` 丢失、强制 `slow_mem`（1000→200 万 block/s）、`__DATA` 漏 rebase、
-PAC strip 宽度、OEM/PV-lock hypercall、UI 状态失联若干、按文件记录校验。
+### 10.1 主目标与优先级
 
-**未解决**（按版本）：
+**主目标：把“安装 macOS”（DFU + idevicerestore）跑通。** 其余一切让路。
 
-- **24G90**：iBoot 全通，内核跑进 `arm_init` 后，guest 自己的页表把内核栈页标成只读
-  （`ap=2`，`code_page=0`，非引擎误伤）→ 处理异常时写栈 → 嵌套 → `halt x2 "MACH Reboot"`，
-  console（PL011）从未初始化。下一步：异常嵌套环形记录，找**第一个**异常。
+**短时间内不碰 UI。** 原因（用户明确）：安装流程没走完，UI 没有可展示的真实状态；
+**只有安装流程走完之后才会碰 UI**。届时若需要用 `gdb` 推送 / `run-as` 之类手段调试，
+那**只适用于调试**；真正控制 `.so` 的行为要走别的方案（不要在 UI 里依赖调试通道）。
+
+### 10.2 当前卡点（唯一一个）
+
+引导链、kext、IOKit、ramdisk、launchd bootstrap 全部通过，`restored_external` 已经真正在跑
+（19 万+ 块、2.8 万 syscall），然后进入**用户态缺页循环**：
+
+```
+访问 → 缺页（translation fault L3）→ 处理返回 → 页表项仍未建立 → 再访问 → 再缺页
+→ 所有线程挂在 WQT_QUEUE → 两个 CPU 都进 WFI（不是崩溃，是无活可干）
+```
+
+**已经确定的事实**（详见 `docs/investigation-tree.md` 与 `docs/fault-*.md`）：
+
+- 缺页页在 `vm_map` 里**有登记**（entry 存在，大小正常）；
+- 页表项（PTE）**确实为 0**；同一地址会**重复**缺页（`0x1007401cc` 在一轮里出现两次）；
+- ESR 为 `translation fault L3`、`EA=0`（不是外部 abort）、`WnR=0`（读）；
+- 故障横跨**匿名零页**与**子映射（线程栈）**两类 entry → 指向**共同下游**（写页表）；
+- `pmap_enter_options`（link `0xfffffe001ca2206c..0x1ca233ac`）**确实被执行过**；
+- 排除：磁盘 I/O（ramdisk 在内存）、网络（0/0）、外部 abort、PTE 写到错误物理页
+  （`HV_SLOW_MEM=1` 下 `TLB-fresh mismatch` = 0）、引擎读错页表（`hv_walk_dbg` 与手工遍历一致）。
+
+**下一步（唯一可信）**：用 `HV_TRACE_PC` 统计 `pmap_enter_options` 范围内的**真实**执行次数，
+并检查每次 fault 之后执行流是否进入它 —— 这才能分开“调用了但没写成功”与“根本没调用”。
+
+### 10.3 已验证可用的工具
+
+| 工具 | 用途 |
+|---|---|
+| `tools/lcfs.py` | 从 `LC_FUNCTION_STARTS` 建函数索引（220 image / 149 938 函数），内核主代码没有符号时唯一可用 |
+| `tools/ksym.py` | kernelcache 符号解析（181 781 符号，只覆盖 kext） |
+| `hv_el0_flt_*` / `hv_el0_flt_ttbr0[]` | EL0 故障完整寄存器环 + 地址空间 |
+| `hv_el0_trace_*` / `hv_svc_*` | 用户态块轨迹 / syscall 参数与返回值 |
+| `HENGE_STOP_ON` + 现场保护 | 串口同步断点，停住后机器不拆 |
+
+### 10.4 其它未解决
+
 - **25G83**：iBoot Stage1 打印 `Memory image not valid` 后卡住（固件拒绝镜像；Stage2 都没到）。
   不要在它上面调内核；跑它会产出 200+ MB 日志。
-- UI：`InstallTab` 的状态应彻底收敛为单一 `Pipeline.State`（版本号 + 单一渲染函数），
-  现在虽已用静态快照+广播收口，但仍是多 writer 结构。
+- **UI**：`InstallTab` 的状态应彻底收敛为单一 `Pipeline.State`（版本号 + 单一渲染函数）。
+  属于“安装流程走完之后”的工作，现在不动。
+
+### 10.5 已修好（历史）
+
+`hv_enter` 丢失、强制 `slow_mem`（1000→200 万 block/s）、`__DATA` 漏 rebase、
+PAC strip 宽度、OEM/PV-lock hypercall、UI 状态失联若干、按文件记录校验、
+SIMD clobber（`put_helper`/`refill` 未保存 v0-v31）、缺 1 ms kicker（irq 0→27 万）、
+磁盘 fd 被提前关闭。
 
 ## 11. 设备上跑 CLI（首选调试方式，1 分钟一轮）
 
