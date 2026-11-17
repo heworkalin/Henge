@@ -340,3 +340,62 @@ HV_EXTRA_BOOT_ARGS="serial=3" setsid nohup ./host-install ...
 
 - 若 `req/s` 归零但队列里有未完成请求 → **completion 路径的问题**，在 `devices/virtio_blk.c`；
 - 若完全没有请求 → 等待的不是块设备，回到 `9.2`，查 `diskimagesiod` 那条路径。
+
+---
+
+## 10. 后续实测：磁盘被排除，全系统 6 个线程停在同一个 turnstile
+
+### 10.1 块设备的请求全部完成（所以不是磁盘）
+
+在 `Successfully spawned restored_external` 停住后读到（`g_board.root_blk/aux_blk`，
+偏移 `submitted`@+9040、`completed`@+9044、`inflight`@+9052）：
+
+```
+root_blk  requests=7  submitted=7  completed=7  inflight=0
+aux_blk   requests=4  submitted=4  completed=4  inflight=0
+```
+
+**提交的请求全部完成，`inflight=0`。** 总数只有 11 个，因为 restore ramdisk 在内存里，
+加载 dylib 不产生块 I/O。所以 §9.1 的"I/O 未完成"假设**被排除**。
+
+### 10.2 继续跑之后：6 个线程全部 WAIT 在同一个 turnstile
+
+`kill -CONT` 让运行继续 55 秒后：
+
+```
+launchd            threads=6   （全部 turnstile=0xfffffe8df208ec88）
+restored_externa   threads=6   （同样的 6 个线程地址，同一个 turnstile）
+状态分布：0x9(WAIT+UNINT) ×3、0x49(WAIT+UNINT+WAITREP) ×2、0x1(WAIT) ×1
+```
+
+- **`launchd` 和 `restored_external` 的线程地址完全相同** → 是同一个 task 的不同视图
+  （`p_comm` 匹配到了不同位置的字符串），不是两个进程。
+- 6 个线程**全部** WAIT，其中 5 个是 `UNINT`（不可中断）。
+- 该 turnstile 的内容**没有持有者**：
+
+```
+turnstile 0xfffffe8df208ec88  pa=0x8423ec88
+  +0x00 = 0xc6c60144e54eef09     (标志)
+  +0x08 = 0xfffffe24122cf010     → 其中一个等待线程
+  +0x10 = 0x0                    ← 没有持有者
+  +0x50 = 0x0
+```
+
+### 10.3 由此得到的最终形态
+
+```
+不是崩溃      —— EL0 故障全是 translation/access-flag fault
+不是 syscall 阻塞 —— 最后 15 个调用全部有返回值
+不是磁盘     —— 11 个块请求全部完成，inflight=0
+不是缺网络   —— hv_net_tx/rx = 0/0
+而是：整个 guest 的 6 个线程都停在一个没有持有者的等待对象上，
+      等一个不会再发生的事件。两个 CPU 都在跑 idle 线程。
+```
+
+**剩下的问题只有一个**：那个事件是什么（哪一类 waitq / 哪个 port / 哪个 page）。
+判定路径：
+
+1. 读 6 个线程的内核栈，把栈上的 `__TEXT_EXEC` 返回地址（范围
+   `0xfffffe001c890000..0xfffffe001eecc000`）映射到函数 —— 能直接看出它们进了哪个等待函数；
+2. 或按 turnstile 的 `+0x00` 标志位判断类型（mutex 与 waitq 的标志不同），
+   再看 `+0x08` 链上的第一个等待者是谁。
