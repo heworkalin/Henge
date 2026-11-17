@@ -128,6 +128,17 @@ int main(int argc, char **argv) {
             hv_android_scan_procs();
             printf("%s\n", step == 100 ? "restore finished" : "restore failed");
             fflush(stdout);
+            /* With a console breakpoint armed, the machine is the thing under inspection, and the
+               state at the moment the restore gives up is exactly what is wanted: keep it alive
+               (no teardown, no exit) until an explicit kill. install.c already skips stop_cpus()
+               for this case; without this the CLI would exit and take the machine with it. */
+            const char *stop_on = getenv("HENGE_STOP_ON");
+            if (stop_on && *stop_on) {
+                fprintf(stderr, "hengevm: HENGE_STOP_ON is set, staying alive for gdb "
+                                "(pid %d); kill -9 %d to exit\n", (int) getpid(), (int) getpid());
+                fflush(stderr);
+                for (;;) sleep(60);
+            }
             break;
         }
         sleep(1);

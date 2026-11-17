@@ -127,8 +127,26 @@ static void stop_cpus(void);
 static void on_install_progress(int step, double progress, void *user) {
     if ((int)(intptr_t)user != __atomic_load_n(&g_install_gen, __ATOMIC_RELAXED)) return;
     /* The restore is over: its guest (a panic, in a failed one) is spinning in a wfe loop that will
-       never end. Stopping the CPUs here is what lets the next attempt build a machine at all. */
-    if (step >= HV_INSTALL_DONE) stop_cpus();
+       never end. Stopping the CPUs here is what lets the next attempt build a machine at all.
+       Unless a console breakpoint is armed: HENGE_STOP_ON means someone is going to attach gdb and
+       read this machine, and the state that matters is exactly the one the timeout would tear
+       down. Then the guest keeps running (idle or stuck, which is what is being measured) and only
+       an explicit kill ends the process. */
+    if (step >= HV_INSTALL_DONE) {
+        const char *stop_on = getenv("HENGE_STOP_ON");
+        if (stop_on && *stop_on) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "hengevm: install ended (step %d, r %s) but HENGE_STOP_ON is set: "
+                                "keeping the machine alive for inspection; kill -9 %d to exit\n",
+                        step, step == HV_INSTALL_DONE ? "done" : "failed", (int) getpid());
+                fflush(stderr);
+            }
+        } else {
+            stop_cpus();
+        }
+    }
     int previous = g_install_step;
     g_install_step = step;
     g_install_progress = progress;
