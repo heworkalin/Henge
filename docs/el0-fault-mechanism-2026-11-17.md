@@ -127,3 +127,66 @@ cbz  x0, ...
 
 五步全部只读内存，本次就是这样定下来的。工具化脚本见 `/tmp/ucal2.py`、`/tmp/sample.py`、
 `/tmp/vbar.py` 的逻辑（`tools/lcfs.py` 可用于把 handler 地址命名）。
+
+---
+
+## 5. 补齐最后一块：两个 CPU 都在 `WFI`
+
+读两个 CPU 的完整状态：
+
+```
+CPU0: pc=0xfffffe001ca35e68  elr=0xfffffe001ca4325c  sp=0xfffffe8780697fc0  x29=0xfffffe8780697ff0
+CPU1: pc=0xfffffe001ca35e68  elr=0xfffffe001ca4325c  sp=0xfffffe8780667fc0  x29=0xfffffe8780667ff0
+```
+
+两点：
+
+1. **`x29 == sp + 0x30`，等于栈顶** —— 没有调用链，CPU 不在任何函数里；
+2. **`pc` 落在**：
+
+```asm
+fffffe001ca35e60: dsb sy
+fffffe001ca35e64: wfi                    ← 等待中断
+fffffe001ca35e68: mov w0, #0x1           ← PC 在这里（WFI 返回点）
+fffffe001ca35e6c: bl  ...
+```
+
+这是 XNU 的 idle 循环。**两个核都在打盹**，说明**调度器认为没有任何可运行线程**。
+
+而 `elr_el1 = 0xfffffe001ca4325c` 是进入 idle 之前跑过的一段代码（一个带 PAC 校验的链表遍历，
+在 `str xzr, [x8,#0x50]` 清掉一个字段后读 `[x8,#0x58]`），符合"CPU 下线/空闲前的清理"。
+
+## 6. 完整因果链（每一环都有实测）
+
+```
+restored_external 执行
+  → FeatureFlags → libsandbox → libMatch → 0x100f9c568 的函数
+    → 该函数 adrp 得到 x8=0x100fc0000，然后 ldr x8,[x8,#0xe0]
+      → 页 0x100fc0000 **从未映射**（L3[1008]=0x8000000000000000，两次采样不变）
+        → data abort（esr=0x92000007，translation fault L3）
+          → 进 EL0 同步向量（vbar_el1+0x400 → b 0xfffffe001c8943e4，标准 fleh_synchronous）
+            → 处理完返回，页仍然没有
+              → 再 fault …… 累计 52977 次，直到线程被换下
+                → 所有线程进入 WAIT（WQT_QUEUE，thread+0x28 type=1）
+                  → 两个 CPU 无活可干，进入 WFI
+                    → 系统静止：不是崩溃，是"无事可做"
+```
+
+## 7. 所以"为什么反复缺页"的最终答案
+
+**因为那一次缺页处理没有把页补上，而代码每次执行到同一条 `ldr` 都会再触发一次。**
+
+这不是引擎的翻译错误、不是 TLB 语义、不是页表遍历错、不是异常入口错 ——
+这四项本轮全部逐一验证过：
+
+| 检查项 | 结果 |
+|---|---|
+| 代码页是否映射 | 是，L3[999]=0x200000afc38ec3 → PA 0xafc38000，+0x568 是 `d503237f` |
+| 数据页是否"映射过又被清" | 否，两次采样 L3[1008] 都是 0x8000000000000000 |
+| granule 是否按 16K 算 | 是（TCR.TG0=2，3 级页表） |
+| 异常入口是否正确 | 是，标准 XNU `fleh_synchronous` |
+| CPU 是否在跑别的东西 | 否，两个核都在 WFI，栈是空的 |
+
+**要往下走，只剩一个问题：为什么 `0x100fc0000` 没有被装入。**
+三种可能（vnode 页等 I/O 完成 / 匿名零页补零路径没走到 / 该页本不该映射），
+判据见第 3 节表格。当前最值得先查的是第一种 —— 它和最初"等一个不来的 wakeup"是同一件事。
