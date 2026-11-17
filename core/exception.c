@@ -37,6 +37,10 @@ uint64_t hv_el0_flt_n;
 uint64_t hv_el0_flt_pc[HV_EL0_FLT], hv_el0_flt_ret[HV_EL0_FLT], hv_el0_flt_far[HV_EL0_FLT];
 uint64_t hv_el0_flt_sp[HV_EL0_FLT], hv_el0_flt_x[HV_EL0_FLT][31];
 uint32_t hv_el0_flt_esr[HV_EL0_FLT];
+/* Address space of the faulting thread.  Several user processes interleave, and
+   the fault ring is global, so without this a fault cannot be matched to the
+   vm_map/pmap that owns it -- hv_last_el0_ttbr0 only names the most recent one. */
+uint64_t hv_el0_flt_ttbr0[HV_EL0_FLT];
 
 int hv_svc_pending[HV_MAX_CPUS];
 uint64_t hv_svc_last_slot[HV_MAX_CPUS];
@@ -108,6 +112,7 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
             hv_el0_flt_far[fi] = far;
             hv_el0_flt_sp[fi] = cpu->sp;
             hv_el0_flt_esr[fi] = esr;
+            hv_el0_flt_ttbr0[fi] = cpu->ttbr0_el1;
             for (int r = 0; r < 31; r++) hv_el0_flt_x[fi][r] = cpu->x[r];
             if (cpu->m->log >= 1) {
                 fprintf(stderr, "hengevm: el0 fault #%llu ec %llx pc %llx far %llx lr %llx sp %llx"
