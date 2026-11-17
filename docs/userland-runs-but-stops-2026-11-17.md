@@ -399,3 +399,66 @@ turnstile 0xfffffe8df208ec88  pa=0x8423ec88
    `0xfffffe001c890000..0xfffffe001eecc000`）映射到函数 —— 能直接看出它们进了哪个等待函数；
 2. 或按 turnstile 的 `+0x00` 标志位判断类型（mutex 与 waitq 的标志不同），
    再看 `+0x08` 链上的第一个等待者是谁。
+
+---
+
+## 11. 符号表打通（`tools/ksym.py`）与"等的是什么"的最后一步
+
+### 11.1 kcache 符号解析：三个必须踩过的坑
+
+新增 `tools/ksym.py <kernelcache> <addr...>`，从 kernelcache 解出符号并查地址。实测验证 3/3：
+
+```
+0xfffffe001db396ac -> AppleVirtIOPCITransport::updateStatus(uint8) + 0x2c
+0xfffffe001db37934 -> AppleVirtIOPCITransport::start(IOService*) + 0x67c
+0xfffffe001db7016c -> AppleVirtIOUSBDeviceController::goOnBus() + 0x0
+```
+
+三个坑（都踩过，结果全部错位）：
+
+| 坑 | 表现 | 正确做法 |
+|---|---|---|
+| `symoff/stroff` 的作用域 | 当成相对 kext 起始 → 读到别的数据 | 它们相对**整个 kernelcache**：读 `d[symoff]` |
+| `nlist.value` 是否含 slide | 减了 slide → 全部映射到低地址的错符号（`_IOFreeData`） | **value 已是 run VA，不要减 slide** |
+| `strx` 越界 | `0x96340e00` 这种垃圾名；顺序配对得到 `__GLOBAL__D_a` | 只在 `0 < strx < strsize` 时读名字，其余跳过 |
+
+**符号只覆盖 kext**（`__TEXT_EXEC` 里的 kext 代码）。内核自身代码没有名字，
+查到的"最近符号"会是数据段符号（`_sSortedProcessWhitelist`），要识别只能靠
+`LC_FUNCTION_STARTS` 的函数边界 + 反汇编。
+
+用 `work/kc-24G90.bin`（60 MB）解得 0 个符号——**必须用含完整 `__LINKEDIT` 的镜像**（72 MB 那份）。
+
+### 11.2 线程结构的两个 turnstile 字段（实测）
+
+对 WAIT+UNINT 的线程 dump 结构，`+0x28` 与 `+0x30` 都指向 turnstile（标志字都含 `0x0144`）：
+
+```
++0x028 -> 0xfffffe48420b2c88  [0x46460144ff56c909, ...]   ← thread->turnstile
++0x030 -> 0xfffffe2301fa9de0  [0x6262014400000002, ...]   ← 另一个 turnstile（waitq 的 interlock）
+```
+
+其中 `+0x28` 与 `dump-threads.py` 用的偏移一致（它读 `p+0x28` 报 turnstile）。
+`+0x30` 是第二个 turnstile-like 对象，很可能就是 `thread->wait_queue` 的 interlock ——
+**waitq 的地址本身还没取到**，所以"事件是哪一类（vm_page / port / 条件变量）"仍差这最后一步。
+
+### 11.3 "等的是什么"当前能确认与不能确认的
+
+**能确认**
+
+- 6–7 个线程全部 WAIT，共用**同一个** turnstile（无持有者）；
+- 其中 3–5 个是 `UNINT`，即不可中断等待；
+- 块设备请求全部完成（`inflight=0`），网络零帧；
+- 最后 15 个 syscall 全部有返回值，没有阻塞调用。
+
+**不能确认（缺一环）**
+
+- 那个 waitq/事件的具体类型。需要的字段是 `thread->wait_event`（指向 waitq），
+  取到它之后读 `waitq->waitq_queue` 与 `waitq->waitq_set` 就能定性：
+  `waitq_set` 非 0 且指向 vm_object → page wait；指向 port → 端口等待。
+
+**下一步的两条路**
+
+1. 在 thread 结构里继续定位 `wait_event`（候选：`+0x30` 附近、或 `+0x148`/`+0x3d8` 这些队列节点旁的字段），
+   判据是"该指针指向的结构第一个字是 turnstile 指针"；
+2. 用 `LC_FUNCTION_STARTS` 取函数边界，把 `+0x298` / `+0x0d0` 里的 continuation 落到某个函数区间，
+   再从区间内的字符串引用（`adrp/add` 后的地址里有 `"vm_page"`、`"mach_msg"` 一类）判断等待类型。
