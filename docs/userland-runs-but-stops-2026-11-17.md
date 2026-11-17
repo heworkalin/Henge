@@ -462,3 +462,71 @@ turnstile 0xfffffe8df208ec88  pa=0x8423ec88
    判据是"该指针指向的结构第一个字是 turnstile 指针"；
 2. 用 `LC_FUNCTION_STARTS` 取函数边界，把 `+0x298` / `+0x0d0` 里的 continuation 落到某个函数区间，
    再从区间内的字符串引用（`adrp/add` 后的地址里有 `"vm_page"`、`"mach_msg"` 一类）判断等待类型。
+
+---
+
+## 12. 按 XNU 源码解析：等的是一个 `WQT_QUEUE`（通用等待队列），不是锁
+
+### 12.1 字段对齐（这次按源码，不猜）
+
+```c
+/* osfmk/kern/thread.h —— 这四个字段连续 */
+event64_t               wait_event;   /* 等待事件号          */
+struct { processor_t runq; } __runq;  /* 运行队列归属        */
+waitq_t                 waitq;        /* 线程所在等待队列    */
+struct turnstile       *turnstile;    /* 线程的 turnstile    */
+```
+
+`waitq_type_t`（`osfmk/kern/waitq.h`）占 flags 的低 3 位：
+
+```
+WQT_INVALID=0  WQT_QUEUE=1  WQT_TURNSTILE=2  WQT_PORT=3
+WQT_SELECT=4   WQT_PORT_SET=5  WQT_SELECT_SET=6
+```
+
+arm64 上 `waitq_flags_t` 是 **uint32**、`hw_lck_ticket_t` 是 4 字节，所以 `struct waitq` 是：
+
+```c
+uint32_t flags;        // +0x00
+uint32_t interlock;    // +0x04  ticket lock
+circle_queue_head_t queue;  // +0x08 等待者链
+void *inheritor;       // +0x18
+```
+
+### 12.2 实测
+
+```
+thread+0x28 -> 0xfffffe48420b2c88  flags 低32 = 0xff56c909  type = 0x9 & 7 = 1 = WQT_QUEUE
+thread+0x30 -> 0xfffffe2301fa9de0  flags 低32 = 0x00000002  type = 2      = WQT_TURNSTILE
+```
+
+**所以 `thread+0x28` 是 `waitq`（通用等待队列），`thread+0x30` 才是 `turnstile`。**
+之前 `dump-threads.py` 读 `+0x28` 却在日志里写成 turnstile —— 那一列报的是 waitq，需要更正。
+
+该 waitq 的内容：
+
+```
++0x00 flags     = 0xff56c909   type=1 (WQT_QUEUE), fifo=1
++0x04 interlock = 0x18180144   ticket lock（被拿过）
++0x08 queue     = 0xfffffe29d01bc040   → 等待者（线程）
++0x18 inheritor = 0x14400000009        ← 不是指针（无优先级继承）
+```
+
+### 12.3 结论：等的是 `msleep`/`assert_wait` 那一层的唤醒
+
+`WQT_QUEUE` 是"通用等待队列"，XNU 里由 `assert_wait` / `msleep`（`lck_mtx_sleep`）、
+semaphore 这类**睡眠等待**使用；不是 port（`WQT_PORT`）、不是锁（turnstile）、不是 select。
+
+在 guest RAM 里扫到 **15 处**指向该 waitq 的指针 —— 说明它是共享对象，多个线程等同一个队列。
+`waitq_inheritor` 不是指针，即没有优先级继承，符合普通 `msleep` 的形态。
+
+**所以**：这些线程是在 `assert_wait`/`msleep` 上睡眠，等**某个对象调用 `wakeup()`**。
+缺的不是"某个设备能力"，而是**该 waitq 的唤醒方**：那个唤醒要求还没满足（结合前面
+USB 侧只走到 `ACKNOWLEDGE`、`DiskImages2` 未加载，最可能是 USB/IOKit 那侧的事件没到）。
+
+### 12.4 更正两个工具的错误
+
+| 位置 | 之前 | 正确 |
+|---|---|---|
+| `dump-threads.py` 报 `+0x28` 为 turnstile | 把 waitq 当成了 turnstile | `+0x28` = `thread->waitq`，`+0x30` = `thread->turnstile` |
+| `dump-wait.py` 的 `wait_event` | 读出 `0x2500` 这类小值 | `wait_event` 是 `event64_t`（事件号），本来就不是指针；waitq 在 `+0x28` |
