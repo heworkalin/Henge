@@ -590,3 +590,52 @@ thread 起始。用"扫回去找一个 `+0x1c8` 是合法 state 的结构"这种
 要拿到准确的每-task 线程数，正确做法：先在**只有一个线程**的 task 上（例如刚 spawn 时的
 `restored_external`）取 `task+0x50` 的 `head.next`，它与 thread 起始的差值就是
 `offsetof(task_threads)`，一次定死。
+
+---
+
+## 14. 线程表偏移：`task+0x50` 已证明不是 `task->threads`
+
+### 14.1 判据（三 task 互相矛盾）
+
+从三个 task 的 `task+0x50` 出发沿队列遍历，得到的**节点集合完全相同**（5 个，只是起点不同）：
+
+```
+launchd          task=0xfffffe1f5808f278  head=0xfffffe2af02b9828  nodes=5
+restored_externa task=0xfffffe1f5808c7e8  head=0xfffffe2af02a8838  nodes=5
+kernelmanagerd   task=0xfffffe1f58093968  head=0xfffffe2af02ae818  nodes=5
+```
+
+三个不同的 head 走完却落在**同一组节点**上，说明它们指向的是**同一个环**。若 `task+0x50`
+真是各自的 `task->threads`，三个 task 的线程集不可能一致。**所以 `+0x50` 不是
+`task->threads`**，之前所有基于它的"每 task 线程数"读数是错的（`docs` 里 §8/§13 的相关数字
+一并作废）。
+
+### 14.2 也不能靠启发式反推 thread 起始
+
+加严判据（`+0x1c8` 是合法 state、`+0x28` 是合法内核指针、state 含 WAIT 位、且结构某处有
+`== task` 的回指）后，5 个节点里只有 1 个能被勉强解释（且 `taskptr=False`），其余 4 个
+"找不到合理的 thread 起始"。**说明那 5 个节点里大部分不是 `thread->task_threads`。**
+
+### 14.3 仍然可靠的事实（不依赖这个偏移）
+
+```
+- 那些节点所在的环上有 5 个成员，全部 state 都是 WAIT 组合
+- 等待对象是 WQT_QUEUE（waitq 在 thread+0x28，类型位 = 1，见 §12）
+- 块设备 11 个请求全部完成（inflight=0）
+- 网络 0 帧
+- 两个 CPU 都在跑 idle 线程
+```
+
+结论不变：**全系统停在等待上，等一个 WQT_QUEUE 的唤醒，而唤醒方没有动作**。
+
+### 14.4 要把偏移定死的正确做法
+
+1. **反汇编内核的 `task_threads()`**（`__TEXT_EXEC` 里的内核主代码）：它的 `ldr x?,[x?,#imm]`
+   直接给出 `task->threads` 的偏移。难点只在于内核主代码没有符号 —— 需要先解析
+   `LC_FUNCTION_STARTS` 圈出函数边界，再按"函数体里有 `task_threads` 相关调用/返回队列头"
+   的特征定位；
+2. **或者取一个单线程 task**（刚 spawn 的 `restored_external`，`HENGE_STOP_ON` 停在
+   `service state: running` 那一刻），此时 `threads` 环只有 1 个成员，`head.next - thread`
+   一次就能定死 `offsetof(task_threads)`。
+
+第 2 条更省事，而且现场保护机制（§13）保证停了以后不会丢。
