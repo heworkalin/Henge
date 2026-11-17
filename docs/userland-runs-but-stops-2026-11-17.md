@@ -876,3 +876,74 @@ restored_external 执行 → 调进 shared cache 的一个函数（0x100f9c568�
 
 **缺的是"那一次 wakeup 的触发条件"，而它属于共享缓存里的一段代码 ——
 名字还没拿到，但定位路径已经缩小到"用两个环反推基址"这一步。**
+
+---
+
+## 19. 按"聚焦 WQT_QUEUE"的策略复核：三个前提的实测结果
+
+外部建议的核心是"别扩大范围，只做针对性因果验证"，并要两样东西：
+① `0x100f9c568` 的反汇编 + GOT 目标；② WQT_QUEUE 的 XNU 源码与 type=1 定义。
+第 ② 项本轮之前已经拿到（`WQT_QUEUE=1`，`struct waitq{uint32 flags;uint32 interlock;
+circle_queue_head_t queue;void *inheritor;}`）。第 ① 项本轮逐项验证，结果如下。
+
+### 19.1 GOT 槽：地址算对了，但页没有映射
+
+反汇编里 `adrp x17, ...; add x17, x17, #0x608`，objdump 对裸 binary 的 adrp 目标显示
+不可靠（本仓库 AGENTS.md 记过这一点），所以从指令编码直接解：
+
+```python
+# ADRP: immlo=bits[30:29], immhi=bits[23:5], target=(PC&~0xfff)+(imm<<12)
+# ADD (immediate): bits[28:23]=100010, bit22=sh, bits[21:10]=imm12
+```
+
+两种算法（objdump 路径 / 编码解码）都得到
+
+```
+GOT slot VA = 0x100fc4608
+```
+
+但 `0x100fc4608` **未映射**（页表走不通）。它落在那个 image 的 `__DATA`
+（GOT 所在段），而 `__DATA` 和代码一样是**按需映射**，当前不在 RAM 里。
+**所以"读 GOT 拿间接调用目标"这一步现在做不了**，不是算错了，是数据页没加载。
+
+### 19.2 方向 B 的前提不成立：内核主代码没有符号
+
+要"在 wakeup 调用点下断点"，得先能定位 `msleep` / `wakeup` / `assert_wait`。
+用 kernelcache 符号表（181 781 个符号）按名字反查：
+
+```
+msleep / wakeup / thread_wakeup / assert_wait / waitq_wakeup64_all / thread_block
+  -> 0 个匹配
+符号名里含 "sleep" 或 "wakeup" 的 -> 0 个
+```
+
+原因就是 `tools/ksym.py` 文件头自己写的：**内核自身的代码在这张表里没有符号**
+（该表只覆盖 kext 的 `__TEXT_EXEC`）。这些函数属于内核主代码，所以：
+
+- 不能在它们入口下 `HV_PCHK`（没有地址）；
+- 也不能靠"找 kext 里的 stub"绕过（表里连 stub 名都没有）。
+
+**要往下走，必须先解决内核主代码的地址定位** —— 这正是外部建议里提到、
+而本仓库一直挂着的 `LC_FUNCTION_STARTS` 未解析问题。
+
+### 19.3 对建议本身的判断
+
+| 建议 | 我的判断 |
+|---|---|
+| 不要推倒重来，从 WQT_QUEUE 继续 | **同意**，因果链已闭环到这里 |
+| "没观察到唤醒方 ≠ 不存在唤醒方" | **同意**，我之前的措辞收得过紧 |
+| 不要强行解释成 A 等 B 的死锁 | **同意**，`msleep` 等的是事件条件，可以没有持有者 |
+| 别急着把 SEV 与 WQT_QUEUE 合并成一个根因 | **同意**，两条线应分别验证 |
+| 只做一个实验 | **同意**，但那个实验依赖 19.2 的前提 |
+| T1/T2/T3 事件级追踪（wait 登记 / wakeup / 出队） | **需要修正实现方式**：本环境没有 kprobe/ebpf，只能在 JIT 里下断点，而断点需要地址 —— 见 19.2 |
+| 要两样东西：GOT 目标 + type=1 定义 | 第 2 项已有；第 1 项受 19.1 阻塞（数据页未映射） |
+
+### 19.4 因此下一步唯一有价值的动作
+
+**解析 `LC_FUNCTION_STARTS`，给内核主代码建档**（函数边界 + 起止地址）。有了它：
+
+1. 能定位 `msleep` / `wakeup` 的地址 → 在外层套 `HV_PCHK` 做 T1/T2/T3；
+2. 能反查那个 WQT_QUEUE 的 `waitq` 归属函数（谁调用了 `assert_wait` 用了它）。
+
+这是所有剩余路径的共同前提，且是纯离线工作（kernelcache 已在 `/tmp/kc72.bin`），
+不需要设备、不需要 AEA、不需要重跑。
