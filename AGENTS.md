@@ -365,10 +365,11 @@ SIMD clobber（`put_helper`/`refill` 未保存 v0-v31）、缺 1 ms kicker（irq
 #    ZLIB 必须有，libhengerestore 用 gzread。
 ZLIB=1 API=28 ./tools/build-install-android.sh
 
-# 2. 推送。模拟器固定占一对端口：偶数（5554）是控制台，奇数（5555）是 adb，
-#    两者是同一台模拟器（Android 官方文档原文）。手动 adb connect 127.0.0.1:5555
-#    会让 adb 额外登记一条 transport，于是 adb devices 同时列出 emulator-5554 和
-#    127.0.0.1:5555 —— 同一台机器，命令里用 -s 选一条即可。
+# 2. 推送。设备是**真机**（PJE110 / SM8550 / Android 15），通过
+#    adb connect 127.0.0.1:5555 连上。adb 的代码里只要连到 5555 端口，就按约定
+#    额外登记一条名为 emulator-5554 的 transport（并虚拟出控制台端口 5554），
+#    所以 adb devices 会同时列出 emulator-5554 和 127.0.0.1:5555 ——
+#    同一台机器、同一个连接，**名字带 emulator 不代表它是模拟器**。
 adb -s emulator-5554 push build/andcli/host-install /data/local/tmp/henge/
 
 # 3. 跑（参数顺序：booter ipsw 工作目录 RAM_MB log）
