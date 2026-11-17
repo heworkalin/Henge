@@ -208,6 +208,11 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 | `docs/android-install-status.md` | 安装现状 |
 | `docs/android-ui-plan.md` / `android-ui-design.md` | UI 结构与主题 |
 | `docs/asm-feature-floor.md` | 指令集下限与运行期降级 |
+| `docs/debug-switches.md` | **全部环境变量开关总表**（日志/引导/断点/用户态/USB/设备/JIT/安装），含默认值与最短排障路径 |
+
+**新增开关必须同步维护 `docs/debug-switches.md`。** 加一个 `getenv` 就往对应分节补一行
+（名称 / 取值 / 默认 / 作用）；凡是会改变 guest 所见的开关，默认必须是关的，并在表里写明。
+这份表是「有哪些开关」的唯一出处，不要在别处另开清单造成两份不一致。
 
 ## 10. 当前状态（2026-11，随时会变，以最新提交与 docs/ 为准）
 
