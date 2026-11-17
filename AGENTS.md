@@ -14,7 +14,8 @@
 - 上游：`https://github.com/Leviidev/Henge`（iOS 版，作者 Leviidev）
 - 本仓库：`dev` 分支 = 上游 + 我们的 **Android 移植**（`android/`）与内核启动调试
 - 模拟对象：Apple **VMAPPLE** 平台（Virtualization.framework 的 guest 侧设备模型）
-  引导链：`AVPBooter → iBoot Stage1 → Stage2(iBEC) → ramdisk + device tree + kernelcache → XNU → restored`
+  引导链：`AVPBooter → iBoot Stage1 → Stage2(iBEC) → ramdisk + device tree + kernelcache → XNU → restored_external`
+  （`restored` 与 `restored_external` 是**同一个 task** 的两个 `p_comm` 视图，后者被截成 `restored_externa`）
 - 我们实现的是 **EL2 角色**：自有 arm64 JIT、软件 MMU、PVG 半虚拟 GPU、virtio/bdif/xhci/aes/rtc/pvpanic/cfg 设备
 
 管线：`PVG 设备模型 → reims-vgpu → metal2vulkan → Vulkan(Turnip/原厂) → SurfaceView`
@@ -30,7 +31,7 @@
 | `host/` | 上游宿主层：`vm.c`(线程/kicker/WFI)、disk、hvsparse、libusb_shim、dns_proxy |
 | `ios/` | 上游 iOS App（SwiftUI）。**UI 结构/交互的参照实现**，改 Android UI 前先看这里 |
 | `android/` | Android 移植：`install.c`(宿主入口)、`henge_vm.c`、`probe_jni.c`、`stderr_to_logcat.c`(统一日志)、`app/`(Java UI)、`build-*.sh` |
-| `tools/` | 宿主侧工具：`build-install-host.sh`、`run-install-host.sh`、`host-install.c`、`disasm-raw.sh` |
+| `tools/` | 宿主侧工具：`build-install-host.sh`、`run-install-host.sh`、`host-install.c`、`disasm-raw.sh`；内核/内核态分析：`lcfs.py`（`LC_FUNCTION_STARTS` 函数索引）、`ksym.py`（kernelcache 符号）、`tsbase.py`（guest 页表遍历 + proc/walk 基础）、`dump-*.py`（线程/waitq/vmmap/栈） |
 | `tests/` | 本地脚手架（寄存器/位运算/memops/mathops/atomics/LZFSE） |
 | `third_party/` | idevicerestore/libimobiledevice、reims-vgpu、mbedtls、libzip、lzfse |
 | `docs/` | 见第 9 节，**先读再改** |
@@ -56,7 +57,7 @@ adb -s emulator-5554 shell am force-stop dev.henge.probe   # 装完必须重启 
 ```bash
 ./tools/build-install-host.sh                 # gcc/glibc 版本
 CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
-  ./build/host/host-install work/AVPBooter.vmapple2.bin android/ipsw/24G90.ipsw work 4096 2
+  ./build/host/host-install work/AVPBooter.vmapple2.bin android/ipsw/24G90.ipsw work 2048 2
 ```
 
 宿主与设备的差异（结论只在宿主成立时必须说明）：RAM、CPU 数、**PVG 是 stub**（真图形只在
@@ -72,7 +73,7 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
 
 ## 4. 设备与数据
 
-- 设备：`emulator-5554`（PJE110 / SM8550 / Adreno 740 / Android 15 / 4 KB 页）
+- 设备：`emulator-5554`（PJE110 / SM8550 / Adreno 740 / Android 15 / **宿主 4 KB 页**；guest 是 **16 KiB 页**，见 §6.9）
 - App 包名：`dev.henge.probe`（debuggable → 可用 `run-as`）
 - 日志（**内部存储**）：`files/vm/henge.log`（全量，GB 级）
   `adb -s emulator-5554 shell run-as dev.henge.probe cat files/vm/henge.log > /tmp/x.log`
@@ -99,15 +100,22 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
 | `HV_PTW_LOG` / `HV_PTW_SNAP` / `HV_DUMP_DC` / `HV_BLOCK_DUMP` | 页表写历史 / 段 dump |
 | `HENGE_RANDOM_SEED=1` | 用宿主熵填 `/chosen/random-seed`（**默认关**，关才可复现） |
 | `HENGE_TIMEOUT_SCALE` | 放大 restore 的所有等待 |
+| `HV_EXTRA_BOOT_ARGS` | 追加 boot-args（串口日志最关键，见 §5.0） |
+| `HENGE_STOP_ON` / `HENGE_STOP_EVERY` | 串口同步断点：输出匹配即 `SIGSTOP` / 每次匹配都停（见 §5.0） |
+| `HV_PCHK` / `HV_PCHK_CPU` / `HV_PCHK_MAX` | 执行断点（默认 cpu0、400 次；`CPU=all\|N`、`MAX=N` 可改）——**只作存在性证据，不能计数**（§6.7） |
+| `HV_TRACE_PC=<file>` | 全量执行轨迹（每块 run VA），判“某函数跑没跑”用它 |
+| `HV_SLOW_MEM=1` | 所有 load/store 走 C 慢路径（用于让 `HV_PTW_LOG` 看见 JIT 直接发出的写） |
 
 ### 5.0 串口（guest 的 kprintf / IOLog）—— 让内核日志可见
 
-**默认状态下 guest 内核日志全部丢弃。** 要在串口看到，必须同时满足两件事：
+**默认状态下 guest 内核日志全部丢弃。** `serial=3` 是**必要条件**，`debug=0xA` 是**可选项且带副作用**：
 
-| 条件 | 作用 |
-|---|---|
-| `serial=3` | 触发 `switch_to_serial_console()`，把 kprintf 改道到 PL011 |
-| `debug=0xA` | `DB_PRT`(0x2) + `DB_KPRT`(0x8) 打开 `disable_serial_output` |
+| 条件 | 必要性 | 作用 |
+|---|---|---|
+| `serial=3` | **必需** | 触发 `switch_to_serial_console()`，把 kprintf 改道到 PL011 |
+| `debug=0xA` | 可选 | `DB_PRT`(0x2) + `DB_KPRT`(0x8) **解除** `disable_serial_output`；**会让运行有时走不到 `restored_external`**（观察扰动） |
+
+**默认只用 `serial=3`。**
 
 **三种注入方式（按用途选）：**
 
@@ -168,7 +176,7 @@ kernelcache 里的 link VA，`HV_PCHK` 输出里也打印 `slide 0`）。**传�
 
 | 参数 | 该传的地址空间 | 说明 |
 |---|---|---|
-| `HV_PCHK=start:end` | **run VA 的低 32 位**（源码比较 `(uint32_t)cpu->pc`） | 执行断点；仅 `cpu->index==0`、最多 400 次。**传 link VA 会差一个 slide，永不命中** |
+| `HV_PCHK=start:end` | **run VA 的低 32 位**（源码比较 `(uint32_t)cpu->pc`） | 执行断点。默认仅 `cpu->index==0`、最多 400 次；`HV_PCHK_CPU=all\|N` 指定 CPU、`HV_PCHK_MAX=N` 改上限。**传 link VA 会差一个 slide，永不命中**；**命中数不能当调用次数**（§6.7） |
 | `HV_PCHK_DST=start:end` / `HV_PCHK_LEN=hex` | run VA 低 32 位（`x22`）/ 长度阈值 | 在 `HV_PCHK` 之上的附加过滤 |
 | `HV_TRACE_PC=<file>` | **文件路径**，内容为每块 **run VA**（u64 数组，上限 4M 块） | 全量执行轨迹。**判"某函数执行没执行"用它，别用 `HV_PCHK`** |
 | `HV_BLOCK_DUMP=<file>` | 文件路径 | 每 `HV_BLOCK_DUMP_EVERY`（默认 64）块 dump 翻译后的宿主指令 |
@@ -190,7 +198,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 |---|---|---|
 | `HV_PCHK`（link） | `0x84eb0e0`（`InitIOKit`） | 0 次 ← **错，差 slide** |
 | `HV_PCHK`（run） | `0x1cfff0e0` | **16 次** ✓ |
-| `HV_TRACE_PC` 统计 | `__PRELINK_TEXT` `0x1bb20000..0x1c210000` | 0 次 = kext 真没执行 |
+| `HV_TRACE_PC` 统计 | `__PRELINK_TEXT` `0x1bb20000..0x1c210000` | 0 次 = kext 真没执行（**当时那套配置下**；见下方 B 类说明） |
 
 注意 `com.apple.kernel` 的 `vmaddr` 就是 `0xfffffe000700c000`（`__PRELINK_TEXT` 起点），
 它属于 kernel fileset entry，所以"该段 0 块"等于"内核早期段没跑"，含义要单独判断。
@@ -211,7 +219,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 ## 6. 调试方法论（本项目最贵的教训）
 
 1. **推导 ≠ 证据。** 讲清机制要有 XNU 源码/实测支撑；否则标"不确定"。
-2. **先本地，后设备。** 宿主几十秒一轮；设备一轮要等人工点按。
+2. **先宿主，后设备。** 宿主几十秒一轮；设备走 **CLI** 时 1~3 分钟一轮、**无需人工**（只有走 APK 安装才需要人工点按）。
 3. **不要猜规则直接补。** 先读源码：
    - XNU（tag `xnu-11417.140.69`，本地 `/tmp/xnu`）：`osfmk/arm/arm_init.c`、`osfmk/prng/prng_random.c`、`pexpert/gen/pe_gen.c`、`osfmk/arm64/{hv_hvc.h,arm64_hypercall.c,pac_asm.h,start.s,locore.s}`、`bsd/kern/bsd_init.c`
    - QEMU（本地 `/tmp/qemu`）：`hw/vmapple/*`（**设备模型对拍金矿**）、`hw/display/apple-gfx.m`、`target/arm/tcg/pauth_helper.c`（软件 PAC 唯一参照）
@@ -341,7 +349,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 
 ### 10.5 已修好（历史）
 
-`hv_enter` 丢失、强制 `slow_mem`（1000→200 万 block/s）、`__DATA` 漏 rebase、
+`hv_enter` 丢失、强制 `slow_mem`（1000→200 万 block/s）、`__DATA` 漏 rebase（**曾经必修；后来实测内核自己会走完 fixup，现改为默认不补，见 §7**）、
 PAC strip 宽度、OEM/PV-lock hypercall、UI 状态失联若干、按文件记录校验、
 SIMD clobber（`put_helper`/`refill` 未保存 v0-v31）、缺 1 ms kicker（irq 0→27 万）、
 磁盘 fd 被提前关闭。
@@ -349,24 +357,28 @@ SIMD clobber（`put_helper`/`refill` 未保存 v0-v31）、缺 1 ms kicker（irq
 ## 11. 设备上跑 CLI（首选调试方式，1 分钟一轮）
 
 内核/引擎的调参、探针、对照实验**不要走 APK**。把安装器编译成 Android CLI，推到
-`/data/local/tmp` 直接跑：bionic、真机 CPU、4 KB 页，**并且没有 proot 的 ptrace 干扰**
-（glibc 宿主上出现的 SIGSEGV 在 bionic 上不出现，实测过）。
+`/data/local/tmp` 直接跑：bionic、真机 CPU、**宿主 4 KB 页**（guest 仍是 16 KiB 页，见 §6.9），
+**并且没有 proot 的 ptrace 干扰**（glibc 宿主上出现的 SIGSEGV 在 bionic 上不出现，实测过）。
 
 ```bash
 # 1. 编译（约 1 分钟）。API 28 起才有 aligned_alloc / pthread_gettid_np；
 #    ZLIB 必须有，libhengerestore 用 gzread。
 ZLIB=1 API=28 ./tools/build-install-android.sh
 
-# 2. 推送
-adb -s 127.0.0.1:5555 push build/andcli/host-install /data/local/tmp/henge/
+# 2. 推送。注意：现在有两个 adb 目标（emulator-5554 与 127.0.0.1:5555），
+#    不给 -s 会报 "more than one device/emulator"。
+adb -s emulator-5554 push build/andcli/host-install /data/local/tmp/henge/
 
 # 3. 跑（参数顺序：booter ipsw 工作目录 RAM_MB log）
-adb shell "cd /data/local/tmp/henge && chmod 755 host-install && \
-  ./host-install AVPBooter.vmapple2.bin /data/local/tmp/ipsw/24G90.ipsw workN 4096 2 > run.log 2>&1"
+adb -s emulator-5554 shell "cd /data/local/tmp/henge && chmod 755 host-install && \
+  ./host-install AVPBooter.vmapple2.bin /data/local/tmp/ipsw/24G90.ipsw workN 2048 2 > run.log 2>&1"
 ```
 
 要点：
 
+- **RAM 用 `2048`，且一次只开一个实例。** 设备总内存约 15 GB，单个实例实测 RSS ≈ 2.1 GB；
+  以前同时留两个（一个“现场”+ 一个新实验）就占了 4 GB+。**分析完立刻 `kill -9`，不要留“现场”**
+  （分析数据落进 docs 就够了）。开了新的先确认旧的已消失。
 - **每次换一个新的 `workN` 目录**。同一个目录被占用时会直接退出并打印
   `another installer is using workN`。用完的目录记得删（`aux.img` 30 MB、`dc-*.bin` 各 6 MB）。
 - **参数少一个会静默跑错**：给 `workN 3` 会把 3 当成 RAM=3 MB，机器建不起来但不报错。
