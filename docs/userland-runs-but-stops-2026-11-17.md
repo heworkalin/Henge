@@ -710,3 +710,58 @@ restored_external 起来并执行（tokens: 20 万+ 用户态块）
 另外记一笔：`task+0x50` / `task+0x58` 在这一轮又被证明不是 `threads` / `vm_map`
 （两者都指向同一个线程链节点），**因此 task 结构的所有偏移目前都不可靠**，
 上面这些结论刻意没有依赖它们。
+
+---
+
+## 16. 离线扫描结论：那段代码也不在 restore ramdisk 里
+
+### 16.1 方法（二进制特征匹配，不依赖运行时基址）
+
+取 `0x100f9c568` 开头 32 字节的指令编码作为特征：
+
+```
+d503237f a9bd57f6 a9014ff4 a9027bfd 910083fd d10043ff aa0103f4 aa0003e1
+```
+
+在 `/tmp/rd/full`（restore ramdisk 的完整解包，**1098 个文件**）里逐文件搜索该字节序列：
+
+```
+files scanned: 1098, pattern hits: 0
+```
+
+### 16.2 结论
+
+```
+0x100f9c568 的代码
+  ✗ 不在 restored_external（2.7 MB，__TEXT 只到 0x100240000）
+  ✗ 不在 restore ramdisk 的任何文件里（1098 个文件全扫，0 命中）
+  → 来自 dyld shared cache
+```
+
+而且 ramdisk 里**没有** `dyld_shared_cache_arm64e`
+（`find /tmp/rd/full -name "*dyld_shared_cache*"` 为空），这解释了两件事：
+
+1. 为什么按 `MH_MAGIC_64` 扫 guest RAM 找不到覆盖该地址的头 —— cache 里的 image 没有独立 header；
+2. 为什么离线特征匹配 0 命中 —— 代码不在 ramdisk 的独立文件里，而在共享缓存内。
+
+### 16.3 要把名字拿到，只剩两条路
+
+| 路径 | 需要的材料 | 成本 |
+|---|---|---|
+| 从**主系统**镜像取 shared cache，用 `dyld_info`/`dyld_shared_cache_util` 解出符号 | 主系统 dmg（restore ramdisk 不含） | 需要换包 |
+| 从**运行中的 guest** 走 `_dyld_all_image_infos`，读 `imageLoadAddress`/`imageFilePath` 直连 | 只要正确的结构偏移（`TPIDRRO_EL0` 链路，序言里 `[x8,#0xe8]` 已给出入口） | 需先定偏移 |
+
+第一条是"换材料"，第二条是"补偏移"。**两条都不该用盲扫 2 GB RAM 的方式**（本轮试过一次，超时且 0 命中）。
+
+### 16.4 本轮到此为止的判断
+
+因果链已经收敛到一句话，且每一环都有实测支撑：
+
+```
+restored_external 执行 → 调进 shared cache 的一个函数（0x100f9c568，alloca 72B/元素 + 间接调用）
+  → 进内核 → 停在 WQT_QUEUE（msleep/assert_wait）
+  → 唤醒方无动作 → 永久等待 → USB 的 SetDescription 永远不会发生
+```
+
+**缺的不是设备能力，而是某一次 `wakeup()` 的触发条件。** 要落地点名，就必须先解决
+"shared cache 符号"或"`_dyld_all_image_infos` 偏移"其中一个。
