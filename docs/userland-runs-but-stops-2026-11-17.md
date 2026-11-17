@@ -765,3 +765,50 @@ restored_external 执行 → 调进 shared cache 的一个函数（0x100f9c568�
 
 **缺的不是设备能力，而是某一次 `wakeup()` 的触发条件。** 要落地点名，就必须先解决
 "shared cache 符号"或"`_dyld_all_image_infos` 偏移"其中一个。
+
+---
+
+## 17. 用完整 IPSW 复核：名字只能在 shared cache 里，而它在加密的 AEA 中
+
+### 17.1 IPSW 内容（`android/ipsw/24G90.ipsw`，16.8 GB）
+
+```
+043-18152-097.dmg.aea  9.3 GB   ← 主系统（.aea = Apple Encrypted Archive）
+043-18205-098.dmg.aea  5.2 GB   ← 另一个加密卷
+043-18107-098.dmg       25 MB   APFS，Safari 分区（2512 个文件）
+043-18326-098.dmg      188 MB   APFS，含 usr/lib/dyld（1.2 MB）
+043-18242-098.dmg      188 MB   restore ramdisk（已解包到 /tmp/rd/full）
+```
+
+### 17.2 逐个排除
+
+| 位置 | 检查 | 结果 |
+|---|---|---|
+| restore ramdisk（1098 文件） | 特征字节搜索 | 0 命中 |
+| `043-18107`（Safari 分区） | 无 dyld/共享缓存 | — |
+| `043-18326` 的 `usr/lib/dyld` | 特征字节 + 前缀 8/16/24 字节搜索 | 0 命中 |
+| guest RAM（`MH_MAGIC_64`） | 无头覆盖该地址 | 0 命中 |
+
+**结论：`0x100f9c568` 的代码只在 `dyld_shared_cache_arm64e` 里，而共享缓存只存在于
+`043-18152-097.dmg.aea`（9.3 GB，加密）。**
+
+### 17.3 为什么这条路当前走不通
+
+- `.aea` 需要 Apple 的 `aea decrypt`（macOS 自带）或等价实现 + 对应密钥；本环境两者都没有；
+- restore ramdisk 之所以不含共享缓存，是因为 restore 环境本来就用主系统的缓存。
+
+### 17.4 因此只剩"从运行中的 guest 读"这一条
+
+`_dyld_all_image_infos` 的入口在那段序言里就给了：
+
+```asm
+100f9c598: mrs  x8, TPIDRRO_EL0     ; 线程 TLS
+100f9c59c: ldr  x22, [x8, #0xe8]    ; 从这里能到 image infos 链
+```
+
+顺着它读 `imageLoadAddress` / `imageFilePath`，就能直接点名 `0x100f9c568` 属于哪个
+`.dylib`，不需要解 AEA，也不需要反编译共享缓存。
+
+**前提**：偏移要可靠。目前 task 结构的偏移（+0x50/+0x58/+0x60）全部被证伪过，
+所以下一步应该先建立**可自校验的结构定位**（两个互不相关字段互相指回才算数），
+再走 `_dyld_all_image_infos`。否则又是一轮"读数看着像、结论全错"。
