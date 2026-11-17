@@ -141,6 +141,8 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | `HV_VUSB_LATE` | `1` | 关 | 把 vusb 放到 PCI 槽位最后（默认放到块设备之前，因为它的驱动用 INTx，槽位顺序是唯一差异） |
 | `HV_VUSB_PROBE` | `1` | 关 | 探测 vusb 应答 |
 | `HENGE_USB_REENUM` | `1` | **关** | userland 起来 8 秒后 `hv_vusb_force_rescan()`。**曾导致 `Killed`**：8 秒后 `d` 可能已被 installer 释放。只用于对照实验 |
+| `HENGE_STOP_ON` | 串口子串，可用 `\|` 分隔多个 | 关 | **串口同步断点**：console 出现匹配行时 `raise(SIGSTOP)` 停住整个进程，gdb 附加读内存后 `kill -CONT` 继续。串口是 guest 与引擎唯一的共同同步点，所以这是「在已知时刻抓状态」的唯一无轮询办法。`devices/vmapple.c` 的 `vmapple_serial_out()` |
+| `HENGE_STOP_EVERY` | `1` | 关 | 每次匹配都停（否则只停第一次）。配合多个模式用它走一条事件阶梯，每级拿一次快照 |
 | `HV_RESET_ENUM` | `1` | 关 | 恢复「枚举前先 reset」的旧行为（`host/libusb_shim.c:93`） |
 | `HV_LIBUSB_LOG` | `1` | 关 | 宿主 libusb shim 日志（arrived/left/enumerate failed）——**看 host 是否看到设备切换就靠它** |
 | `HV_USB_CTRL_CHUNK` / `HV_USB_OUT_CHUNK` | 字节数 | 设备默认 | 控制/OUT 传输分块大小（调试吞吐） |

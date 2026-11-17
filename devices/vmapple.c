@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -301,6 +302,40 @@ static void vmapple_serial_out(void *opaque, uint8_t c) {
         /* log 1, not 2: the port's own words are the cheapest evidence there is, and log 2
            floods the log with per-helper lines that hide them. */
         if (m->log >= 1 && n) fprintf(stderr, "hengevm: serial: %s\n", line);
+        /* HENGE_STOP_ON=<substring>: stop the whole process the moment a console line contains
+           it. A console event is the only synchronisation point the guest and the engine share,
+           so this is how a state gets caught at a known moment without polling: the run halts
+           with every CPU, thread and page exactly as the line that named it was printed. gdb
+           then attaches (adb shell ./gdb.sh -p <pid>), reads what it wants, and continues.
+           SIGSTOP rather than a halt so nothing is torn down and the run can go on. */
+        const char *stop_on = getenv("HENGE_STOP_ON");
+        if (n && stop_on && *stop_on) {
+            static int once;
+            static int stop_every = -1;
+            if (stop_every < 0) stop_every = getenv("HENGE_STOP_EVERY") != NULL;
+            if (!once || stop_every) {
+                /* '|' separated patterns, so one run can walk a ladder of console events
+                   (spawning -> running -> spawned -> objc) stopping at each. HENGE_STOP_EVERY=1
+                   makes it stop at every match instead of only the first, which is what turns
+                   one stop into a sequence of states to compare. */
+                char pats[512];
+                snprintf(pats, sizeof pats, "%s", stop_on);
+                const char *hit = NULL;
+                for (char *tok = strtok(pats, "|"); tok; tok = strtok(NULL, "|"))
+                    if (*tok && strstr(line, tok)) { hit = tok; break; }
+                if (hit) {
+                    /* Remember which pattern matched, for the log line. */
+                    static char which[128];
+                    snprintf(which, sizeof which, "%s", hit);
+                    once = 1;
+                    fprintf(stderr, "hengevm: HENGE_STOP_ON matched \"%s\", stopping pid %d for "
+                                    "gdb\n", which, (int) getpid());
+                    fflush(stderr);
+                    raise(SIGSTOP);
+                    fprintf(stderr, "hengevm: resumed after HENGE_STOP_ON (\"%s\")\n", which);
+                }
+            }
+        }
         /* Off by default: this thread runs 8 s later and calls hv_vusb_force_rescan() on a
            pointer that the installer may already have freed -- the run ends with "Killed" right
            after the line below, which is why it is opt-in now. HENGE_USB_REENUM=1 for a

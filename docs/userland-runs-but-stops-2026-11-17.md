@@ -193,3 +193,150 @@ pc 0x104e3f5d4   ldr x8, [x20, #0x20]      ← x20 未知
 1. **等它停住后读等待状态**：`restored_external` 的线程在等哪个端口/服务（XPC 消息、`psynch_cvwait`、`semwait`）。这能直接回答"缺什么"。
 2. 若确认是等 XPC：查那个服务为什么没被 launchd 启动（`com.apple.system.notification_center` 在另一次运行里出现过 `failed lookup ... error = 3: No such process`）。
 3. 若要重复"最后一个块"的断点，**必须在同一次运行里**先取 `hv_last_el0_va`，再用 `HV_PCHK_CPU=all` 断它——不能复用上一次的地址。
+
+---
+
+## 7. 本轮新增的调试接口
+
+### 7.1 串口同步断点 `HENGE_STOP_ON` / `HENGE_STOP_EVERY`
+
+guest 和引擎之间**唯一的共同同步点就是串口**。所以"在某个已知时刻抓状态"最可靠的办法
+不是轮询、也不是定时，而是：**console 打出某行时把整个进程停住**。
+
+```bash
+HV_LOG=1 \
+HENGE_STOP_EVERY=1 \
+HENGE_STOP_ON="restored_external) <Notice>: service state: spawning|\
+restored_external [5]) <Notice>: service state: running|\
+Successfully spawned restored_external|objc[5]" \
+HV_EXTRA_BOOT_ARGS="serial=3" setsid nohup ./host-install ...
+```
+
+实现（`devices/vmapple.c` 的 `vmapple_serial_out()`）：
+
+- 行结束时按 `|` 拆开 `HENGE_STOP_ON`，任一子串命中则 `raise(SIGSTOP)`；
+- `HENGE_STOP_EVERY=1` 让每次命中都停（否则只停第一次），从而一条命令走完一条事件阶梯；
+- 日志会打 `HENGE_STOP_ON matched "<命中的模式>", stopping pid N for gdb`；
+- gdb 用 `-batch -x <script>` 读完自动 detach；**detach 不会替进程发 SIGCONT**，
+  要继续必须显式 `adb shell 'kill -CONT $(pidof host-install)'`（这一步踩过：停在 T 但日志没有下一次命中）。
+
+**为什么不用 `Successfully spawned` 当唯一点**：那只是 launchd 的记账（fork + 交给 xpcproxy），
+停在那里无法判断进程是否真的执行过。停在它**之前**的 `service state: running` 更有信息量。
+
+### 7.2 `HV_PCHK_CPU` / `HV_PCHK_MAX`
+
+`HV_PCHK` 原来只对 cpu 0 生效，而用户态不一定跑在 cpu0。现在：
+
+| 值 | 含义 |
+|---|---|
+| 不设 | cpu 0（保持旧日志可比） |
+| `all` / `-1` | 全部 CPU |
+| `N` | 指定核 |
+| `HV_PCHK_MAX=N` | 命中打印上限（原固定 400） |
+
+用户态命中时改为打印 `x0..x29 + lr + sp`；原来那套 dump 把 `x21` 当 proc、`x26` 当 slide 基址，
+对用户态没有意义。已验证两个核都会命中（`pchk c1` / `pchk c0`）。
+
+### 7.3 `hv_el0_flt_*`：EL0 故障的完整寄存器快照
+
+环形 8 条，记录 EL0 同步异常（排除 SVC）那一刻的 `pc/far/esr/sp` 与全部 `x0..x30`。
+坏指针的基址寄存器只在那一刻存在——事后再看，进程已退出、页表已销毁。
+
+### 7.4 修掉的 bug：`hv_svc_ret[]` 恒为 0
+
+`hv_svc_ret[]` 的更新原本和 pc 环形一起挂在 `log >= 2` 分支里，所以普通日志级别下
+**所有系统调用返回值读出来都是 0**，此前据 `ret=0x0` 得到的判断不可信。
+现在用户态部分拆成 `hv_el0_note()`，每块无条件执行。
+
+### 7.5 关键的偏移纠正
+
+| 字段 | 正确偏移 | 之前用的（错） |
+|---|---|---|
+| `task->threads` | **`task+0x50`** | `task+0x600` |
+| `thread->state` | **`thread+0x1c8`** | `thread+0x340` |
+| `p_comm` | `proc+0x5cc`，`char[17]` | — |
+
+`+0x600`/`+0x340` 读出来的是别的东西，据此得到的"线程 state 全 0"等结论全部作废。
+`p_comm` 只有 17 字节，`"restored_external"`（17 字符）实际存为 `"restored_externa"`，
+用全名查找会误报"进程不存在"。
+
+---
+
+## 8. 停在哪里（阶梯断点的实测结果）
+
+同步点阶梯（`HENGE_STOP_EVERY=1`），每停一次用 `dump-threads.py` / 自写 `th2.py` 扫线程表：
+
+| 停点 | `hv_el0_trace_n` | `restored_external` 线程 | 说明 |
+|---|---|---|---|
+| `exiting bootstrap mode` | 95 382 | 尚未创建 | 只有 `launchd0`（WAIT）+ 两个 idle（RUN），CPU 都在 idle 线程上 |
+| `service state: spawning` | — | — | 已停（未扫） |
+| `service state: running` | — | **1 个，state=0x4 (RUN)** | 已在运行队列，可被调度 |
+| `Successfully spawned restored_external` | 135 649 | **1 个，state=0x4 (RUN)** | 用户态块增长 4 万，确实在跑 |
+| 之后（无 objc[5]） | — | **5 个，全部 WAIT** | 见下 |
+
+阶梯之后的终态（`restored_external` 的 task，threads=5）：
+
+```
+[0] state=0x1  (WAIT)                    turnstile=0xfffffe46aa09ac88
+[1] state=0x49 (WAIT+UNINT+WAITREP)      turnstile=0xfffffe46aa09ac88
+[2] state=0x9  (WAIT+UNINT)              turnstile=0xfffffe46aa09ac88
+[3] state=0x41 (WAIT+WAITREP)            turnstile=0xfffffe46aa09ac88
+[4] state=0x9  (WAIT+UNINT)              turnstile=0xfffffe46aa09ac88
+```
+
+同时：
+
+- **串口没有出现 `objc[5] ... DiskImages2`** —— 说明 `DiskImages2.framework` 没有被加载完成；
+- `hv_el0_flt_n` 在 45 秒里只增长 2，用户态基本停止；
+- 最后的 syscall 序列**全部有返回值**（`-50 / -47 / -19 / -18 / 75 / 478`），
+  没有阻塞在某个 syscall 里 —— 所以线程是卡在**内核内部**等一个对象，而不是卡在调用上；
+- 两个 `idle` 线程 `state=0x4 (RUN)`，两个 CPU 都在跑它们。
+
+---
+
+## 9. 可能的结论（按可信度排序）
+
+### 9.1 最可信：`restored_external` 的 5 个线程在等同一个 I/O / page
+
+依据：
+
+1. 5 个线程的 `turnstile` 字段**是同一个值** `0xfffffe46aa09ac88`；
+2. 其中 3 个是 `UNINT`（不可中断睡眠）—— 这是内核 I/O 与 page 等待的典型形态，
+   不是用户态互斥锁（那通常是可中断的 `WAIT`）；
+3. 最后一批 syscall 没有一个是阻塞调用，全部返回 —— 所以等待发生在内核内部；
+4. `objc[5]`（`DiskImages2` 加载）没有出现，而 `DiskImages2` 正是**磁盘镜像**相关框架。
+
+`turnstile 0xfffffe46aa09ac88` 的内容：
+
+```
++0x08 = 0xfffffe2aea38d030   → 线程 [3]（WAIT+WAITREP）
++0x50 = 0xfffffe2aea0c9828   → 另一个内核对象
+```
+
+**推论**：请求已经提交给块设备，但 completion 没有回来，于是线程集体停在不可中断等待上。
+这与 `HV_BLK_STATS` 观测到的「只有 1 req/s、`busy` 很低」一致 —— 有少量提交，没有推进。
+
+### 9.2 次可信：`DiskImages2` 的 I/O 通过某个我们没实现的设备/路径
+
+`restored_external` 用 `DiskImages2.framework` 打开磁盘镜像。如果它走的是
+`AppleVirtIOStorageDevice` 之外的另一条路径（例如需要 `diskimagesiod` 这个 daemon 配合），
+而那个 daemon 没有起来，等待就会落到"内核内部等一个永远不会到来的事件"。
+
+### 9.3 已排除（本轮实测）
+
+| 假设 | 反证 |
+|---|---|
+| `restored_external` 没有执行 | 执行了：`hv_el0_trace_n` 从 95k 涨到 135k+，线程 `state=0x4 (RUN)` |
+| 卡在某个 syscall 上 | 最后 15 个 syscall 全部有返回值 |
+| 用户态崩溃 | 8392 次 EL0 故障全是 translation/access-flag fault，无权限/未定义指令 |
+| `shared_region ... failed` 是致命伤 | launchd 带着它完成 bootstrap |
+| `No task-access server` 是致命伤 | 它之后系统继续 spawn |
+| 缺网络后端 | `hv_net_tx/rx = 0 / 0` |
+| vusb 的 MSI capability | 去掉后 vusb 配置序列完全一致 |
+
+### 9.4 下一步（一次运行即可判定）
+
+带 `HV_BLK_STATS=5` 跑，在 5 个线程进入 `UNINT` 之后看块设备：
+
+- 若 `req/s` 归零但队列里有未完成请求 → **completion 路径的问题**，在 `devices/virtio_blk.c`；
+- 若完全没有请求 → 等待的不是块设备，回到 `9.2`，查 `diskimagesiod` 那条路径。
