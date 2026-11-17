@@ -365,8 +365,9 @@ SIMD clobber（`put_helper`/`refill` 未保存 v0-v31）、缺 1 ms kicker（irq
 #    ZLIB 必须有，libhengerestore 用 gzread。
 ZLIB=1 API=28 ./tools/build-install-android.sh
 
-# 2. 推送。注意：现在有两个 adb 目标（emulator-5554 与 127.0.0.1:5555），
-#    不给 -s 会报 "more than one device/emulator"。
+# 2. 推送。同一个设备可以通过真实端口（emulator-5554）或转发的网络端口
+#    （127.0.0.1:5555）访问 —— adb 把它们算成两个 transport，所以命令里用 -s
+#    指明走哪个即可（正常现象，不是两台机器）。
 adb -s emulator-5554 push build/andcli/host-install /data/local/tmp/henge/
 
 # 3. 跑（参数顺序：booter ipsw 工作目录 RAM_MB log）
