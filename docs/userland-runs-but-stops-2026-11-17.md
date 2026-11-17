@@ -639,3 +639,74 @@ kernelmanagerd   task=0xfffffe1f58093968  head=0xfffffe2af02ae818  nodes=5
    一次就能定死 `offsetof(task_threads)`。
 
 第 2 条更省事，而且现场保护机制（§13）保证停了以后不会丢。
+
+---
+
+## 15. 用户态最后执行的代码：一个 alloca + 间接调用的函数
+
+### 15.1 位置
+
+```
+hv_last_el0_va      = 0x100f9c568
+hv_last_el0_ttbr0   = 0x30000922d4000      ← 用户态页表，说明那一刻确实在用户态
+hv_last_el0_page_pa = 0xc56bc000
+gp CPU 的 ttbr0     = 0x837f4000（内核页表）← CPU 在 idle
+```
+
+### 15.2 反汇编（页内 dump，`0x100f9c568` 正是函数序言）
+
+```asm
+100f9c568: pacibsp
+100f9c56c..574: 保存 x19-x30
+100f9c598: mrs  x8, TPIDRRO_EL0        ; 线程 TLS
+100f9c59c: ldr  x22, [x8, #0xe8]
+100f9c5a0: ldr  x21, [x22, #0x18]
+100f9c5a4: ubfiz x8, x20, #3, #32      ; x8 = x20 * 8
+100f9c5a8: add  x8, x8, w20, uxtw      ; x8 = x20 * 9
+100f9c5ac: lsl  x2, x8, #3             ; x2 = x20 * 72      ← 元素 72 字节
+100f9c5b4: and  x8, x8, #0xfffffffff0  ; 对齐 16
+100f9c5c4: ldr  x16, [x17]             ; GOT 取函数指针
+100f9c5c8: blraa x16, x17              ; 带 PAC 的间接调用
+100f9c5d0: sub  x19, x9, x8            ; alloca：栈上开 x20*72 字节
+```
+
+形态是「用 `alloca` 开一个 72 字节/元素的数组，再间接调用一个系统函数」，
+很像 `getifaddrs` / `getmntinfo` / `sysctl` 这类枚举系统信息的调用。
+
+### 15.3 这个地址**不属于** restored_external
+
+`restored_external` 从 restore ramdisk 里提出来了（`/tmp/rd/full/usr/local/bin/restored_external`，
+2 707 952 字节，`__TEXT` = `0x100000000` 起、大小 `0x240000`），而
+
+```
+0x100f9c568 - 0x100000000 = 0xf9c568  ≈ 16 MB  >> 0x240000
+```
+
+**所以最后执行的代码在另一个 image 里**（dyld 分配到的另一个地址，基址大约 `0x100f00000`）。
+
+扫 guest RAM 找 `MH_MAGIC_64` 头，**没有任何头覆盖这个地址** —— 与"该 image 来自 dyld shared cache、
+没有独立 header 落在 RAM 里"一致。
+
+### 15.4 因此因果链现在断在这里
+
+```
+restored_external 起来并执行（tokens: 20 万+ 用户态块）
+  → 调进一个 dyld 加载的 dylib（0x100f9c568）
+    → 那里 alloca + 间接调用一个系统函数
+      → 进入内核后停在 WQT_QUEUE（msleep/assert_wait）
+        → 唤醒方没有动作 → 永远不返回
+```
+
+**缺的两个名字**：那个 dylib 是谁，以及那个被间接调用的函数是谁。拿到名字，"为什么死等"就是确定答案。
+
+### 15.5 两条可执行的下一步
+
+1. **点名那个 dylib**：读 `restored_external` 进程的 dyld image 列表（`_dyld_all_image_infos`，
+   在 `TPIDRRO_EL0` 的 TLS 里能找到指针链 —— 本页反汇编里正是 `[x8, #0xe8]`），
+   每项含 `imageLoadAddress` 与 `imageFilePath`，用路径直接点名。
+2. **点名被调用的函数**：该调用经 GOT（`adrp x17, 0x28000; add x17, x17, #0x608`），
+   读那个 GOT 槽的值，再在该 dylib 的符号表（或 dyld shared cache 的符号）里查。
+
+另外记一笔：`task+0x50` / `task+0x58` 在这一轮又被证明不是 `threads` / `vm_map`
+（两者都指向同一个线程链节点），**因此 task 结构的所有偏移目前都不可靠**，
+上面这些结论刻意没有依赖它们。
