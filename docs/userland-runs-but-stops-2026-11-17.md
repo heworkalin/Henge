@@ -530,3 +530,63 @@ USB 侧只走到 `ACKNOWLEDGE`、`DiskImages2` 未加载，最可能是 USB/IOKi
 |---|---|---|
 | `dump-threads.py` 报 `+0x28` 为 turnstile | 把 waitq 当成了 turnstile | `+0x28` = `thread->waitq`，`+0x30` = `thread->turnstile` |
 | `dump-wait.py` 的 `wait_event` | 读出 `0x2500` 这类小值 | `wait_event` 是 `event64_t`（事件号），本来就不是指针；waitq 在 `+0x28` |
+
+---
+
+## 13. 现场保护：`HENGE_STOP_ON` 设置时不因超时收摊
+
+### 13.1 为什么需要
+
+restore 等到超时（约 5 分钟）就会：`on_install_progress` 在 `step >= HV_INSTALL_DONE` 时
+调 `stop_cpus()`（给每个 CPU 置 `exit_req`、置 `g_machine.stop`），CLI 主循环随即 `break`
+并退出进程。**而那正是最该看的现场** —— 一想扫什么，机器已经没了。
+
+### 13.2 改动（两处）
+
+| 位置 | 行为 |
+|---|---|
+| `android/install.c` `on_install_progress` | 设了 `HENGE_STOP_ON` 就**不调** `stop_cpus()`，只打印一行并让 guest 继续跑（idle 或卡住，本来就是被测对象） |
+| `tools/host-install.c` 主循环 | `step >= 100` 后仍打印 verdict 与进程扫描，但设了 `HENGE_STOP_ON` 时**不 break**，改为 `for(;;) sleep(60)` |
+
+两处都会打印一行带 pid 的提示：
+
+```
+hengevm: HENGE_STOP_ON is set, staying alive for gdb (pid 18499); kill -9 18499 to exit
+```
+
+退出从此只能是显式 `kill -9`。
+
+### 13.3 效果（实测）
+
+同一轮运行，改前会在 `restore failed` 后立即消失；改后：
+
+```
+pid=18499 stat=S
+hengevm: HENGE_STOP_ON is set, staying alive for gdb (pid 18499); kill -9 18499 to exit
+```
+
+进程常驻，可以**反复 attach / detach 扫描同一份现场**，不必为了看一个新字段重跑 4 分钟。
+
+### 13.4 现场保护下扫到的事实
+
+反复扫描同一进程（18499）得到：
+
+```
+launchd / restored_externa / kernelmanagerd 三个 task 都存在
+task+0x50 是 queue_head（next/prev 指向不同节点）→ 每个 task 都有多个线程
+所有线程 state 都是 WAIT 的组合：0x9(WAIT+UNINT)、0x49(WAIT+UNINT+WAITREP)、0x1(WAIT)
+等待对象是 WQT_QUEUE（见 §12），不是锁
+块设备 11 个请求全部完成、网络 0 帧
+```
+
+### 13.5 还没定的一个偏移（诚实记录）
+
+从 `task+0x50`（queue_head）出发沿队列走，得到的是**节点地址**，而节点是
+`thread->task_threads` 字段，需要知道 `offsetof(struct thread, task_threads)` 才能反推
+thread 起始。用"扫回去找一个 `+0x1c8` 是合法 state 的结构"这种启发式在三个 task 上收敛到
+同一个地址（`node-0x7f8`），说明这个启发式不够判别 —— **所以上面"三个 task 各自的线程数"
+目前不可信**，可信的只是"每个 task 都挂着多个线程、且线程状态都是 WAIT"。
+
+要拿到准确的每-task 线程数，正确做法：先在**只有一个线程**的 task 上（例如刚 spawn 时的
+`restored_external`）取 `task+0x50` 的 `head.next`，它与 thread 起始的差值就是
+`offsetof(task_threads)`，一次定死。
