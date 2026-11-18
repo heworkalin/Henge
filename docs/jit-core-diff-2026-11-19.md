@@ -158,6 +158,50 @@ x0 = [x28]                  helper 的返回值
 | T-9 | `HV_INSN_WAIT` 注释 | 说明 `SEV`/`SEVL` 走 `HV_INSN_COPY` 原生执行，所以 `WFE` 能被唤醒 | **E** |
 | T-10 | `translate_emit()` 调 `put_trace_entry()` | 见 T-1 | **E** |
 
+### 2.1.5 寄存器使用约定：Darwin 与 bionic 的 ABI 对照（2026-11-19 查证）
+
+用户提出的假设是"可能只是 iOS 在寄存器分配上没有限制，所以上游能正常使用"。查证结论：
+**两个平台的规定完全相同，差异不在这里。**
+
+| 寄存器 | AAPCS64 角色 | Darwin (iOS) | Android (bionic) |
+|---|---|---|---|
+| x0–x7 | 参数/返回值 | 同 | 同 |
+| x8 | 间接结果位置 | 同 | 同 |
+| x9–x15 | 临时（caller-saved） | 同 | 同 |
+| **x16/x17** | **IP0/IP1；链接器可在 PLT/veneer 中使用** | 同 | 同 |
+| **x18** | **平台保留** | thread state（编译器不用） | **ShadowCallStack（NDK：不要碰）** |
+| x19–x28 | callee-saved | 同 | 同 |
+| x29/x30 | FP / LR | 同 | 同 |
+
+来源：ARM AAPCS64 原文（"R16, R17 — IP0, IP1: intra-procedure-call temporary registers.
+The linker may use these in PLT code"）、Android NDK「Android ABIs」（x18 保留给
+ShadowCallStack）、Apple「Writing ARM64 code for Apple platforms」（x18 平台保留）。
+
+**链接器实际怎么用 x16/x17**（这就是两侧的差别所在，不是"允许不允许"）：
+
+```
+ELF (glibc/LLD):  adrp x16, … ; ldr x17, [x16, …] ; add x16, x16, … ; br x17
+Mach-O (Apple):   adrp x16, … ; ldr x16, [x16, …] ; br x16
+```
+
+**两者都占用 x16**（ELF 还用 x17）。所以真正的变量是**链接方式与符号可见性**：
+一个自家符号是否需要经 GOT 取地址。我们代码里正有一条修复对着这里（`enter.S` 的
+`.hidden`，注释原文：*"That is how a .got.plt address turned up in a guest's x16 and the
+firmware died on it"*）。它把地址变成链接期常量，不再走 GOT。
+
+由此可以给"上游为什么能跑"一个**候选解释**：Mach-O 构建里这些自家符号可能被直接解析
+（不经 GOT），而我们的 ELF/PIE 构建走到 GOT，`adrp x16/ldr x16` 就改写了 x16。
+**但这是推断，尚未验证**（需要在 Android 构建上确认 `.hidden` 是唯一变量，且在 iOS
+构建上确认没有 GOT 访问）。
+
+对上游/我们的实际结论：
+
+- `x18` 必须排除 —— 两边都保留，没有争议；
+- `x16/x17` 不能借给别的 guest 寄存器 —— 这是**引擎自身的保存逻辑**（`SAVE_X2_X29`
+  按编号存），与操作系统无关；
+- 但**"借用后是否立即出事"**取决于宿主代码在这期间是否用了 x16/x17（PLT/GOT 就会），
+  这就是平台/链接差异能放大的地方。
+
 ### 2.2 两处架构级偏离——但都还欠"上游为什么能跑"的解释
 
 | # | 上游 | 我们 | 为什么这是上游的问题（架构级） |
@@ -166,7 +210,8 @@ x0 = [x28]                  helper 的返回值
 | **D-2 ⚠️** | `put_strip()` 用 `BFM #16,#6`（清 bits[54:48]） | `BFM #16,#14`（清 bits[62:48]） | ARM 的 `XPAC`/`AUT` strip 语义是"签名字段整段变成 bit55 的符号扩展"；QEMU 的软件 PAC（`target/arm/tcg/pauth_helper.c: pauth_strip`）是唯一开源参照。只清后半段时签名上半残留，guest 往 `0xfffffe90...` 写，异常处理里再缺页，形成权限异常风暴。**机制是架构语义，但上游为何不触发仍未解释**（可能该 AUT 路径在 iOS 的恢复流程里走不到，或被别的行为掩盖） |
 
 > 结论：这两条**严格说也只能证明"我们的环境必须偏离"**。要升级为完整的"上游错误"，
-> 还需要解释上游产品为什么能跑（例如在 iOS 构建上复现，或给出它不触发该路径的证据）。
+> 还需要解释上游产品为什么能跑。目前 §2.1.5 给出了 D-1 的一个候选解释（Mach-O 可能不经
+> GOT，而 ELF/PIE 经 GOT 用到 x16），但**未验证**；D-2 仍无解释。
 
 ### 2.3 SIMD 保存：**不是 D，是 U-10**
 
