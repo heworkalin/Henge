@@ -12,7 +12,13 @@
 | **D（刻意偏离）** | 行为与上游不同，且有证据表明上游在这里是错的 |
 | **U（未验证）** | 有偏离或可能有偏离，但没有证据判定等效 |
 
-行数：`core/*` 共 +2310 −25（`dispatch.c` 1207、`exception.c` 474、`memop.c` 407、`translate.c` 101、`machine.c` 49、`mmu.c` 23、`cpu.h` 19、`machine.h` 36、`sysreg.c` 8）。
+行数（2026-11-19 重测，基线 `e98920c`）：`dispatch.c` +1887、`exception.c` +1125、
+`memop.c` +395、`translate.c` +124、`machine.c` +83、`mmu.c` +44、`machine.h` +36、`cpu.h` +29、
+`exception.h` +9、`sysreg.c` +6、`mmu.h` +2。
+
+> 恢复链路的差异（第三方恢复栈、USB 设备模型、宿主层）不在本文范围，见
+> `docs/upstream-restore-semantics-2026-11-19.md`。JIT/核心模块的逐项对比见
+> `docs/jit-core-diff-2026-11-19.md`。
 
 ---
 
@@ -45,6 +51,7 @@
 |---|---|---|---|---|
 | D-1 | `translate.c` `is_stolen()` 候选寄存器集 | 含 `16, 17` | 移除 16/17 | 宿主 x16 保存 guest x16 到 slot，借用它保存别的 guest 寄存器会把那个值写进 guest x16 的槽；固件因此拿到宿主地址并死掉 |
 | D-2 | `translate.c` `put_strip()`（XPAC/AUT） | 清 bits[54:48]（`BFM #16,#6`） | 清 bits[62:48]（`BFM #16,#14`） | ARM 语义：签名位整段置为 bit55 的符号扩展；QEMU 软件 PAC `target/arm/tcg/pauth_helper.c: pauth_strip → pauth_original_ptr` 是唯一开源参照。只清后半段时签名上半残留，guest 往 `0xfffffe90b4130000` 写 → 在异常处理里再缺页 → 每轮数百万次权限异常风暴 |
+| D-3 ⚠️ | `translate.c` `put_helper()`、`host/enter.S` 的三个 thunk | helper/refill/ijc/xjump 路径**不保存 guest v0-v31**（thunk 只恢复 NZCV；`hv_enter`/`hv_exit` 才存 q0-q31） | helper 调用前后、thunk 进入/返回时**保存并恢复全部 q0-q31** | **已降级为 U-10**：本条只证明"在我们的构建上必须保存"，**不能**据此判上游是 bug。iOS 与 Android 的 helper 编译产物、libc、信号/JIT 入口都不同，上游完全可能在其环境下不需要这段保存。差异 ≠ 上游错误 |
 
 
 ## U：未验证（仍是风险，不能声称等效）
@@ -60,9 +67,11 @@
 | U-7 | `memop.c` 慢路径 | 407 行新增，覆盖所有 load/store 形式。`tests/bitops_prog.s` 的 memops 用例 0 差异，但覆盖的是形式，不是全部寻址模式/边界 | 扩展 memops 用例：非对齐、跨页、pre/post-index、writeback、LDXP/STXP 边界 |
 | U-8 | "不 rebase"这一**与上游共享的**假设 | 依赖"iBoot 不 rebase、内核 `arm_init` 会 rebase"。只在 **24G90** 上实测过；换固件（如 25G83）未验证 | 其他固件版本重跑一次带 `HV_KFIX`/`HV_DC_PROBE` 的对照 |
 | U-9 | 图形（PVG） | 宿主构建是 stub（`android/` 才是真的 reims-vgpu），宿主上所有图形结论对设备不成立 | 设备端验证 |
+| U-10 | helper/thunk 是否必须保存 guest v0-v31 | 我们实测：不保存时 iBEC 的 LZFSE 解码器丢掉 q0-q2 里的 FSE 状态，解出的 kernelcache 字节错误（`kalloc_type.kt_flags` 读成 `0x2` 而不是 `0x71`），随后 `validate_flags` panic。**但这是在我们的构建、我们的 helper 实现上**；上游（iOS）用同一份源码却长期正常运行，说明它依赖了我们不具备的前提（helper 不破坏 SIMD / 走不到该慢路径 / ABI 差异），不是"上游写错了" | 在 iOS/上游构建上复现同一现象；或证明上游的 helper 同样会破坏 v0-v31 且该路径在 iOS 上也执行。在那之前只能说"我们的实现需要这段保存" |
 
 ## 一句话总结
 
 - **纯诊断类（E）占了绝大部分行数差**，对 guest 没有语义影响
-- **真正的语义偏离只有 2 处（D-1、D-2）**，都有实测证据；另有 2 项原本被我误判成偏离——rebase 内核镜像是**我们自己加过又撤回**的（上游从没做过，撤回后即与上游一致），`random-seed` 填充是**我们新增**（上游没有）
+- **真正的语义偏离只有 2 处（D-1、D-2）**，都有**架构级**证据（ARM64 ABI / PAC 语义，与操作系统无关）；另有 2 项原本被我误判成偏离——rebase 内核镜像是**我们自己加过又撤回**的（上游从没做过，撤回后即与上游一致），`random-seed` 填充是**我们新增**（上游没有）；
+  **D-3（SIMD 保存）已降级为 U-10**：它是"我们的构建需要"，不能反推上游有 bug —— iOS 与 Android 的 helper 编译产物、libc、JIT 入口和信号行为都不同，**差异不等于上游错误**
 - **仍然不能声称等效的有 9 项（U-1..U-9）**，其中 U-1（PAC 整体）、U-3（bit 63）、U-7（慢路径覆盖面）是当前最该继续收口的
