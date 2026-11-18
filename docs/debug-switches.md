@@ -115,6 +115,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | `HV_RAM_ANON` / `HV_RAM_FILE` / `HV_RAM_GREP` / `HV_RAM_GREP_OUT` | — | — | 载体/内容检查（`host/main.c`） |
 | `HV_RAM_NO_LEDGER` / `HV_RAM_NO_PREFAULT` | `1` | 关 | 关掉 RAM 记账 / 预取（性能对照） |
 | `HV_EL0_LAST`（规划） | — | — | 未实现；现由 `hv_el0_note()` 无条件记录 |
+| `HV_THREADS` | `1` | 关 | 把每个进程（`launchd`/`restored_externa`/`loginsupport`/`mobile_restore`）的线程链表 dump 出来：`state` / `wait_event` / `turnstile`，并对每个被等待的 turnstile 打印尾部内核指针（`ts_proprietor` 的候选）。**在引擎内读 guest RAM，不需要 gdb**（proot 下 gdb 会把 PIE 全局变量解析成未重定位地址）。由 SIGUSR1 或 `hv_android_scan_procs()` 触发。偏移：`proc+0x18`→`proc_ro`、`proc_ro+8`→`task`、`task+0x50`→线程链头、`thread+0x10`→`wait_event`、`+0x28`→`turnstile`、`+0x1c8`→`state` |
 | `HV_FAULT_PROBE` | `lo:hi[,lo:hi,...]`（最多 4 段，十六进制，32 位写法自动补成 `0xfffffe00...`） | 关（不设=不统计） | 对每个 EL0 同步异常，在**处理完、回 EL0 前**做三件事：① 用块入口 `trace_ring`（`put_trace_entry`，不经 dispatcher，chain/superblock/`bl` 直调全覆盖）判断路径是否经过各段；② 用 `hv_mmu_walk()` 按 **fault 时刻的 TTBR0** 遍历该 fault 地址，统计 PTE 是否已建立；③ 按 `(TTBR0, VA 页)` 统计重复缺页与热点页。结果由 `hv_fault_stats_dump()` 打印（SIGUSR1 或 CLI 结束时）。只统计，不改 guest 语义。**前提 `HV_LOG>=2`**（`trace_ring` 只在 `log>=2` 时由 JIT 写入） |
 
 **引擎内部记录（gdb 直接读，不需要开关）**

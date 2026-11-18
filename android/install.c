@@ -887,6 +887,161 @@ static void dump_last_el0(void) {
     free(probe);
 }
 
+/* Debug-only: what every thread of every process is waiting on.
+ *
+ * Port of tools/dump-wait.py that needs no gdb: the engine reads its own guest RAM, so this
+ * works where attaching a debugger does not (a PIE under proot, where gdb resolves globals to
+ * their unrelocated addresses and then stalls loading 75 MB of symbols).
+ *
+ * The question it answers is the one the idle stats raise: blocks 0/s with wfi at 95% means no
+ * runnable thread, and a thread's wait_event (0 = it is waiting on a turnstile instead) says
+ * whether something is going to post an event or whether the wakeup was lost.
+ *
+ * Offsets are XNU's for xnu-11417.140.69, same as tools/henge-gdb/tsbase.py:
+ *   proc+0x18 -> proc_ro, proc_ro+8 -> task, task+0x50 -> threads list head,
+ *   thread+0x00 -> next, thread+0x10 -> wait_event, +0x28 -> turnstile, +0x1c8 -> state.
+ * HV_THREADS=1 enables it; it is called from hv_android_scan_procs() and from SIGUSR1. */
+static uint64_t th_walk(uint64_t va) {
+    HvWalk w;
+    if (!va) return 0;
+    hv_mmu_walk(&g_cpus[0], va, HV_ACC_READ, 1, &w);
+    return w.fsc ? 0 : w.pa;
+}
+
+static uint64_t th_k64(uint64_t va) {
+    uint64_t pa = th_walk(va), v = 0;
+    if (!pa || hv_phys_read(&g_machine, pa, &v, 8) != 0) return 0;
+    return v;
+}
+
+static uint64_t th_pa64(uint64_t pa, int *ok) {
+    uint64_t v = 0;
+    if (hv_phys_read(&g_machine, pa, &v, 8) != 0) { if (ok) *ok = 0; return 0; }
+    if (ok) *ok = 1;
+    return v;
+}
+
+static int th_kaddr(uint64_t v) { return (v >> 56) == 0xff || (v >> 56) == 0xfe; }
+
+/* proc PA from a p_comm PA: walk backwards until proc+off holds list nodes whose neighbours
+   point back at it, which is what distinguishes the real struct proc from a copy of the name. */
+static uint64_t th_find_proc(uint64_t pc, uint64_t *node_va) {
+    for (uint64_t k = (pc % 8) ? pc % 8 : 8; k < 0x1000; k += 8) {
+        uint64_t s = pc - k;
+        int ok1 = 0, ok2 = 0;
+        uint64_t nxt = th_pa64(s, &ok1), prev = th_pa64(s + 8, &ok2);
+        if (!ok1 || !ok2 || !th_kaddr(nxt) || !th_kaddr(prev)) continue;
+        uint64_t pp = th_walk(prev);
+        if (!pp) continue;
+        uint64_t sv = 0;
+        if (hv_phys_read(&g_machine, pp, &sv, 8) != 0) continue;
+        if (th_kaddr(sv) && th_walk(sv) == s) { *node_va = sv; return s; }
+    }
+    return 0;
+}
+
+/* The turnstile a blocked thread sits on. ts_proprietor is the owner it waits for: if that is a
+   live thread we have a chain (who waits for whom), and if it is not, the wakeup was lost. The
+   exact offset depends on the build, so print every kernel pointer in the tail of the structure
+   and let the caller compare it against the thread addresses above. */
+static uint64_t ts_seen[32];
+static int ts_n;
+static void th_dump_turnstile(uint64_t ts) {
+    if (!ts) return;
+    for (int i = 0; i < ts_n; i++) if (ts_seen[i] == ts) return;
+    if (ts_n < 32) ts_seen[ts_n++] = ts;
+    uint64_t tpa = th_walk(ts);
+    fprintf(stderr, "hengevm: turnstile %llx pa %llx kptrs:", (unsigned long long) ts,
+            (unsigned long long) tpa);
+    if (!tpa) { fprintf(stderr, " (not walkable)\n"); return; }
+    for (uint64_t off = 0x300; off < 0x3c0; off += 8) {
+        uint64_t v = th_pa64(tpa + off, NULL);
+        if (th_kaddr(v)) fprintf(stderr, " +0x%llx=%llx", (unsigned long long) off,
+                                 (unsigned long long) v);
+    }
+    fprintf(stderr, "\n");
+}
+
+static void th_dump_proc(const char *name) {
+    static const char *const known_names[] = {"launchd", "restored_externa", "loginsupport",
+                                              "mobile_restore", "watchdogd", "diskimagesiod",
+                                              "kernel_task"};
+    size_t nl = strlen(name);
+    uint64_t node = 0, proc_pa = 0, pc = 0;
+    int candidates = 0;
+    uint64_t procs[8];
+    int nprocs = 0;
+    /* The kernel image holds these names as string constants; its PA range is known, and a real
+       p_comm is only accepted once th_find_proc() validates the list node around it. collect every
+       distinct process: a name repeated after fork is a real second process, not a duplicate. */
+    uint64_t img_lo = g_machine.kimage_pa ? g_machine.kimage_pa : 0x73b18000ull;
+    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull && nprocs < 8; pa += 0x1000) {
+        if (pa + 0x1000 > img_lo && pa < img_lo + 0x4000000ull) continue;
+        uint8_t pg[4096];
+        if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
+        for (int i = 0; i + (int) nl + 1 <= 4096 && nprocs < 8; i++) {
+            if (memcmp(pg + i, name, nl) != 0) continue;
+            if (pg[i + nl] != 0) continue;
+            candidates++;
+            uint64_t p = th_find_proc(pa + (uint64_t) i, &node);
+            if (!p) continue;
+            int dup = 0;
+            for (int k = 0; k < nprocs; k++) if (procs[k] == p) dup = 1;
+            if (dup) continue;
+            procs[nprocs++] = p;
+            proc_pa = p; pc = pa + (uint64_t) i;
+        }
+    }
+    if (nprocs > 1)
+        fprintf(stderr, "hengevm: threads: %s has %d processes\n", name, nprocs);
+    if (!proc_pa) {
+        fprintf(stderr, "hengevm: threads: %s no proc (candidates %d, walk self-test pc %llx -> %llx,"
+                        " ttbr1 %llx)\n", name, candidates,
+                (unsigned long long) g_cpus[0].pc,
+                (unsigned long long) th_walk(g_cpus[0].pc),
+                (unsigned long long) g_cpus[0].ttbr1_el1);
+        return;
+    }
+    uint64_t ro_pa = th_walk(th_pa64(proc_pa + 0x18, NULL));
+    if (!ro_pa) { fprintf(stderr, "hengevm: threads: %s ro missing\n", name); return; }
+    uint64_t task = th_pa64(ro_pa + 8, NULL);
+    uint64_t tpa = th_walk(task);
+    if (!tpa) { fprintf(stderr, "hengevm: threads: %s task %llx not walkable\n", name,
+                             (unsigned long long) task); return; }
+    uint64_t head = th_pa64(tpa + 0x50, NULL);
+    fprintf(stderr, "hengevm: threads: %s proc_pa %llx task %llx head %llx\n", name,
+            (unsigned long long) proc_pa, (unsigned long long) task, (unsigned long long) head);
+    uint64_t cur = head;
+    for (int n = 0; n < 24 && cur && th_kaddr(cur); n++) {
+        uint64_t tp = th_walk(cur);
+        if (!tp) break;
+        uint64_t next = th_pa64(tp, NULL);
+        uint64_t we = th_pa64(tp + 0x10, NULL);
+        uint64_t ts = th_pa64(tp + 0x28, NULL);
+        uint64_t st = th_pa64(tp + 0x1c8, NULL) & 0xffffffffull;
+        const char *tag = "";
+        for (int c = 0; c < g_board.ncpus; c++)
+            if (g_cpus[c].tpidr_el1 == cur) tag = " (current on this cpu)";
+        fprintf(stderr, "hengevm:   th %llx state 0x%llx wait_event %llx turnstile %llx%s\n",
+                (unsigned long long) cur, (unsigned long long) st,
+                (unsigned long long) we, (unsigned long long) ts, tag);
+        th_dump_turnstile(ts);
+        if (next == head) break;
+        cur = next;
+    }
+    (void) known_names;
+}
+
+void hv_threads_dump(void) {
+    static const char *const names[] = {"launchd", "restored_externa", "loginsupport",
+                                        "mobile_restore"};
+    for (int i = 0; i < (int) (sizeof names / sizeof names[0]); i++) th_dump_proc(names[i]);
+    for (int c = 0; c < g_board.ncpus; c++)
+        fprintf(stderr, "hengevm: cpu%d pc %llx tpidr_el1 %llx el%u\n", c,
+                (unsigned long long) g_cpus[c].pc, (unsigned long long) g_cpus[c].tpidr_el1,
+                g_cpus[c].el);
+}
+
 void hv_android_scan_procs(void) {
     scan_proc_names();
     scan_kernel_log();

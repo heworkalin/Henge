@@ -5,6 +5,7 @@
 #define HV_SVC_CAP 4096u
 uint64_t hv_svc_pc[HV_SVC_CAP];
 uint64_t hv_svc_x16[HV_SVC_CAP], hv_svc_x0[HV_SVC_CAP], hv_svc_x1[HV_SVC_CAP];
+uint64_t hv_svc_x2[HV_SVC_CAP], hv_svc_x3[HV_SVC_CAP];
 uint32_t hv_svc_imm[HV_SVC_CAP], hv_svc_el[HV_SVC_CAP];
 uint64_t hv_svc_n;
 /* Set when a syscall traps and cleared when userland runs again: a syscall still pending at the
@@ -171,6 +172,27 @@ static int ring_has(HvCpu *cpu, int which) {
         if (va >= fprobe_lo[which] && va < fprobe_hi[which]) return 1;
     }
     return 0;
+}
+
+/* The last syscalls in order, with the arguments and the value the caller got back. A process
+   that stops making progress is waiting in one of these: the number says what it is waiting for
+   (Darwin takes it in x16) and ret says the call has not returned yet if it is the newest one. */
+void hv_svc_dump_tail(void) {
+    uint64_t n = hv_svc_n, cnt = n < 48 ? n : 48;
+    fprintf(stderr, "hengevm: last %llu syscalls (oldest first; number is guest x16):\n",
+            (unsigned long long) cnt);
+    for (uint64_t i = n - cnt; i < n; i++) {
+        uint64_t s = i & (HV_SVC_CAP - 1);
+        int pending = 0;
+        for (int c = 0; c < HV_MAX_CPUS; c++)
+            if (hv_svc_pending[c] && hv_svc_last_slot[c] == s) pending = 1;
+        fprintf(stderr, "  pc %-12llx sys %-4llu x0 %-11llx x1 %-11llx x2 %-11llx x3 %-11llx ret %-6lld%s%s%s\n",
+                (unsigned long long) hv_svc_pc[s], (unsigned long long) hv_svc_x16[s],
+                (unsigned long long) hv_svc_x0[s], (unsigned long long) hv_svc_x1[s],
+                (unsigned long long) hv_svc_x2[s], (unsigned long long) hv_svc_x3[s],
+                (long long) hv_svc_ret[s], pending ? "  <-- NOT RETURNED" : "",
+                hv_svc_path[s][0] ? "  " : "", hv_svc_path[s]);
+    }
 }
 
 void hv_fault_stats_dump(void) {
@@ -1185,6 +1207,8 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             hv_svc_x16[slot] = cpu->x[16];
             hv_svc_x0[slot] = cpu->x[0];
             hv_svc_x1[slot] = cpu->x[1];
+            hv_svc_x2[slot] = cpu->x[2];
+            hv_svc_x3[slot] = cpu->x[3];
             hv_svc_el[slot] = cpu->el;
             hv_svc_ret[slot] = 0;
             hv_svc_path[slot][0] = 0;
