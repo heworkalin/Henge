@@ -60,7 +60,7 @@
 
 | # | 位置 | 上游 | 我们 | 证据 |
 |---|---|---|---|---|
-| D-1 ⚠️ | `translate.c` `is_stolen()` 候选寄存器集 | 含 `16, 17` | 移除 16/17 | 机制（与 OS 无关）：`SAVE_X2_X29` 按编号把宿主 x16 存进 guest x16 的槽；若宿主 x16 正替别的 guest 寄存器打工，该值就写进 guest x16 的槽，下个块读回的 guest x16 变成宿主地址。我们环境实测：固件拿到宿主地址后死亡。**但上游能正常跑——它为何未被触发仍未解释**。ABI 查证见 `docs/jit-core-diff-2026-11-19.md` §2.1.5：两平台对 x16/x17 的规定相同（IP0/IP1，链接器可用），差异在链接方式——ELF/PIE 的 GOT 访问用 `adrp x16/ldr x17`，我们实测到 `.got.plt` 地址进入 guest x16，而 Mach-O 可能直接解析自家符号（候选解释，未验证）。在解释坐实之前，本条只能证明"我们的环境必须偏离" |
+| D-1 ⚠️ | `translate.c` `is_stolen()` 候选寄存器集 | 含 `16, 17` | 移除 16/17 | 机制（与 OS 无关）：`SAVE_X2_X29` 按编号把宿主 x16 存进 guest x16 的槽；若宿主 x16 正替别的 guest 寄存器打工，该值就写进 guest x16 的槽，下个块读回的 guest x16 变成宿主地址。我们环境实测：固件拿到宿主地址后死亡。**但上游能正常跑——它为何未被触发仍未解释**。ABI 查证（`docs/jit-core-diff-2026-11-19.md` §2.1.5）：两平台对 x16/x17 的规定相同（IP0/IP1，链接器可用）；而 §2.1.6 的实测推翻了"经不经 GOT"这个解释——我们自己的 ELF 构建取 `hv_helper_thunk` 仍走 `.got`（`adrp x0; ldr x0`），用 x0 且在初始化阶段。因此 D-1 目前**没有任何解释**，只能证明"我们的环境必须偏离" |
 | D-2 ⚠️ | `translate.c` `put_strip()`（XPAC/AUT） | 清 bits[54:48]（`BFM #16,#6`） | 清 bits[62:48]（`BFM #16,#14`） | 机制（架构语义）：strip 应把签名字段整段变成 bit55 的符号扩展，QEMU 的 `pauth_helper.c: pauth_strip` 是唯一开源参照。只清后半段时签名上半残留，我们环境里 guest 往 `0xfffffe90b4130000` 写 → 异常处理里再缺页 → 每轮数百万次权限异常风暴。**但上游能正常跑——为何 ios 上不触发仍未解释**（可能该 AUT 路径在 iOS 的运行中不走到，或被别的行为掩盖）。同样只能先记为"我们的环境必须偏离" |
 | D-3 ⚠️ | `translate.c` `put_helper()`、`host/enter.S` 的三个 thunk | helper/refill/ijc/xjump 路径**不保存 guest v0-v31**（thunk 只恢复 NZCV；`hv_enter`/`hv_exit` 才存 q0-q31） | helper 调用前后、thunk 进入/返回时**保存并恢复全部 q0-q31** | **已降级为 U-10**：本条只证明"在我们的构建上必须保存"，**不能**据此判上游是 bug。iOS 与 Android 的 helper 编译产物、libc、信号/JIT 入口都不同，上游完全可能在其环境下不需要这段保存。差异 ≠ 上游错误 |
 

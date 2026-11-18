@@ -189,10 +189,8 @@ Mach-O (Apple):   adrp x16, … ; ldr x16, [x16, …] ; br x16
 `.hidden`，注释原文：*"That is how a .got.plt address turned up in a guest's x16 and the
 firmware died on it"*）。它把地址变成链接期常量，不再走 GOT。
 
-由此可以给"上游为什么能跑"一个**候选解释**：Mach-O 构建里这些自家符号可能被直接解析
-（不经 GOT），而我们的 ELF/PIE 构建走到 GOT，`adrp x16/ldr x16` 就改写了 x16。
-**但这是推断，尚未验证**（需要在 Android 构建上确认 `.hidden` 是唯一变量，且在 iOS
-构建上确认没有 GOT 访问）。
+（该候选解释已被 §2.1.6 的实测推翻：我们自己的 ELF 构建**也**经 GOT 取地址，
+只是用 x0 且在初始化阶段，所以"经不经 GOT"不能解释 guest x16 的污染。）
 
 对上游/我们的实际结论：
 
@@ -210,8 +208,8 @@ firmware died on it"*）。它把地址变成链接期常量，不再走 GOT。
 | **D-2 ⚠️** | `put_strip()` 用 `BFM #16,#6`（清 bits[54:48]） | `BFM #16,#14`（清 bits[62:48]） | ARM 的 `XPAC`/`AUT` strip 语义是"签名字段整段变成 bit55 的符号扩展"；QEMU 的软件 PAC（`target/arm/tcg/pauth_helper.c: pauth_strip`）是唯一开源参照。只清后半段时签名上半残留，guest 往 `0xfffffe90...` 写，异常处理里再缺页，形成权限异常风暴。**机制是架构语义，但上游为何不触发仍未解释**（可能该 AUT 路径在 iOS 的恢复流程里走不到，或被别的行为掩盖） |
 
 > 结论：这两条**严格说也只能证明"我们的环境必须偏离"**。要升级为完整的"上游错误"，
-> 还需要解释上游产品为什么能跑。目前 §2.1.5 给出了 D-1 的一个候选解释（Mach-O 可能不经
-> GOT，而 ELF/PIE 经 GOT 用到 x16），但**未验证**；D-2 仍无解释。
+> 还需要解释上游产品为什么能跑。§2.1.6 的实测已经排除"经不经 GOT"这个解释；
+> D-1 与 D-2 目前**都没有解释**，保持未解。
 
 ### 2.3 SIMD 保存：**不是 D，是 U-10**
 
@@ -236,7 +234,7 @@ SIGSEGV 与 JIT 入口的处理不同）。**不能据此说上游有 bug。**
 | # | 改动 | 分级 |
 |---|---|---|
 | E-1 | 非 Apple 目标下用 `#define` 把 `_hv_*` 映射成 `hv_*`（Mach-O 下划线） | **E**（平台） |
-| E-2 | 给 9 个入口加 `.hidden` | **E**（链接方式；见 §1.2，避免 GOT 用 x16） |
+| E-2 | 给 9 个入口加 `.hidden` | **E**（不导出、不可抢占；实测未消除 GOT 访问，见 §2.1.6） |
 | U-3 | 三个 thunk 里 `ldr x0,[x28,#CPU_NZCV]; msr nzcv,x0` 换成 `SAVE_FLAGS_FP`/`LOAD_FLAGS_FP`（即连带 `q0-q31`） | **U-10**（同上） |
 
 ### 2.5 `core/dispatch.c`（+1887）
@@ -570,7 +568,7 @@ hv_exit:
 | `lookup` | 无（只加计时变量） | — |
 | `hv_translate_place` 前的 `slots` 检查 | 拒绝链接并打印 | 防空指针；正常路径不变 |
 | `hv_run` | 计时包装（`HV_BLOCKTIME`） | 默认关 |
-| `enter.S` 符号 | `.hidden` | 取地址成为链接期常量，不走 GOT |
+| `enter.S` 符号 | `.hidden` | 符号不导出、不可抢占；**实测仍经 GOT 取地址**（见 §2.1.6） |
 | `jit_region` | Android memfd 双映射 | 区域分配方式；guest 不可见 |
 | `exception.c` | OEM HVC（WFK/KICK/MABS/UUID） | 上游走降级；我们实现 |
 | `dispatch.c` | `kernel_fixups` / `random-seed` | 默认关 |
@@ -614,3 +612,61 @@ hv_exit:
 
 > 结论：本节只陈述**当前代码怎么走**。凡涉及"上游行为"的部分，一律留空，
 > 不用推理填补。
+
+## 2.1.6 `.hidden` 的实测结果：它并没有消除 GOT 访问
+
+之前的说法是"`.hidden` 让地址成为链接期常量、不再走 GOT"。**用当前宿主构建实测，这个说法不准确。**
+
+### 检查方法（可复现）
+
+```bash
+# 1) 符号可见性
+llvm-readelf -s build/host/host-install | grep -E "hv_(helper_thunk|enter|exit)"
+#   → hv_helper_thunk / hv_chain_thunk / hv_ijc_thunk / hv_xjump_thunk / hv_enter / hv_exit
+#     全部是 GLOBAL HIDDEN；动态符号表 (--dyn-syms) 里没有 hv_*
+
+# 2) 取地址的指令（hv_cpu_reset_index）
+llvm-objdump -d --no-show-raw-insn build/host/host-install
+#   310ac: adrp x0, 0x1cf000
+#   310b0: ldr  x0, [x0, #0xdb0]     ← 仍然从 .got 加载
+#   310b4: str  x0, [x20, #0x420]    ← HvCpu.helper_thunk
+#   310b8: adrp x0, 0x1cf000
+#   310bc: ldr  x0, [x0, #0xdd8]     ← chain_thunk
+#   310c0: str  x0, [x20, #0x428]
+#   310c4: adrp x0, 0x1cf000
+#   310c8: ldr  x0, [x0, #0xf10]     ← ijc_thunk
+#   310cc: str  x0, [x20, #0x430]
+#   310d0: adrp x0, 0x1cf000
+#   310d4: ldr  x0, [x0, #0xed8]     ← xjump_thunk
+#   310d8: str  x0, [x20, #0x4e0]
+
+# 3) 这些槽来自 RELATIVE 重定位
+llvm-readelf -r build/host/host-install | grep -iE "5a93c|5aab8|5abe4|5aa80"
+#   01cfdb0 R_AARCH64_RELATIVE  5a93c   (= hv_helper_thunk)
+#   …
+```
+
+### 结果
+
+| 说法 | 实测 |
+|---|---|
+| `.hidden` 后符号不导出 | **成立**：`GLOBAL HIDDEN`，`--dyn-syms` 无 `hv_*` |
+| `.hidden` 后地址成为链接期常量、不走 GOT | **不成立**：取地址仍是 `adrp x0, 0x1cf000; ldr x0, [x0, #0xdb0]`，即从 `.got` 加载 |
+| 取地址指令会用 x16 | **本构建里没有**：用的是 `x0` |
+| 取地址发生在 guest 执行期间 | **不是**：在 `hv_cpu_reset_index` 里，CPU 初始化阶段 |
+
+### 所以 `.hidden` 实际做了什么
+
+1. **符号不进入动态符号表**，不会被别的 DSO 或 `LD_PRELOAD` 抢占（这是它真正的作用）；
+2. **没有消除 GOT 访问**：PIE 需要运行期基址，链接器仍生成 `.got` 槽 +
+   `R_AARCH64_RELATIVE`，取地址照样是一条 `ldr`。
+
+`enter.S` 里那段注释（*"otherwise taking it goes through the GOT, and the instructions that
+do that use x16 — which is a guest register here"*）在本构建的实测里**没有得到支持**：
+GOT 访问用的是 x0，而且发生在初始化，不在 guest 运行时。
+
+**这与"上游为什么能跑"直接相关**：既然我们自己的构建也经过 GOT，"Mach-O 不经 GOT"
+就不能再当作 D-1 的解释。D-1 的候选解释因此撤回，重新回到"未解释"。
+
+> 需要说明的是：`.hidden` 本身没有坏处（不导出更安全），保留它没有问题。
+> 只是**它的理由描述与实测不符**，不能再用它解释 guest x16 的污染来源。
