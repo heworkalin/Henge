@@ -296,6 +296,51 @@ PV ticket lock、等待队列为空、锁未解锁（绑定已解除）、CAS lo
 运行里**把一个 turnstile 和它的 `tsid` 对上——但 `tsid` 是 ID 而非地址，得先确认
 XNU 的 `tsid → turnstile` 映射方式（`osfmk/kern/turnstile.c` 的 hash 表）。
 
+## 4.12 重要更正：§4.5–§4.11 的"turnstile"读错了结构
+
+读 `thread+0x28` 指向对象的 `WAITQ_FLAGS.type`（bits 0..2），结果是 **1 = WQT_QUEUE**；
+而 `thread+0x30` 的对象是 **2 = WQT_TURNSTILE**，且其 `tsid`（flags bits 12..，CTSID_BITS=20）
+为 **0**：
+
+```
+thread+0x20 = 0                                     (__runq)
+thread+0x28 = fffffe43fa09a598  flags 148e809  type 1  → waitq
+thread+0x30 = fffffe1e3807e9e0  flags 2        type 2  → turnstile, tsid = 0
+```
+
+所以：
+
+| 结论 | 状态 |
+|---|---|
+| `thread+0x28` 是 turnstile | **错**，那是 waitq |
+| `ts_proprietor` 在 `+0x50` 且为 0（§4.5–§4.9） | **作废**。那读的是 waitq，`+0x50` 落在**相邻的 waitq 对象**里（waitq 只有 40 字节），所以"thread 指针或 0"是相邻对象的 `pq_root`，不是锁的 proprietor |
+| "线程在锁上等" | **错**，线程在 **waitq** 上等 |
+| `thread->turnstile` 的 `tsid = 0` | turnstile **未与任何锁绑定** |
+
+仍然成立的观测（它们不依赖 turnstile 布局）：
+
+- `state = 0x1 (WAIT)`；
+- `thread->waitq`（`+0x28`）非 0，其 `pq_root`（`waitq+0x08`）正指向该线程 → **等待队列确实挂着它**；
+- `wait_event`（`thread+0x10`）= `0x1f00`（restored / launchd 是 `0x2500`）；
+- 扫 18601 个 `lck_mtx` 里 `needs_wakeup && owner == 0` 为 **0**；
+- 引擎的 exclusive/CAS 是硬件 `casal`，语义正确。
+
+### 结论改成
+
+> **线程在 waitq 上等待一个 event（`0x1f00`），而这个 event 从未被 post。**
+> 不是"锁的唤醒丢了"——锁那一侧是干净的（`tsid = 0`，没有绑定）。
+
+这也解释了为什么 `event` 值很小（`0x1f00`、`0x2500`）却不像指针：`event64_t` 允许任意值，
+`assert_wait`/`wakeup` 的 event 不一定是地址。下一步要查的是**这两个 event 分别属于哪个
+子系统、谁应该 `wakeup()` 它**。
+
+### 方法论教训
+
+结构偏移不能只靠"从源码数一遍"。`thread+0x28` 与 `+0x30` 只差 8 字节，但一个是 waitq、
+一个是 turnstile，而两者都是"内核指针"，**外观完全一样**。判定它们的唯一可靠办法是读
+`WAITQ_FLAGS.type`（1 vs 2）——这一步应该在第一次用某个偏移时就做，而不是等到多个结论
+都建立在它上面之后。
+
 ## 5. 下一步
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该

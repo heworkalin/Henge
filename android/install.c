@@ -1076,6 +1076,8 @@ static void th_find_refs(uint64_t target) {
                         (unsigned long long) target);
 }
 
+static void th_mtx_for_ts(uint64_t ts, uint64_t tpa);
+
 static void th_dump_turnstile(uint64_t ts, int depth) {
     if (!ts) return;
     uint64_t tpa = th_walk(ts);
@@ -1121,6 +1123,7 @@ static void th_dump_turnstile(uint64_t ts, int depth) {
         if (!prop || !th_kaddr(prop)) {
             fprintf(stderr, "hengevm:       proprietor NONE (unowned lock)\n");
             if (getenv("HV_TS_REF")) th_find_refs(ts);
+            if (getenv("HV_TS_MTX")) th_mtx_for_ts(ts, tpa);
             /* Arm the write watch on this turnstile's proprietor: the next unlock that clears it
                prints the writing pc and its caller, which is what says whether the wakeup path ran
                from the same place. */
@@ -1222,6 +1225,18 @@ static void th_dump_one(int idx) {
         for (int c = 0; c < g_board.ncpus; c++)
             if (g_cpus[c].tpidr_el1 == cur) tag = " (running here)";
         uint64_t wq = th_pa64(tp + 0x20, NULL);
+        if (getenv("HV_TS_LAYOUT")) {
+            for (int k = 0; k < 3; k++) {
+                static const char *nm[3] = {"0x20", "0x28", "0x30"};
+                uint64_t p = th_pa64(tp + 0x20 + (uint64_t) k * 8, NULL);
+                uint64_t pp = th_walk(p);
+                uint32_t f = 0;
+                if (pp) hv_phys_read(&g_machine, pp, &f, 4);
+                fprintf(stderr, "hengevm:     thread+%s = %llx%s flags %x type %u tsid %x\n",
+                        nm[k], (unsigned long long) p, pp ? "" : " (not walkable)", f, f & 7u,
+                        (f >> 12) & 0xfffffu);
+            }
+        }
         fprintf(stderr, "hengevm:   th %llx state 0x%llx wait_event %llx waitq %llx%s\n",
                 (unsigned long long) cur, (unsigned long long) st,
                 (unsigned long long) we, (unsigned long long) wq, tag);
@@ -1249,6 +1264,36 @@ static void th_dump_one(int idx) {
         if (next == head) break;
         cur = next;
     }
+}
+
+/* The turnstile's own compact id: WAITQ_FLAGS places it at bits 12.. (type:3 fifo:1 preposted:1
+   unused:7 ts_compact_id:20, CTSID_BITS=20). lck_mtx stores the same (mangled) id in its 24-bit
+   lck_mtx_tsid, so matching the two says whether this turnstile still belongs to a mutex. */
+static void th_mtx_for_ts(uint64_t ts, uint64_t tpa) {
+    uint32_t flags = 0, state = 0;
+    if (hv_phys_read(&g_machine, tpa, &flags, 4) != 0) return;
+    uint32_t tsid = (flags >> 12) & 0xfffffu;
+    fprintf(stderr, "hengevm:       tsid %x (flags %x, type %u)\n", tsid, flags, flags & 7u);
+    if (!tsid) { fprintf(stderr, "hengevm:       tsid 0: not a turnstile?\n"); return; }
+    int hits = 0;
+    for (uint64_t pa = 0x84000000ull; pa < 0x85000000ull && hits < 4; pa += 0x1000) {
+        uint8_t pg[4096];
+        if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
+        for (int i = 0; i + 16 <= 4096 && hits < 4; i += 4) {
+            uint32_t v0;
+            memcpy(&v0, pg + i, 4);
+            if ((v0 >> 24) != 0x22) continue;             /* LCK_TYPE_MUTEX */
+            if ((v0 & 0xfffffu) != tsid) continue;        /* same compact id */
+            memcpy(&state, pg + i + 8, 4);
+            hits++;
+            fprintf(stderr, "hengevm:       -> mtx pa %llx state %x owner %x needs_wakeup %d\n",
+                    (unsigned long long) (pa + (uint64_t) i), state, state & 0x0fffffffu,
+                    (int) ((state >> 30) & 1));
+        }
+    }
+    if (!hits)
+        fprintf(stderr, "hengevm:       no lck_mtx carries tsid %x (turnstile is not attached to"
+                        " a mutex)\n", tsid);
 }
 
 /* lck_mtx_t (arm64 uses the non-arch definition, osfmk/kern/lock_mtx.h):
