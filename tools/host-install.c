@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,15 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
                              const char *cache_dir, char *report, size_t cap);
 int hv_android_install_status(double *progress);
 void hv_android_scan_procs(void);
+
+/* HV_TRACE_PC's buffer only reaches a file when the restore gives up (scan_procs), and a stuck
+   guest can sit in the page-fault loop for many minutes before that. SIGUSR1 dumps it on demand:
+   the handler only raises a flag, the main loop (which sleeps 1 s at a time) does the IO, so no
+   malloc/fopen runs in signal context. `kill -USR1 <pid>` while the guest is stuck, then read
+   the file HV_TRACE_PC pointed at. */
+void hv_trace_dump(void);
+static volatile sig_atomic_t trace_dump_req;
+static void on_sigusr1(int sig) { (void) sig; trace_dump_req = 1; }
 
 /* compat_android.c synthesises the commpage the translator reads while emitting counter
    instructions. In the app this happens from the JNI entry; here it has to happen before any guest
@@ -112,8 +122,13 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     /* The steps come from idevicerestore; the loop stays until it says it is over. */
+    signal(SIGUSR1, on_sigusr1);
     int last = -1;
     for (;;) {
+        if (trace_dump_req) {
+            trace_dump_req = 0;
+            hv_trace_dump();
+        }
         double progress = 0;
         int step = hv_android_install_status(&progress);
         if (step != last) {

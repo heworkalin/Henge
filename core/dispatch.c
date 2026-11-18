@@ -2703,11 +2703,17 @@ void hv_seg_note(uint64_t va) {
 /* HV_TRACE_PC=<file>: every block's pc, in order, straight into a flat buffer. The 4096-entry
    ring above only knows the last instant before the guest stops, which is all userland; the
    question "when did the kernel hand control to userland" needs the whole boot. 4M entries
-   (32 MB) covers it; once full it just stops recording. */
+   (32 MB) covers it; once full it just stops recording.
+
+   HV_TRACE_TAIL=1 turns the same buffer into a ring that keeps the *last* 4M blocks instead
+   (trace_n keeps counting, only the window is stored and dumped in order). That is the mode
+   the page-fault stall needs: the boot is tens of millions of blocks, and the interesting part
+   is the seconds before the guest stops, not the first 4M. */
 #define TRACE_CAP (4u << 20)
 static uint64_t *trace_buf;
 static uint32_t trace_cap, trace_n;
 static int trace_on = -1;
+static int trace_tail;
 void hv_trace_dump(void);
 
 
@@ -2718,8 +2724,11 @@ void hv_trace_dump(void);
 int hv_trace_last_below(uint64_t limit, uint64_t *out, int n) {
     if (!trace_on || !trace_buf || !trace_n || n <= 0) return 0;
     int got = 0;
-    for (uint32_t i = trace_n; i-- > 0 && got < n; ) {
-        if (trace_buf[i] < limit) out[got++] = trace_buf[i];
+    uint32_t avail = trace_n < trace_cap ? trace_n : trace_cap;
+    for (uint32_t k = avail; k-- > 0 && got < n; ) {
+        uint32_t i = trace_n - avail + k;
+        uint64_t v = trace_tail ? trace_buf[i % trace_cap] : trace_buf[i];
+        if (v < limit) out[got++] = v;
     }
     return got;
 }
@@ -2731,9 +2740,17 @@ void hv_trace_note(uint64_t va) {
             trace_buf = malloc(sizeof(uint64_t) * TRACE_CAP);
             trace_cap = trace_buf ? TRACE_CAP : 0;
             if (!trace_buf) trace_on = 0;
+            const char *t = getenv("HV_TRACE_TAIL");
+            trace_tail = (t && *t && *t != '0') ? 1 : 0;
         }
     }
-    if (!trace_on || trace_n >= trace_cap) return;
+    if (!trace_on || !trace_cap) return;
+    if (trace_tail) {
+        trace_buf[trace_n % trace_cap] = va;
+        trace_n++;
+        return;
+    }
+    if (trace_n >= trace_cap) return;
     trace_buf[trace_n++] = va;
 }
 
@@ -2741,12 +2758,20 @@ void hv_trace_dump(void) {
     if (!trace_on || !trace_buf || !trace_n) return;
     const char *p = getenv("HV_TRACE_PC");
     FILE *f = p && *p ? fopen(p, "wb") : NULL;
+    uint32_t written = trace_n < trace_cap ? trace_n : trace_cap;
     if (f) {
-        fwrite(trace_buf, sizeof(uint64_t), trace_n, f);
+        if (trace_tail && trace_n > trace_cap) {
+            uint32_t start = trace_n % trace_cap;
+            fwrite(trace_buf + start, sizeof(uint64_t), trace_cap - start, f);
+            fwrite(trace_buf, sizeof(uint64_t), start, f);
+        } else {
+            fwrite(trace_buf, sizeof(uint64_t), written, f);
+        }
         fclose(f);
-        fprintf(stderr, "hengevm: pctrace %u blocks -> %s\n", trace_n, p);
+        fprintf(stderr, "hengevm: pctrace %u blocks%s -> %s\n", written,
+                (trace_tail && trace_n > trace_cap) ? " (tail window)" : "", p);
     } else {
-        fprintf(stderr, "hengevm: pctrace %u blocks (open failed)\n", trace_n);
+        fprintf(stderr, "hengevm: pctrace %u blocks (open failed)\n", written);
     }
 }
 

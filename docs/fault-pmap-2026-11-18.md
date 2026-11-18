@@ -1,0 +1,110 @@
+# 缺页到底走没走到 pmap_enter（2026-11-18）
+
+> 目标：回答 `docs/investigation-tree.md` §9 那个问题 —— 缺页处理跑完了，为什么 PTE 没建立。
+> 手段：`HV_TRACE_PC`（真实执行记录）+ `HV_PCHK`（独立计数）+ `tools/lcfs.py` 函数边界。
+
+## 0. 先纠正两个前提
+
+| 前提 | 实测 |
+|---|---|
+| `HV_TRACE_PC` 只记前 4M 块 | 一轮只有 ~38 万块，够用；另加了 `HV_TRACE_TAIL=1`（环形，保留最后 4M 块）作为保险 |
+| `pmap_enter_options` 地址 0x1ca2206c..0x1ca233ac 的地址空间 | 与 `work/kernel_functions.json` 的函数边界**逐字节吻合**，就是 run VA；本轮 **slide = 0**（PCHK 打印 `slide 0`） |
+
+## 1. 结论一：`pmap_enter_options` 确实被调用，而且正常返回
+
+- 入口 `0x1ca2206c` 命中 **33 次**（PCHK 与 trace 一致）。
+- 反汇编里 6 条早退分支（`+0xcec`、`+0xd30`、`+0xd5c`、`+0x11c0`、`+0x11e0`、`+0x1240`）
+  **一次都没有执行** —— 不是参数校验失败。
+- 调用序列平均 10–34 个基本块，是完整路径；返回地址分布在多个调用者
+  （0x1c902074、0x1ca396f4、0x1c904cf4 …），说明不是同一条错误路径。
+
+## 2. 结论二：用户态的缺页几乎不进入它
+
+按 trace 分区统计（一条 trace 覆盖整个引导，按地址自然分区）：
+
+| 区域 | 块数 |
+|---|---|
+| 固件（< 0x100000000） | 89 814 |
+| 内核（≥ 0xffff000000000000） | 276 474 |
+| 用户态（0x100000000…） | 18 546 |
+
+用户态开始（索引 307 621）之后：
+
+| 指标 | 值 |
+|---|---|
+| EL0 同步异常（向量 `0x1c893400`） | **6 515** |
+| 进入内核异常入口后续（`0x1c894448`） | 1 599 |
+| `pmap_enter_options` 入口 | **2** |
+
+即 **6515 次缺页里只有 2 次走到 pmap_enter_options**。这否定了
+“调用过但写没生效”这个分支的**主要形态** —— 绝大多数缺页在更早的地方就返回了。
+
+## 3. 结论三：ESR 里混着两类故障，`pmap_enter` 只服务其中一类
+
+同一轮日志的 data abort 分布：
+
+| ESR | 次数 | 类型 |
+|---|---|---|
+| `92000007` | 2664 | translation fault L3（读） |
+| `92000047` | 324 | translation fault L3（写） |
+| `9200004f` | 1155 | **permission fault L3** |
+| `9200004b` | 492 | access-flag fault L2 |
+| `9600004f` / `96000047` | 267 | **same-EL abort（内核自己）** |
+
+permission fault 不走 `pmap_enter`（走 `pmap_protect`／保护错误路径），
+access-flag fault 也不走。只有 translation fault 才应该走 `pmap_enter`。
+所以“fault 数 vs pmap_enter 数”不能直接比；**要按 ESR 分开算**。
+
+## 4. 结论四（方法教训）：全局 trace 是多 CPU 交错的
+
+`hv_trace_note()` 写的是**所有 CPU 共用的一个缓冲区**，两条 CPU 流按执行顺序交错。
+因此“向量块的下一条是哪个块”这种相邻分析**不成立** —— 下一条可能是另一个 CPU 的块。
+
+可用的只有**计数**（PCHK 或 trace 的频次），不可用的是**相邻关系**。
+要还原单 CPU 路径，必须先让 trace 按 CPU 分离（`hv_pc_hist_note_va(index, va)` 已经有
+`index`，改成每 CPU 一个文件即可，改动很小）。
+
+## 5. 用户态阶段的内核热点
+
+| 函数起点 | 块数 | 猜测（未证实） |
+|---|---|---|
+| `0x1c893000` | 9 817 | 异常/中断向量页 |
+| `0x1ca35d68` | 7 919 | 疑似 idle/自旋（trace 最后一块 `0x1ca35e68` 也在这里） |
+| `0x1ca42818` | 1 689 | 未知 |
+| `0x1c8943e4` | 1 611 | EL0 同步异常入口（`fleh_/sleh_synchronous`） |
+| `0x1ca431e0` | 821 | 未知 |
+| `0x1e70b0d8` | 545 | `com.apple.iokit.IOUSBHostFamily`（USB 路径） |
+
+内核函数**没有符号**（`tools/ksym.py` 只覆盖 kext，kernel 段解析出来是
+`_sSortedProcessWhitelist + 0x19446c` 这类数据符号），所以上表只能给函数边界，不能给名字。
+
+## 6. 下一步（按优先级）
+
+1. **trace 按 CPU 分离**（改 `core/dispatch.c` 的 `hv_trace_note`，每 CPU 一个文件）。
+   这是唯一能把“某次缺页之后内核走到了哪”还原出来的办法。
+2. **按 ESR 分类统计**（trans-L3 / perm-L3 / access-flag 分开），再看每一类各自的
+   后续路径；现在把三类混在一起算比例是没有意义的。
+3. 用分离后的 trace 检查：translation fault 之后，内核是否进入了 `vm_fault` 一类的函数
+   （函数边界可用 `tools/lcfs.py`，但没有名字，需要靠调用 pmap_enter 的返回地址反推）。
+
+## 7. 工具
+
+- `tools/trace-stats.py`：trace 离线统计（范围/热点/上下文）。
+  注意：**32 位内核地址会自动提升到 0xfffffe00xxxxxxxx**，否则 `0x1ca2206c` 永远 0 命中
+  （这个坑已经踩过，脚本里已修）。
+- `tools/henge-gdb/`：现场探针（faults / walkva / vmmap / entries / images / procs / blk …）。
+- `SIGUSR1` → `hv_trace_dump()`：卡住时随时把 trace 落盘，不用等超时退出
+  （`tools/host-install.c`）。
+
+## 8. 复现
+
+```bash
+./tools/build-install-host.sh
+CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
+  HV_TRACE_PC=/tmp/tr.bin HV_TRACE_TAIL=1 \
+  HV_PCHK=1ca2206c:1ca233ac HV_PCHK_CPU=all HV_PCHK_MAX=200000 \
+  ./build/host/host-install work/AVPBooter.vmapple2.bin android/ipsw/24G90.ipsw work 2048 2
+# 等到 fault 阶段（约 90 s），然后：
+kill -USR1 $(pgrep -x host-install)
+python3 tools/trace-stats.py /tmp/tr.bin --range 0x1ca2206c:0x1ca233ac
+```

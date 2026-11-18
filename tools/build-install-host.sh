@@ -48,7 +48,7 @@ fi
 
 build core core/*.c
 build dev devices/*.c
-build host host/disk.c host/hvsparse.c host/jit_region.c host/usb_host.c
+build host host/disk.c host/hvsparse.c host/jit_region.c host/usb_host.c host/net_min.c
 build compat android/compat/compat_android.c android/compat/commoncrypto_android.c \
               android/compat/corefoundation_android.c android/compat/pvg_metal_stub.c
 build mbed third_party/mbedtls/library/aes.c third_party/mbedtls/library/sha256.c \
