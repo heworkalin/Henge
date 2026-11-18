@@ -1251,11 +1251,60 @@ static void th_dump_one(int idx) {
     }
 }
 
+/* lck_mtx_t (arm64 uses the non-arch definition, osfmk/kern/lock_mtx.h):
+ *   +0x00  uint32_t lck_mtx_tsid:24, lck_mtx_type:8   (LCK_TYPE_MUTEX = 0x22)
+ *   +0x04  uint32_t lck_mtx_grp
+ *   +0x08  lck_mtx_state: data = owner:28 | ilocked:1 | spin_mode:1 | needs_wakeup:1 | profile:1
+ * The turnstile is referenced by the 24-bit tsid, NOT by a pointer, which is why scanning for a
+ * pointer to the turnstile found only the waiter itself.
+ *
+ * needs_wakeup set with owner == 0 is the state that must not persist: unlock has to clear the
+ * owner, see needs_wakeup and call turnstile_wakeup. Finding such a lock names the exact object
+ * whose waiter was left behind. */
+static void th_scan_mtx(void) {
+    int total = 0, stale = 0, orphan = 0;
+    for (uint64_t pa = 0x84000000ull; pa < 0x85000000ull; pa += 0x1000) {
+        uint8_t pg[4096];
+        if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
+        for (int i = 0; i + 16 <= 4096; i += 4) {
+            uint32_t v0, state;
+            memcpy(&v0, pg + i, 4);
+            if ((v0 >> 24) != 0x22) continue;         /* lck_mtx_type == LCK_TYPE_MUTEX */
+            memcpy(&state, pg + i + 8, 4);
+            uint32_t owner = state & 0x0fffffffu;
+            int ilocked = (int) ((state >> 28) & 1), spin = (int) ((state >> 29) & 1);
+            int needs = (int) ((state >> 30) & 1);
+            total++;
+            /* tsid != 0 means this mutex still has a turnstile attached (somebody queued), while
+               owner == 0 means nobody holds it. That combination can never resolve: the queued
+               thread waits for an unlock that already happened. */
+            if ((v0 & 0xffffffu) && owner == 0 && !spin) {
+                orphan++;
+                if (orphan <= 20)
+                    fprintf(stderr, "hengevm: mtx pa %llx tsid %x state %x: OWNERLESS with a"
+                                    " turnstile attached (needs_wakeup %d)\n",
+                            (unsigned long long) (pa + (uint64_t) i), v0 & 0xffffffu, state, needs);
+            }
+            if (needs && owner == 0 && !spin) {
+                stale++;
+                if (stale <= 20)
+                    fprintf(stderr, "hengevm: mtx pa %llx tsid %x state %x: needs_wakeup, no owner"
+                                    " (ilocked %d)\n",
+                            (unsigned long long) (pa + (uint64_t) i), v0 & 0xffffffu, state,
+                            ilocked);
+            }
+        }
+    }
+    fprintf(stderr, "hengevm: mtx scan: %d mutexes, %d ownerless-with-turnstile, %d with"
+                    " needs_wakeup && no owner\n", total, orphan, stale);
+}
+
 void hv_threads_dump(void) {
     th_scan_all();
     th_build_map();
     fprintf(stderr, "hengevm: threads: %d processes, %d threads mapped\n", g_pe_n, g_tm_n);
     for (int i = 0; i < g_pe_n; i++) th_dump_one(i);
+    if (getenv("HV_TS_MTX")) th_scan_mtx();
     for (int c = 0; c < g_board.ncpus; c++)
         fprintf(stderr, "hengevm: cpu%d pc %llx tpidr_el1 %llx el%u\n", c,
                 (unsigned long long) g_cpus[c].pc, (unsigned long long) g_cpus[c].tpidr_el1,

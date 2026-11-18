@@ -245,6 +245,57 @@ park 过并收到 kick。**Henge 目前不会踩这个坑**（返回 -1），但
 `+0x28`，要求指回同一个 turnstile（`thread->turnstile == ts`）。这需要 op 一次
 `hv_mmu_walk`，只能对**首次出现**的 `(ts, oldv)` 组合做（缓存），否则百万级 walk 太慢。
 
+## 4.9 扫 lck_mtx：unlock 把状态清干净了
+
+`HV_TS_MTX=1` 扫 `kalloc` 区找 `lck_mtx`。arm64 用 `osfmk/kern/lock_mtx.h` 的定义
+（`LCK_MTX_USE_ARCH` 只在 x86_64 为 1）：
+
+```
++0x00  uint32_t lck_mtx_tsid:24, lck_mtx_type:8      (LCK_TYPE_MUTEX = 0x22)
++0x04  uint32_t lck_mtx_grp
++0x08  lck_mtx_state: owner:28 | ilocked:1 | spin_mode:1 | needs_wakeup:1 | profile:1
+```
+
+**turnstile 是用 24 位 `tsid` 引用的，不是指针** —— 这解释了 4.6 里"扫不到锁对象指向
+turnstile 的引用"：找的是指针，而内核存的是 ID。
+
+结果（18601 个候选）：
+
+| 判据 | 结果 |
+|---|---|
+| `needs_wakeup` 置位 + `owner == 0` | **0** |
+| `tsid != 0` + `owner == 0`（ownerless 但挂着 turnstile） | 14603（**误报**） |
+
+14603 那批是误报：`pa` 以 `0x18` 递增、`tsid` 同步递增（`1e4018/1e4030/1e4048…`），
+是数组/指针表的特征，而 `lck_mtx` 本身只有 `0x10` 字节。`needs_wakeup && owner==0`
+这个组合罕见，0 条是可信的。
+
+含义：**unlock 把 `owner`、`tsid`、`needs_wakeup` 全清了**。也就是说解锁路径**认为没有
+需要唤醒的等待者**，而不是"想唤醒但失败了"。
+
+## 4.10 排除：引擎的 exclusive / CAS 模拟
+
+`core/translate.c` 的 `translate_excl()` 把 `LDXR` 记为（地址、大小、值），`STXR` 则
+用**宿主的 `casal`**（硬件 CAS）实现，靠"内存里的值是否还等于 LDXR 读到的值"判断成败；
+注释也明说只有 ABA 会漏。所以：
+
+- 不是 LDXR/STXR 的 lost update（那是真正原子 CAS，不是"地址对就算成功"）；
+- 多个 CPU 同时改同一个 `lck_mtx_state` 的不同位时，值不同 → CAS 失败 → 重试，语义正确。
+
+## 4.11 现在的处境
+
+已排除：缺页/PTE、`pmap_enter` 未调用、死锁（proprietor 全 0）、syscall 卡住、
+PV ticket lock、等待队列为空、锁未解锁（绑定已解除）、CAS lost update。
+
+剩下的分歧点只有一个：
+
+> **解锁路径认为没有等待者**，而等待线程确实在 turnstile 队列里。
+
+要么 guest 内核在入队时没把"有等待者"这件事反映到它能看见的地方（`needs_wakeup`/`tsid`），
+要么我们观察的 `thread->turnstile` 与那个锁不是同一个对象。要分清这两者，需要**在同一次
+运行里**把一个 turnstile 和它的 `tsid` 对上——但 `tsid` 是 ID 而非地址，得先确认
+XNU 的 `tsid → turnstile` 映射方式（`osfmk/kern/turnstile.c` 的 hash 表）。
+
 ## 5. 下一步
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该
