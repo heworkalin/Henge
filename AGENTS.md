@@ -379,6 +379,13 @@ adb -s emulator-5554 shell "cd /data/local/tmp/henge && chmod 755 host-install &
 
 要点：
 
+- **`adb shell "... &"` 不是后台。** 实测 `time adb shell "nohup sleep 5 &"` 用了 5.5 s：
+  `adb shell` 会等它的 shell 及所有子作业退出才返回，`nohup` 和重定向都断不开。
+  所以「命令加个 `&` 就挂后台了」是执行机制的误解——那条 adb 命令是**前台阻塞**的；
+  工具调用超时/中断后，设备上的进程会变成**没人管的孤儿**（还在跑，但日志没人收）。
+  要真后台：在**本地侧**后台化 adb 客户端（`adb shell '...' &` 并保持连接），
+  或设备上 `setsid`/`screen` 之类彻底脱离会话；
+  **判断依据只能是一条新的 adb shell 里的 `pidof host-install`**，不要用“命令返回了”当证据。
 - **RAM 用 `2048`，且一次只开一个实例。** 设备总内存约 15 GB，单个实例实测 RSS ≈ 2.1 GB；
   以前同时留两个（一个“现场”+ 一个新实验）就占了 4 GB+。**分析完立刻 `kill -9`，不要留“现场”**
   （分析数据落进 docs 就够了）。开了新的先确认旧的已消失。
