@@ -91,6 +91,50 @@ turnstile 的 `ts_proprietor` 在 **+0x50**，推法（arm64 是 `WQ_OPAQUE_SIZE
 - 不是某个 syscall 没返回（`hv_svc_dump_tail` 无 `NOT RETURNED`）；
 - 不是 gdb 读错（本次全部用引擎自己的 RAM 读 + 页表 walk，偏移从源码核对）。
 
+## 4.5 确证：等待队列非空 + proprietor 为 0
+
+`HV_TS_FULL=1` 打 turnstile 头（`waitq` 部分在 `+0x00..0x28`，arm64 布局：
+`flags(4) + interlock(4) + queue(16) + links(16) = 40`）。turnstile 的 `queue` 是
+**priority queue**，其 `pq_root` 在 **`+0x08`**，指向等待线程的 `wait_prioq_links`
+（`struct thread` 的第一个 union 成员，即 `thread+0x00`）。
+
+同一 run 的快照，每个被等待的 turnstile 都是同一形态：
+
+```
+ts+0x00 = flags/interlock
+ts+0x08 = fffffe2f9f9ff808   (kptr)  ← 等待队列，非空
+ts+0x10 = 0
+ts+0x18 = links
+...
+ts+0x50 = 0                          ← ts_proprietor，无主
+```
+
+而且 `+0x08` 指向的正是排在队列里的那个线程本身（`thread+0x00` 就是
+`wait_prioq_links`），两边可以对上：
+
+| 检查 | 结果 |
+|---|---|
+| turnstile 的等待队列 `+0x08` | 指向线程（非空） |
+| 同一个 turnstile 的 `ts_proprietor +0x50` | 0 |
+| 线程自己的 `thread->turnstile` | 正是这个 turnstile |
+
+**等待者确实在队列里，锁却没有任何持有者** —— 丢失唤醒成立，不是"队列为空所以没人
+该被唤醒"。
+
+### 完整链条（restored_external）
+
+```
+restored 线程 ...fd828
+  └─ 等 turnstile ...88cd8        (+0x08 = ...fd828 ✓ 它自己)
+       proprietor = thread ...bf2020   (state 0x9 = WAIT|UNINT)
+         └─ 它等 turnstile ...88d20  (+0x08 = ...bf2020 ✓)
+              proprietor = 0        ← 断点在这里
+```
+
+所以精确位置是：**turnstile `...88d20` 被释放（proprietor 清 0）时没有唤醒排在其
+队列里的 thread `...bf2020`**；该 thread 同时是 restored_external 所等那个锁的持有者，
+于是整条链冻结。
+
 ## 5. 下一步
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该
