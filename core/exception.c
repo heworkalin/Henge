@@ -199,8 +199,34 @@ void hv_svc_dump_tail(void) {
         for (uint32_t no = 0; no < 600; no++)
             if (hist[no]) fprintf(stderr, " %u=%u", no, hist[no]);
         fprintf(stderr, "\n");
-        /* Read the last arguments back out of guest user memory: for a syscall that blocks, the
-           pointed-to structures are the only record of what it is waiting for. */
+        /* mach_msg2_trap (-47) is how libdispatch and IOKit wait for IPC. Its first argument is
+           the mach_msg header in guest user memory; msgh_local_port / msgh_id say which service is
+           being waited on, which no amount of kernel-structure walking would tell us. */
+        {
+            HvCpu *cpu = (g_svc_m && g_svc_m->cpus[0]) ? g_svc_m->cpus[0] : NULL;
+            int shown = 0;
+            for (uint64_t i = n; i-- > 0 && shown < 6 && cpu; ) {
+                uint64_t s = i & (HV_SVC_CAP - 1);
+                if ((int64_t) hv_svc_x16[s] != -47 || !hv_svc_x0[s]) continue;
+                uint64_t saved_ttbr0 = cpu->ttbr0_el1;
+                cpu->ttbr0_el1 = hv_svc_ttbr0[s];
+                HvWalk w;
+                hv_mmu_walk(cpu, hv_svc_x0[s], HV_ACC_READ, 0, &w);
+                cpu->ttbr0_el1 = saved_ttbr0;
+                if (w.fsc) continue;
+                uint8_t buf[0x20];
+                if (hv_phys_read(cpu->m, w.pa, buf, sizeof buf) != 0) continue;
+                uint32_t bits, size, rport, lport, vport, id;
+                memcpy(&bits, buf, 4), memcpy(&size, buf + 4, 4);
+                memcpy(&rport, buf + 8, 4), memcpy(&lport, buf + 12, 4);
+                memcpy(&vport, buf + 16, 4), memcpy(&id, buf + 20, 4);
+                fprintf(stderr, "hengevm: mach_msg2 pc %llx bits %x size %u remote %x local %x"
+                                " voucher %x id %d\n",
+                        (unsigned long long) hv_svc_pc[s], bits, size, rport, lport, vport,
+                        (int) id);
+                shown++;
+            }
+        }
         {
             int shown = 0;
             HvCpu *cpu = (g_svc_m && g_svc_m->cpus[0]) ? g_svc_m->cpus[0] : NULL;
