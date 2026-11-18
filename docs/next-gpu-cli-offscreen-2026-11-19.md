@@ -44,6 +44,36 @@ vkCreateInstance -> vkEnumeratePhysicalDevices -> 打印 deviceName / apiVersion
 注意：`devices/vmapple.c` 里**安装模式仍走 `pvg_lite`**（`cfg->run_installer1/2` 分支），
 所以接入 reims 不影响安装流程，只在**正常启动 macOS** 时生效。
 
+## 第二步半：把帧读回来，存成图片
+
+**现状**：`hv_reims_pvg_poll()` 在没有窗口时**只打印** `reims: frame WxH`，不做编码：
+
+```c
+if (p->frame_pending && p->have_mode) {
+    p->frame_pending = 0;
+    if (p->log) fprintf(stderr, "reims: frame %ux%u\n", p->mode_width, p->mode_height);
+}
+```
+
+真正的呈现走的是 `attach_android_window()` → `rvg_display_attach_android_window()`，
+所以 CLI（无 Surface）目前**没有任何像素输出**。
+
+**做法（不改 reims）**：实现一个**假的 `ANativeWindow`**。
+`ANativeWindow` 的本质是一张函数表 + 一个 buffer 队列，`rvg_display_attach_android_window()`
+拿到它之后会走标准的 `dequeueBuffer` / `queueBuffer` 流程。我们自己实现这几个回调，
+在 `queueBuffer` 里把 `ANativeWindowBuffer` 的数据拷出来，写成 PPM/PNG。
+
+```
+假 ANativeWindow（CLI）
+   dequeueBuffer -> 返回我们自己的 buffer
+   queueBuffer   -> 拿 ANativeWindowBuffer 的像素，存 /tmp/frame-%04d.png
+   perform       -> NATIVE_WINDOW_SET_BUFFERS_FORMAT/SIZE 等，记录参数
+```
+
+好处：**reims 一行不改**，同一份代码在 APK（真 Surface）和 CLI（假 Surface）上都能渲染，
+而且 CLI 侧能拿到确定的图片文件，用来判断渲染内容对不对（颜色/几何/文字），
+而不是只看"有没有创建成功"。
+
 ## 第三步：用"非安装"模式跑
 
 ```
@@ -54,9 +84,15 @@ vkCreateInstance -> vkEnumeratePhysicalDevices -> 打印 deviceName / apiVersion
 
 期望看到：
 - `reims: guest mode WxH, IOSurface format 0x...`
-- `hv_reims_pvg_have_display() == 0`（无窗口，正常）
 - `hv_reims_pvg_have_mapper() == 1`（IOSurface mapper 起来）
-- guest 的 GPU 驱动能完成初始化
+- 假 window 被 attach：`reims: display attached to the host's window`
+- **`/tmp/frame-0001.png` 之类真的出现，且内容不是全黑/全绿**
+
+## 最终目标（分阶段）
+
+1. **安装跑完**（当前：ASR 22%，磁盘 3.3 GB）——数据走 USB，不需要 guest 网络
+2. **GPU 正常渲染**（CLI 离屏 → 出图片；APK → 出画面）
+3. **再谈封装/UI**（只有前两步成立，UI 才有真实内容可显示）
 
 ## 已知的坑
 
