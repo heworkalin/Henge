@@ -256,6 +256,9 @@ L5 用户态卡死     🔍 当前  缺页 → 未建立映射 → 再缺页 →
 `wait_event` / `waitq` / `turnstile` / 持有锁 / 内核栈，拼等待图，两次采样对比，
 区分"存在环"与"事件源消失"。
 
+**与上游/苹果语义的差异清单**（恢复链路的 T/V/H 三类改动，E/X/D/U 分级）见
+`docs/upstream-restore-semantics-2026-11-19.md`；它只说明"恢复能否开始"，不解释本节死锁。
+
 已知的具体落点（作为待验证假设，不是结论）：`restored_external` 卡在
 `CHECKPOINT BEGIN: MAIN:[0x0406] set_progress_0`（没有 END），其内部涉及
 NVRAM 会话（mach body 里有 `ramrod-nvram-session`）与显示。详见

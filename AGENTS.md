@@ -292,6 +292,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 | `docs/architecture.md` | 引擎结构 |
 | `docs/kernel-boot-exclusions.md` | 内核启动已排除的假设 E1–E18 + H1/H2 + 工具清单（**排障先看这里，避免重走**） |
 | `docs/semantic-deviations.md` | 与上游的语义等效性审计（E/X/D/U 四级） |
+| `docs/upstream-restore-semantics-2026-11-19.md` | **恢复模式的苹果语义（VZMacOSInstaller）+ 我们相对上游的差异清单**（T/V/H 三类，E/X/D/U 分级） |
 | `docs/android-install-debug.md` | Android 安装链路调试（设备端） |
 | `docs/android-install-status.md` | 安装现状 |
 | `docs/android-ui-plan.md` / `android-ui-design.md` | UI 结构与主题 |
