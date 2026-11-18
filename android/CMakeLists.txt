@@ -101,6 +101,7 @@ set(HOST_SRC
     ${HENGE_ROOT}/host/hvsparse.c    # sparse image pack/unpack (SEEK_DATA with a fallback)
     ${HENGE_ROOT}/host/jit_region.c  # executable memory: memfd split mapping
     ${HENGE_ROOT}/host/usb_host.c    # virtio USB host mapping (no real USB needed)
+    ${HENGE_ROOT}/host/net_min.c     # hv_net_poll: the kicker thread calls it every millisecond
 )
 
 # The translator's entry and exit stubs: hv_enter, hv_exit, hv_helper_entry,

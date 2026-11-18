@@ -1,8 +1,9 @@
 #include "vmapple.h"
+/* The PVG device model. Always needed: an installer boot uses it with the Metal replay
+   stubbed out, and a normal boot hands the same device to reims-vgpu instead. */
+#include "pvg_lite.h"
 #ifdef HENGE_HAVE_REIMS
 #include "reims_pvg.h"
-#else
-#include "pvg_lite.h"
 #endif
 #include "sysreg.h"
 
@@ -458,11 +459,21 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->aes = hv_aes_create(m, b->gic, VMAPPLE_AES_1, VMAPPLE_AES_2, 32 + VMAPPLE_IRQ_AES);
     hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
 #ifdef HENGE_HAVE_REIMS
-    /* The paravirtual GPU, on reims-vgpu instead of on Metal (android/reims_pvg.c). The guest's
-     * RAM goes with it, together with the file behind it: reims-vgpu builds its views of guest
-     * pages from that file, so the memfd made above is not optional here. */
-    b->pvg = hv_reims_pvg_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10,
-                                 VMAPPLE_MEM, b->ram, ram_size, b->ram_fd);
+    if (cfg->run_installer1 || cfg->run_installer2) {
+        /* Installing: the display device is all the guest needs. The restore UI is the app's own
+         * (idevicerestore's progress), and the guest only ever puts a progress bar in the boot
+         * framebuffer, so there is nothing for a real GPU to draw. reims-vgpu is for the running
+         * Mac; wired in here it is only a crash surface -- measured: it dies on
+         * memory.map.mapping_length_unaligned during the restore. It is also not free: its views
+         * of guest pages pin the RAM file for nothing while the restore is writing the disk. */
+        b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
+    } else {
+        /* The paravirtual GPU, on reims-vgpu instead of on Metal (android/reims_pvg.c). The
+         * guest's RAM goes with it, together with the file behind it: reims-vgpu builds its views
+         * of guest pages from that file, so the memfd made above is not optional here. */
+        b->pvg = hv_reims_pvg_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10,
+                                     VMAPPLE_MEM, b->ram, ram_size, b->ram_fd);
+    }
 #else
     b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
 #endif
