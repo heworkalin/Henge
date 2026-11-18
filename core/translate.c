@@ -799,9 +799,26 @@ static int superblocks(void) {
     return hv_knob[HV_K_SUPERBLOCKS];
 }
 
+/* HV_NOSUPERBLOCK_VA=lo:hi: debug-only. Stop a block at every conditional branch whose pc
+   is in that range, the same idea as HV_NOCHAIN_VA in dispatch.c. Needed because a whole
+   exception handler can sit inside one superblock: the trace then shows "vector ran, then
+   userland ran" although dozens of kernel blocks executed in between. Scoped to one range
+   so only that page pays the dispatch overhead. */
+static uint64_t nsb_lo, nsb_hi;
+static int nsb_read;
+static int nosuper_va(uint64_t va) {
+    if (!nsb_read) {
+        nsb_read = 1;
+        const char *e = getenv("HV_NOSUPERBLOCK_VA");
+        if (e) sscanf(e, "%llx:%llx", (unsigned long long *) &nsb_lo, (unsigned long long *) &nsb_hi);
+    }
+    return nsb_lo && va >= nsb_lo && va < nsb_hi;
+}
+
 /* The block may go on past a conditional branch at pc: the next instruction is
    in the same page and the block is not long already. */
 static int go_on(Emit *e, uint64_t pc) {
+    if (nosuper_va(pc)) return 0;
     return ((pc + 4) & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page && e->cur_i + 1 < 48;
 }
 

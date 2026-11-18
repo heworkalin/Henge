@@ -2544,6 +2544,26 @@ static int run_loop(HvCpu *cpu, int one) {
         } else {
             hv_enter(cpu, b->code);
         }
+        /* HV_TRACEEXIT=lo:hi: debug-only. Print what one block's execution produced -- exit
+           reason and where the pc went. The trace records blocks that *enter* the dispatcher,
+           so when a block seems to "vanish" between two records this line says whether the
+           block jumped into another block's compiled code directly, took an exception, or
+           really fell back to the pc seen next. Scoped to a range so it can be aimed at one
+           block (e.g. an exception vector). */
+        {
+            static uint64_t xe_lo, xe_hi;
+            static int xe_read;
+            if (!xe_read) {
+                xe_read = 1;
+                const char *e = getenv("HV_TRACEEXIT");
+                if (e) sscanf(e, "%llx:%llx", (unsigned long long *) &xe_lo, (unsigned long long *) &xe_hi);
+            }
+            if (xe_lo && b->va >= xe_lo && b->va < xe_hi)
+                fprintf(stderr, "traceexit va %llx -> exit %d pc %llx el%u icount %llu\n",
+                        (unsigned long long) b->va, cpu->exit_reason,
+                        (unsigned long long) cpu->pc, cpu->el,
+                        (unsigned long long) cpu->icount);
+        }
 
         /* An undefined instruction at EL1 is where the panic path traps to the debugger (the
            brk-like word XNU uses): the message panic() formatted is still in the frames above,
