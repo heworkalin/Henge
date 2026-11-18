@@ -135,6 +135,38 @@ restored 线程 ...fd828
 队列里的 thread `...bf2020`**；该 thread 同时是 restored_external 所等那个锁的持有者，
 于是整条链冻结。
 
+## 4.6 最后一环：turnstile 已与锁解绑，只剩线程自己引用它
+
+`HV_TS_REF=1` 扫全部 guest RAM（按 1 MiB 块，比对 8 字节值）找所有指向该 turnstile 的
+指针。结果：**每个 turnstile 都只有一处引用，就是线程结构自己的 `thread+0x28`**。
+上下文把每个字段都对上了：
+
+```
+ref pa 84fdc860 ctx:
+  ref-0x20 = fffffe28e3ebc838   -> thread+0x08  runq_links.prev（指向自己，单元素环）
+  ref-0x18 = 1f00               -> thread+0x10  wait_event（就是之前读到的 0x1f00）
+  ref-0x10 = fffffe2eaffa31d0   -> thread+0x18  __runq
+  ref-0x08 = 0                  -> thread+0x20  waitq（0，即不在普通 waitq 上）
+  [ref]    = fffffe46b00b5b78   -> thread+0x28  turnstile
+  ref+0x08 = fffffe2317ea65c0   -> thread+0x30  inheritor
+```
+
+（`ref` 与 `thread+0x28` 对齐，因此 `ref-0x18` 必须是 `wait_event`：读到的正是 `0x1f00`，
+与线程 dump 独立吻合。）
+
+含义：
+
+- turnstile 在 XNU 里是**按锁分配的**，锁对象/哈希表持有对它的引用；
+- 现在**只有等待线程自己还指着它**，说明它**已经从锁上解绑**（锁释放流程执行过）；
+- 同时 `ts_proprietor = 0`（无主）、线程 `state = WAIT`、`thread->turnstile` 未清、
+  waitq 的 `+0x08` 仍挂着该线程。
+
+三件事合起来只有一种解释：
+
+> **解锁路径把锁状态清干净了（owner/proprietor/哈希绑定），唯独没有唤醒排队的线程。**
+
+不是死锁（proprietor 全 0），不是队列为空（`+0x08` 非空），也不是没解锁（绑定已解除）。
+
 ## 5. 下一步
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该

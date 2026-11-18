@@ -1041,6 +1041,41 @@ static void th_build_map(void) {
     }
 }
 
+/* Who references this turnstile. A turnstile belongs to a lock object (lck_mtx's waiter
+   pointer, a waitq, ...); finding the reference names the lock, and the fields around it say
+   whether the lock still believes it has an owner -- the difference between "the lock object
+   was never unlocked" and "it was unlocked and the wakeup was dropped". */
+static void th_find_refs(uint64_t target) {
+    enum { CHUNK = 1 << 20 };
+    static uint8_t buf[CHUNK];
+    int found = 0;
+    for (int r = 0; r < g_machine.nram && found < 6; r++) {
+        uint64_t pa = g_machine.ram[r].pa, sz = g_machine.ram[r].size;
+        for (uint64_t off = 0; off + CHUNK <= sz && found < 6; off += CHUNK) {
+            if (hv_phys_read(&g_machine, pa + off, buf, CHUNK) != 0) continue;
+            for (uint32_t i = 0; i + 8 <= CHUNK; i += 8) {
+                uint64_t v;
+                memcpy(&v, buf + i, 8);
+                if (v != target) continue;
+                fprintf(stderr, "hengevm:       ref pa %llx ctx:",
+                        (unsigned long long) (pa + off + i));
+                for (int k = -4; k <= 6; k++) {
+                    uint32_t j = (uint32_t) ((int32_t) i + k * 8);
+                    if ((int32_t) j < 0 || j + 8 > CHUNK) continue;
+                    uint64_t w;
+                    memcpy(&w, buf + j, 8);
+                    fprintf(stderr, " %s%llx", k == 0 ? "[" : "", (unsigned long long) w);
+                    if (k == 0) fprintf(stderr, "]");
+                }
+                fprintf(stderr, "\n");
+                if (++found >= 6) break;
+            }
+        }
+    }
+    if (!found) fprintf(stderr, "hengevm:       no reference to turnstile %llx in RAM\n",
+                        (unsigned long long) target);
+}
+
 static void th_dump_turnstile(uint64_t ts, int depth) {
     if (!ts) return;
     uint64_t tpa = th_walk(ts);
@@ -1078,6 +1113,7 @@ static void th_dump_turnstile(uint64_t ts, int depth) {
         uint64_t prop = th_pa64(tpa + 0x50, NULL);
         if (!prop || !th_kaddr(prop)) {
             fprintf(stderr, "hengevm:       proprietor NONE (unowned lock)\n");
+            if (getenv("HV_TS_REF")) th_find_refs(ts);
         } else {
             uint64_t pp = th_walk(prop);
             if (!pp) {
