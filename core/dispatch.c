@@ -1140,7 +1140,29 @@ static void print_stats(HvCpu *cpu, int force) {
    same 16 KB page, so when that page's code is invalidated the stale blocks are
    only reachable from each other, and the exit_req check before every chained
    jump gets a block that just wrote its own page back to the dispatcher. */
+/* HV_NOCHAIN_VA=lo:hi: do not chain blocks whose va is in [lo,hi).  Debug-only.
+
+   Chaining only ever links two blocks in the same 16 KiB guest page, and that is enough
+   for a whole exception handler to disappear from the trace: the XNU vector page at
+   0x1c893000 holds the entry, fleh_synchronous and the first level of dispatch, so
+   "vector ran, then userland ran" is what the trace shows even when dozens of kernel
+   blocks ran in between.  Disabling the chain for that one page makes each of those
+   blocks go through the dispatcher (and therefore the trace) without slowing the rest
+   of the guest down, which is what a full HV_NO_CHAIN=1 does -- and did, badly enough
+   that the DFU handshake timed out. */
+static uint64_t nc_lo, nc_hi;
+static int nc_read;
+static int nochain_va(uint64_t va) {
+    if (!nc_read) {
+        nc_read = 1;
+        const char *e = getenv("HV_NOCHAIN_VA");
+        if (e) sscanf(e, "%llx:%llx", (unsigned long long *) &nc_lo, (unsigned long long *) &nc_hi);
+    }
+    return nc_lo && va >= nc_lo && va < nc_hi;
+}
+
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
+    if (nochain_va(b->va)) return;
     uint32_t idx = (uint32_t)(slot - m->slots);
     if (m->log >= 2 && hv_self) hv_pc_hist_note_va(hv_self->index, b->va);
     if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
@@ -2708,21 +2730,66 @@ void hv_seg_note(uint64_t va) {
    HV_TRACE_TAIL=1 turns the same buffer into a ring that keeps the *last* 4M blocks instead
    (trace_n keeps counting, only the window is stored and dumped in order). That is the mode
    the page-fault stall needs: the boot is tens of millions of blocks, and the interesting part
-   is the seconds before the guest stops, not the first 4M. */
+   is the seconds before the guest stops, not the first 4M.
+
+   HV_TRACE_CPU_SPLIT=1 keeps one buffer per CPU and dumps <file>.c0, <file>.c1, ... instead.
+   The shared buffer interleaves two CPUs, so "what ran right after this block" is not
+   answerable from it; per-CPU files make the ordering real again. Buffers are allocated on
+   first use, so only the CPUs that actually run pay for it. Debug-only: with the switch
+   unset nothing here changes, and the whole feature can be deleted once the stall is read. */
 #define TRACE_CAP (4u << 20)
 static uint64_t *trace_buf;
 static uint32_t trace_cap, trace_n;
+static uint64_t *trace_cpu[HV_MAX_CPUS];
+static uint32_t trace_cpu_n[HV_MAX_CPUS];
+static int trace_split;
 static int trace_on = -1;
 static int trace_tail;
 void hv_trace_dump(void);
 
 
+/* One buffer per CPU, allocated when that CPU first records a block. */
+static uint64_t *trace_cpu_buf(int index) {
+    if (index < 0 || index >= HV_MAX_CPUS) return NULL;
+    if (!trace_cpu[index]) trace_cpu[index] = malloc(sizeof(uint64_t) * TRACE_CAP);
+    return trace_cpu[index];
+}
+
+static void trace_cpu_put(int index, uint64_t va) {
+    uint64_t *b = trace_cpu_buf(index);
+    if (!b) return;
+    if (trace_tail) {
+        b[trace_cpu_n[index] % TRACE_CAP] = va;
+        trace_cpu_n[index]++;
+        return;
+    }
+    if (trace_cpu_n[index] >= TRACE_CAP) return;
+    b[trace_cpu_n[index]++] = va;
+}
+
+/* Write one CPU's window, in order. */
+static uint32_t trace_cpu_write(FILE *f, int index) {
+    uint64_t *b = trace_cpu[index];
+    uint32_t n = trace_cpu_n[index];
+    if (!b || !n) return 0;
+    uint32_t written = n < TRACE_CAP ? n : TRACE_CAP;
+    if (trace_tail && n > TRACE_CAP) {
+        uint32_t start = n % TRACE_CAP;
+        fwrite(b + start, sizeof(uint64_t), TRACE_CAP - start, f);
+        fwrite(b, sizeof(uint64_t), start, f);
+    } else {
+        fwrite(b, sizeof(uint64_t), written, f);
+    }
+    return written;
+}
+
 /* The last N recorded block addresses below `limit`.  Used after the guest has stopped: walking
    the trace backwards for the final userspace block tells the debugger which instruction dyld
    was in when it handed control to the kernel for the last time, without needing a symbol file
-   or a live debugger.  Returns how many were written. */
+   or a live debugger.  Returns how many were written.  (Not used in split mode: with per-CPU
+   files there is no single global order to walk.) */
 int hv_trace_last_below(uint64_t limit, uint64_t *out, int n) {
-    if (!trace_on || !trace_buf || !trace_n || n <= 0) return 0;
+    if (!trace_on || !trace_buf || !trace_n || n <= 0 || trace_split) return 0;
     int got = 0;
     uint32_t avail = trace_n < trace_cap ? trace_n : trace_cap;
     for (uint32_t k = avail; k-- > 0 && got < n; ) {
@@ -2732,19 +2799,29 @@ int hv_trace_last_below(uint64_t limit, uint64_t *out, int n) {
     }
     return got;
 }
-void hv_trace_note(uint64_t va) {
+
+void hv_trace_note(int index, uint64_t va) {
     if (trace_on < 0) {
         const char *e = getenv("HV_TRACE_PC");
         trace_on = (e && *e) ? 1 : 0;
         if (trace_on) {
-            trace_buf = malloc(sizeof(uint64_t) * TRACE_CAP);
-            trace_cap = trace_buf ? TRACE_CAP : 0;
-            if (!trace_buf) trace_on = 0;
             const char *t = getenv("HV_TRACE_TAIL");
             trace_tail = (t && *t && *t != '0') ? 1 : 0;
+            const char *s = getenv("HV_TRACE_CPU_SPLIT");
+            trace_split = (s && *s && *s != '0') ? 1 : 0;
+            if (!trace_split) {
+                trace_buf = malloc(sizeof(uint64_t) * TRACE_CAP);
+                trace_cap = trace_buf ? TRACE_CAP : 0;
+                if (!trace_buf) trace_on = 0;
+            }
         }
     }
-    if (!trace_on || !trace_cap) return;
+    if (!trace_on) return;
+    if (trace_split) {
+        trace_cpu_put(index, va);
+        return;
+    }
+    if (!trace_cap) return;
     if (trace_tail) {
         trace_buf[trace_n % trace_cap] = va;
         trace_n++;
@@ -2755,8 +2832,23 @@ void hv_trace_note(uint64_t va) {
 }
 
 void hv_trace_dump(void) {
-    if (!trace_on || !trace_buf || !trace_n) return;
+    if (!trace_on) return;
     const char *p = getenv("HV_TRACE_PC");
+    if (!p || !*p) return;
+    if (trace_split) {
+        for (int i = 0; i < HV_MAX_CPUS; i++) {
+            if (!trace_cpu[i] || !trace_cpu_n[i]) continue;
+            char path[512];
+            snprintf(path, sizeof path, "%s.c%d", p, i);
+            FILE *f = fopen(path, "wb");
+            if (!f) continue;
+            uint32_t w = trace_cpu_write(f, i);
+            fclose(f);
+            fprintf(stderr, "hengevm: pctrace cpu%d %u blocks -> %s\n", i, w, path);
+        }
+        return;
+    }
+    if (!trace_buf || !trace_n) return;
     FILE *f = p && *p ? fopen(p, "wb") : NULL;
     uint32_t written = trace_n < trace_cap ? trace_n : trace_cap;
     if (f) {
@@ -2780,7 +2872,7 @@ void hv_pc_hist_note_va(int index, uint64_t va) {
     /* hv_pc_hist_note() records the va, its address space and its physical page; this entry
        point only carries the va, so leave everything else to that path. */
     hv_seg_note(va);
-    hv_trace_note(va);
+    hv_trace_note(index, va);
     uint32_t i = pc_hist_at[index]++ & (PC_HIST - 1);
     pc_hist[index][i] = va;
 }

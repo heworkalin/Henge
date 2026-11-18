@@ -108,3 +108,58 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem \
 kill -USR1 $(pgrep -x host-install)
 python3 tools/trace-stats.py /tmp/tr.bin --range 0x1ca2206c:0x1ca233ac
 ```
+
+---
+
+# 追加：per-CPU trace 与一个更根本的记录局限（同日）
+
+## 做了什么
+
+`HV_TRACE_CPU_SPLIT=1`：每个 CPU 一个缓冲，落盘为 `<file>.c0`、`<file>.c1`。
+`HV_NOCHAIN_VA=lo:hi`：对指定地址区间不建立链（`core/dispatch.c` 的 `chain()` 开头）。
+
+两个都**默认关闭**，只用于读现场；关闭时引擎行为与之前完全一致，正式版可以整段删除。
+
+## 结果一：交错确实存在，但不是主因
+
+分 CPU 后仍有大量 "向量块之后直接是 EL0"：
+
+| CPU | 块数 | EL0 同步异常 | 异常后进内核入口 | 异常后直接回 EL0 |
+|---|---|---|---|---|
+| cpu0 | 328 510 | 3 305 | 1 019 | 2 286 |
+| cpu1 | 64 383 | 3 065 | 432 | 2 633 |
+
+## 结果二：真正的原因是 **16 KiB 页内联**
+
+guest 页是 **16 KiB**，`0x1c893000..0x1c896fff` 是同一页。向量表（`0x1c893400`）、
+`fleh/sleh` 入口（`0x1c8943e4`）、第一层分发（`0x1c894448`）**全在这一页里**。
+
+- 链只在同一 16 KiB 页内建立 → 整页的 handler 可以不经过 dispatcher；
+- superblock（`HV_SUPERBLOCKS=1` 默认）让条件分支不结束块 → 一段直线 handler 被并进一块。
+
+所以 trace 记录的**不是"执行的块"**，而是"进入 dispatcher 的块"。
+对同页内的异常处理，这几乎等于没有记录。`HV_NOCHAIN_VA` 只挡住新的链，
+挡不住已经内联进块的内容。
+
+**这条要写进方法论**：`HV_TRACE_PC` 与 `HV_PCHK` 都不能给出块级路径，
+除非彻底关掉 chain 和 superblock；而彻底关掉会让 DFU 阶段超时（实测两次）。
+
+## 结果三：结论反而更硬了
+
+用"函数范围内出现的块数"作为下界（superblock 只会**减少**块数，不会凭空增加）：
+
+| 阶段 | EL0 同步异常 | `pmap_enter_options` 范围内的块 | 其中入口 |
+|---|---|---|---|
+| 用户态（cpu0） | 3 305 | **16** | 0 |
+| 用户态（cpu1） | 3 065 | **10** | 2 |
+
+一个函数被调用 N 次，其内部至少会出现 N 个块（每次调用都要取指令）。
+26 块对 6449 次异常，差了三个数量级 —— **用户态的缺页处理基本不进入
+`pmap_enter_options`**，这个结论不受 superblock/链的影响。
+
+## 下一步
+
+要把"不进入 pmap_enter"往前追一步，需要**按页关 superblock**
+（`go_on()` 里加一个 `HV_NOSUPERBLOCK_VA=lo:hi` 判断，与 `HV_NOCHAIN_VA` 同构），
+把 `0x1c893000` 页完全展开，同时不影响其他页的性能。
+这是唯一能在不拖慢 DFU 的前提下看到真实块级路径的办法。
