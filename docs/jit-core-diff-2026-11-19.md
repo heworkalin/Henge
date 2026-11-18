@@ -771,3 +771,204 @@ llvm-nm /tmp/up030/Payload/Henge.app/Henge | grep hv_
 
 > 这一节的价值在于：它把"上游为什么不触发"从"无从下手"变成了**有二进制可查**。
 > 以后任何关于上游构建细节的疑问，都可以先下 release IPA 反汇编，而不是靠推理。
+
+---
+
+# 6. 上游的翻译模板（源码 + release 0.3 二进制双重确认）
+
+这一节回答"上游到底怎么翻译的"：每个模板生成的宿主指令序列，以及它在
+**上游正式版 IPA（release 0.3）** 里对应的常量。
+二进制证据来自 `llvm-objdump` 对 `/tmp/up030/Payload/Henge.app/Henge` 的反汇编
+（符号未 strip，`_put_helper`、`_put_strip`、`_put_exit` 都能直接找到）。
+
+## 6.1 `put_exit`：块退出模板
+
+源码（`core/translate.c`，上游）：
+
+```c
+static void put_exit(Emit *e, uint64_t target) {
+    put(e, STP_X(0, 1, 28, 0));        /* stp x0, x1, [x28]        */
+    put_lit(e, 0, target);             /* ldr x0, <target 在 pool> */
+    put(e, STR_X(0, 28, HV_CPU_PC));   /* str x0, [x28, #0x100]    */
+    put(e, LDR_X(1, 28, HV_CPU_EXIT)); /* ldr x1, [x28, #0x110]    */
+    put(e, BR_X(1));                   /* br x1  → hv_exit         */
+}
+```
+
+release 0.3 的 `_put_exit`（0x10010366c）里的常量：
+
+| 常量 | 指令 | 对应源码 |
+|---|---|---|
+| `0xa9000780` | `stp x0, x1, [x28]` | `STP_X(0,1,28,0)` |
+| `0xf9008380` | `str x0, [x28, #0x100]` | `STR_X(0,28,HV_CPU_PC)` |
+| `0xf9408b81` | `ldr x1, [x28, #0x110]` | `LDR_X(1,28,HV_CPU_EXIT)` |
+| `0xd61f0020` | `br x1` | `BR_X(1)` |
+
+`put_lit` 的那条是 `ldr x0, [pc, #imm]`（0x58000000 系列），目标地址在 literal pool。
+
+## 6.2 `put_helper`：helper 调用模板（**上游没有 Q 保存**）
+
+源码（上游）：
+
+```c
+static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+    uint32_t info = e->npool;
+    e->pool[info]     = pc;
+    e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
+    e->npool += 2;
+    put(e, STR_X(30, 28, HV_CPU_X(30)));     /* str x30, [x28, #240]  */
+    put(e, LDR_X(15, 28, HV_CPU_HELPER_THUNK)); /* ldr x15, [x28, thunk] */
+    e->fix[e->nfix++] = (LitFix){e->n, FIX_ADR, info, ...};
+    put(e, 0x10000006u);                     /* adr x6, <info>         */
+    put(e, BLR_X(15));                       /* blr x15                */
+    put(e, LDR_X(0, 28, 0));                 /* ldr x0, [x28]  resume  */
+}
+```
+
+release 0.3 的 `_put_helper`（0x100100354）常量：
+
+| 常量 | 指令 |
+|---|---|
+| `0xf9007b9e` | `str x30, [x28, #240]` |
+| `0xf942138f` | `ldr x15, [x28, #0x108]`（HELPER_THUNK 偏移） |
+| `0x10000006` | `adr x6, <info>` |
+| `0xf940...`  | `ldr x0, [x28]` |
+
+**整个函数里 `0xad`（STP_Q/LDP_Q）出现 0 次。**
+我们的版本在这五条之间插入了 16 对 `STP_Q` 和 16 对 `LDP_Q`（§5.5）。
+这从二进制上确认了 U-10 的描述：**上游的 helper 模板不保存 q0-q31**。
+
+## 6.3 `put_helper_refill`：慢路径的 op word 编码
+
+源码（上游）：
+
+```c
+static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
+    put_helper(e, pc, insn, HV_OP_MEM);
+    uint32_t resume = e->n - 1;          /* ldr x0, [x28] 的下标 */
+    uint32_t back = resume - retry;
+    if (back < (1u << 13) && rflags < (1u << 11))
+        e->pool[e->npool - 1] = (uint64_t)insn
+            | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
+}
+```
+
+也就是说，`HvHelperInfo` 低 32 位是 `insn`，高 32 位是
+`op | rflags<<8 | back<<19`：`back` 告诉 `hv_tlb_refill` 成功后跳回多少条指令之前
+（重跑原访问），`rflags` 是 refill 的方向/表/长度。**这个编码上游和我们现在一致**
+（我们只是把 `put_helper` 的返回值改成了 `resume` 下标，省掉 `e->n-1`）。
+
+## 6.4 `put_strip`：PAC strip 模板（**上游是 BFM #16,#6**）
+
+源码（上游）：
+
+```c
+static void put_strip(Emit *e, int r) {
+    if (r == 31) return;
+    uint32_t used = 1u << r;
+    if (!is_stolen(r)) {
+        uint8_t t = pick(&used);
+        spill(e, &t, 1);
+        put(e, SBFM_X(t, r, 55, 55));    /* t = 符号扩展(bit55) */
+        put(e, BFM_X(r, t, 16, 6));      /* r = 用 t 覆盖 bits[54:48] */
+        unspill(e, &t, 1);
+        return;
+    }
+    /* stolen 分支：同样两条，但通过 slot 读写 */
+    ...
+    put(e, SBFM_X(regs[1], regs[0], 55, 55));
+    put(e, BFM_X(regs[0], regs[1], 16, 6));
+    ...
+}
+```
+
+release 0.3 的 `_put_strip`（0x100104b04）里，两个分支的常量是：
+
+```
+100104ce8: mov  w14, #0xdc00
+100104cec: movk w14, #0x9377, lsl #16    → 0x9377dc00 = SBFM(immr=55, imms=55)
+100104d10: orr  w13, w9, w10, lsl #5
+100104d14: mov  w14, #0x1800
+100104d18: movk w14, #0xb350, lsl #16    → 0xb3501800 = BFM(immr=16, imms=6)
+
+100104ee8: orr  w11, w1, w9, lsl #5
+100104eec: mov  w12, #0x1800
+100104ef0: movk w12, #0xb350, lsl #16    → 同上（stolen 分支）
+```
+
+**没有任何 `0xb3503800`（imms=14）。** 所以：
+
+- 上游正式版：`BFM #16,#6` → 只清 `bits[54:48]`
+- 我们的版本：`BFM #16,#14` → 清 `bits[62:48]`
+
+这就是 D-2 的二进制确认：**上游确实用 #6，我们用 #14**。
+（至于哪个对 guest 更好，仍然取决于它是否踩到那条路径；D-2 仍按"我们的环境需要"记录。）
+
+## 6.5 `put_tlb_slot` + 内存访问模板
+
+源码（上游）：
+
+```c
+static uint32_t put_tlb_slot(Emit *e, int T, int va, int table) {
+    put(e, UBFM_X(T, va, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1)); /* 页号 */
+    if (hv_tlb_tmajor) {
+        put(e, ADD_LSL(T, 28, T, 5));        /* x28 + 页号*32 */
+        if (table) put(e, 0x91400000u | ...); /* add T, T, #table 偏移 */
+        return HV_CPU_TLB;
+    }
+    put(e, ADD_LSL(T, 28, T, 7));            /* x28 + 页号*128 */
+    return HV_CPU_TLB + table * HV_CPU_TLB_EL;
+}
+```
+
+`translate_mem` 里每条访问的模板（上游，与我们现在一致）：
+
+```
+UBFM  T, addr, #14, #27         ← 页号（16 KiB 页）
+ADD   T, x28, T, lsl #7         ← TLB 项地址
+LDR   U, [T, #tag_off]          ← 该项的 tag（物理页基址，已调整）
+SUB   U, addr, U
+[对齐形式多一条 SUB/AND]
+UBFM  U, U, #14, #63            ← 非本页则非零
+CBNZ  U → cold 慢路径
+LDR   U, [T, #24]               ← 页的宿主 addend
+ADD   A, addr, U                ← 宿主地址
+LDR/STR ...                     ← 真正的访问
+```
+
+- 组（group）只是把这套检查压缩成"整个 range 检查一次，addend 存
+  `cpu->gaddend[slot]`"。
+- 慢路径的 `OOL_SLOW` 带 `recheck`（页尾 15 字节重新精确检查）、`rflags`、`retry`。
+
+## 6.6 与我们版本的模板对照
+
+| 模板 | 上游 release 0.3 | 我们 | 差异 |
+|---|---|---|---|
+| `put_exit` | stp x0,x1; ldr x0,pool; str pc; ldr x1,exit; br x1 | **同** | 无 |
+| `put_branch_exit` | exit_req 检查 → slot → B 回填 → chain_thunk + slot 数据 | **同**，加 `slots==NULL` 保护 | 保护 |
+| `put_helper` | str x30; ldr x15; adr x6; blr; ldr x0 | **多了 16×STP_Q / 16×LDP_Q** | U-10 |
+| `put_helper_refill` | op\|rflags<<8\|back<<19 | 同（用返回值算 resume） | 无 |
+| `put_strip` | SBFM(55,55) + BFM(16,**6**) | SBFM(55,55) + BFM(16,**14**) | D-2 |
+| `put_tlb_slot` | UBFM + ADD_LSL + table 偏移 | 同 | 无 |
+| 内存访问 | tag 检查 + addend + 慢路径 | 同 | 无 |
+| 寄存器候选 | 含 16,17 | 不含 | D-1 |
+| 块入口 | 无 | `put_trace_entry`（仅 log≥2） | 诊断 |
+
+## 6.7 这轮确认了什么、没确认什么
+
+**确认（源码 + 二进制一致）**：
+
+1. 上游的五个核心模板（exit / branch_exit / helper / strip / tlb_slot）的指令序列；
+2. 上游 `put_helper` **确实不保存 q0-q31**；
+3. 上游 `put_strip` **确实是 BFM #16,#6**；
+4. 上游 `candidates[]` **确实含 16/17**；
+5. 上游取 thunk 地址是 `adrp/add`（不经 GOT）。
+
+**没确认（仍需设备/运行才能判断）**：
+
+1. 这些差异在 iOS 的运行中为什么都没有造成可观察故障 —— 只能记录，不能解释；
+2. 我们的构建上 x16 污染与 Q 丢失的具体触发条件 —— 有历史日志，但没有当前可复现的对照
+   （16/17 已移除、Q 已保存，无法回退做单变量实验而不改代码）。
+
+> 这一节的全部断言都能用两条命令复核：
+> `llvm-nm` 找符号，`llvm-objdump -d --start-address=…` 看常量。
