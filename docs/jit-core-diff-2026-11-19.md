@@ -670,3 +670,104 @@ GOT 访问用的是 x0，而且发生在初始化，不在 guest 运行时。
 
 > 需要说明的是：`.hidden` 本身没有坏处（不导出更安全），保留它没有问题。
 > 只是**它的理由描述与实测不符**，不能再用它解释 guest x16 的污染来源。
+
+## 2.1.7 上游 release 0.3 的二进制实测（不需要苹果设备）
+
+上游有**公开发布**：GitHub releases `0.3` / `0.2` / `0.1`，资产是 `Henge.ipa` 与 `Henge.tipa`。
+IPA 是 unsigned/ad-hoc 打包，**二进制未加密**，可以直接反汇编。
+
+```bash
+curl -sSL -o /tmp/Henge.ipa https://github.com/Leviidev/Henge/releases/download/0.3/Henge.ipa
+unzip -q /tmp/Henge.ipa -d /tmp/up030
+# Mach-O 64-bit arm64 PIE，未 strip（18697 个符号）
+llvm-nm /tmp/up030/Payload/Henge.app/Henge | grep hv_
+#   _hv_cpu_reset_index 0x1000f17cc
+#   _hv_enter 0x10011fb70   _hv_exit 0x10011fc40
+#   _hv_helper_thunk 0x10011fe54   _hv_xjump_thunk 0x10011ffec
+```
+
+### 实测 1：取 thunk 地址 → `adrp/add`，**不经 GOT**
+
+```
+1000f1a30: adrp x8, 0x10011f000
+1000f1a34: add  x8, x8, #0xe54        ← 0x10011fe54 = hv_helper_thunk
+1000f1a38: str  x8, [x19, #0x420]     ← HvCpu.helper_thunk
+1000f1a3c: adrp x8, 0x10011f000
+1000f1a40: add  x8, x8, #0xf10        ← chain_thunk
+1000f1a48: adrp x8, 0x10011f000
+1000f1a4c: add  x8, x8, #0xf48        ← ijc_thunk
+1000f1a5c: adrp x9, 0x10011f000
+1000f1a60: add  x9, x9, #0xfec        ← xjump_thunk
+```
+
+**用的是 x8，不是 x16；而且没有 `ldr`——链接器直接算出了地址。**
+
+对照我们的 ELF 构建（§2.1.6）：
+
+```
+310ac: adrp x0, 0x1cf000
+310b0: ldr  x0, [x0, #0xdb0]          ← 经 .got
+310b4: str  x0, [x20, #0x420]
+```
+
+**所以"上游不经 GOT、我们经 GOT"这一点是实测成立的**（上一节暂时撤回的那半条解释，现在有了二进制证据；
+但"GOT 指令用 x16"仍然不成立——两边都不是 x16）。
+
+### 实测 2：上游 thunk **没有** q0-q31 的保存
+
+```
+10011fe54: ldr  w15, [x6, #0xc]
+10011fe5c: cbz  w15, 0x10011ff04
+10011fe60: str  x30, [x28, #0x438]
+10011fe64: str  x6,  [x28, #0x130]
+10011fe68: stp  x0, x1,  [x28]
+10011fe6c: stp  x2, x3,  [x28, #0x10]
+10011fe70: stp  x4, x5,  [x28, #0x20]
+10011fe74: stp  x8, x9,  [x28, #0x40]
+10011fe78: stp  x10, x11,[x28, #0x50]
+10011fe7c: stp  x12, x13,[x28, #0x60]
+10011fe80: str  x14, [x28, #0x70]
+10011fe84: stp  x16, x17,[x28, #0x80]
+10011fe8c: mrs  x15, NZCV
+10011fe90: str  x15, [x28, #0x108]
+...
+10011feac: bl   0x1000f76f8 <_hv_tlb_refill>
+10011febc: ldr  x0, [x28, #0x108]
+10011fec0: msr  NZCV, x0
+```
+
+**没有任何 `stp q` / `ldp q`**。上游 0.3 确实是"thunk 只保存 NZCV 和通用寄存器"，
+与我们 U-10 描述一致；我们的 Q 保存是后来加的。
+
+### 实测 3：上游 0.3 的 `candidates[]` **含 16、17**
+
+在二进制里按字节搜索候选表：
+
+```
+含 [6,7,15,9,10,11,12,13,14,0,1,2,3,4,5,8,16,17,19,…,30]  → 命中，文件偏移 0x2836a0
+不含 16/17 的序列                                        → 未命中
+```
+
+也就是说：**上游 0.3 既允许借用 x16/x17，也不保存 q0-q31，而且这是它对外发布的、
+能用的版本**（release 0.3，2026-11-10）。
+
+### 这些事实合起来说明什么
+
+| 事实 | 证据 |
+|---|---|
+| 上游 iOS 构建不经 GOT | §2.1.7 实测 1 |
+| 我们的 ELF 构建经 GOT | §2.1.6 实测 |
+| 两个构建都**不**用 x16 取这些地址 | 两处反汇编 |
+| 上游 0.3 借用 x16/x17 且不保存 q0-q31 | §2.1.7 实测 2、3 |
+| 上游 0.3 是可运行的产品 | 它是公开 release |
+
+因此：
+
+1. **D-1（移除 16/17）与 U-10（保存 q0-q31）都不能升级为"上游 bug"** ——
+   上游带着这两处"问题"发布了可用版本；
+2. **"上游不经 GOT"已被证实**，但它**不是 x16 污染的来源**（两边都未用 x16），
+   所以 D-1 仍需要一个**别的**解释；
+3. 那个解释目前**没有**，且**当前无法验证**（没有苹果设备）。文档不猜。
+
+> 这一节的价值在于：它把"上游为什么不触发"从"无从下手"变成了**有二进制可查**。
+> 以后任何关于上游构建细节的疑问，都可以先下 release IPA 反汇编，而不是靠推理。
