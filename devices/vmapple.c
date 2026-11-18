@@ -331,6 +331,7 @@ static void vmapple_serial_out(void *opaque, uint8_t c) {
                     fprintf(stderr, "hengevm: HENGE_STOP_ON matched \"%s\", stopping pid %d for "
                                     "gdb\n", which, (int) getpid());
                     { extern void hv_svc_dump_tail(void); hv_svc_dump_tail(); }
+                    { extern void hv_threads_dump(void); hv_threads_dump(); }
                     fflush(stderr);
                     raise(SIGSTOP);
                     fprintf(stderr, "hengevm: resumed after HENGE_STOP_ON (\"%s\")\n", which);
