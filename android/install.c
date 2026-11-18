@@ -926,7 +926,9 @@ static int th_kaddr(uint64_t v) { return (v >> 56) == 0xff || (v >> 56) == 0xfe;
 /* proc PA from a p_comm PA: walk backwards until proc+off holds list nodes whose neighbours
    point back at it, which is what distinguishes the real struct proc from a copy of the name. */
 static uint64_t th_find_proc(uint64_t pc, uint64_t *node_va) {
-    for (uint64_t k = (pc % 8) ? pc % 8 : 8; k < 0x1000; k += 8) {
+    /* p_comm sits well inside struct proc; a match a few bytes from a list node is random data
+       that happens to look like one (and made every short string a "process"). */
+    for (uint64_t k = 0x100 + ((pc % 8) ? pc % 8 : 0); k < 0x1000; k += 8) {
         uint64_t s = pc - k;
         int ok1 = 0, ok2 = 0;
         uint64_t nxt = th_pa64(s, &ok1), prev = th_pa64(s + 8, &ok2);
@@ -946,73 +948,186 @@ static uint64_t th_find_proc(uint64_t pc, uint64_t *node_va) {
    and let the caller compare it against the thread addresses above. */
 static uint64_t ts_seen[32];
 static int ts_n;
-static void th_dump_turnstile(uint64_t ts) {
-    if (!ts) return;
-    for (int i = 0; i < ts_n; i++) if (ts_seen[i] == ts) return;
-    if (ts_n < 32) ts_seen[ts_n++] = ts;
-    uint64_t tpa = th_walk(ts);
-    fprintf(stderr, "hengevm: turnstile %llx pa %llx kptrs:", (unsigned long long) ts,
-            (unsigned long long) tpa);
-    if (!tpa) { fprintf(stderr, " (not walkable)\n"); return; }
-    for (uint64_t off = 0x300; off < 0x3c0; off += 8) {
-        uint64_t v = th_pa64(tpa + off, NULL);
-        if (th_kaddr(v)) fprintf(stderr, " +0x%llx=%llx", (unsigned long long) off,
-                                 (unsigned long long) v);
-    }
-    fprintf(stderr, "\n");
+/* Thread address -> process name, so a turnstile's owner can be named. */
+typedef struct { uint64_t th; char comm[20]; } HvThMap;
+static HvThMap g_tm[256];
+static int g_tm_n;
+
+static const char *th_comm_of(uint64_t t) {
+    for (int i = 0; i < g_tm_n; i++) if (g_tm[i].th == t) return g_tm[i].comm;
+    for (int c = 0; c < g_board.ncpus; c++) if (g_cpus[c].tpidr_el1 == t) return "idle";
+    return NULL;
 }
 
-static void th_dump_proc(const char *name) {
-    static const char *const known_names[] = {"launchd", "restored_externa", "loginsupport",
-                                              "mobile_restore", "watchdogd", "diskimagesiod",
-                                              "kernel_task"};
-    size_t nl = strlen(name);
-    uint64_t node = 0, proc_pa = 0, pc = 0;
-    int candidates = 0;
-    uint64_t procs[8];
-    int nprocs = 0;
-    /* The kernel image holds these names as string constants; its PA range is known, and a real
-       p_comm is only accepted once th_find_proc() validates the list node around it. collect every
-       distinct process: a name repeated after fork is a real second process, not a duplicate. */
+static int th_printable(uint8_t c) { return c >= 32 && c < 127; }
+
+/* A p_comm is a short printable name at a fixed offset inside struct proc, so scanning RAM finds
+   processes without the symbol table. Candidates are restricted to the character set real process
+   names use, and struct proc is confirmed through the list node around the name; a string constant
+   or a copy of a name does not have that. */
+typedef struct { uint64_t proc_pa; char comm[20]; } HvProcEnt;
+static HvProcEnt g_pe[64];
+static int g_pe_n;
+
+static void th_scan_all(void) {
+    g_pe_n = 0;
     uint64_t img_lo = g_machine.kimage_pa ? g_machine.kimage_pa : 0x73b18000ull;
-    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull && nprocs < 8; pa += 0x1000) {
+    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull && g_pe_n < 64; pa += 0x1000) {
         if (pa + 0x1000 > img_lo && pa < img_lo + 0x4000000ull) continue;
         uint8_t pg[4096];
         if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;
-        for (int i = 0; i + (int) nl + 1 <= 4096 && nprocs < 8; i++) {
-            if (memcmp(pg + i, name, nl) != 0) continue;
-            if (pg[i + nl] != 0) continue;
-            candidates++;
-            uint64_t p = th_find_proc(pa + (uint64_t) i, &node);
-            if (!p) continue;
-            int dup = 0;
-            for (int k = 0; k < nprocs; k++) if (procs[k] == p) dup = 1;
-            if (dup) continue;
-            procs[nprocs++] = p;
-            proc_pa = p; pc = pa + (uint64_t) i;
+        for (int i = 0; i + 17 <= 4096 && g_pe_n < 64; ) {
+            uint8_t c = pg[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                  c == '.')) { i++; continue; }
+            int l = 0;
+            while (l < 16) {
+                uint8_t d = pg[i + l];
+                if (!((d >= 'a' && d <= 'z') || (d >= '0' && d <= '9') || d == '_' || d == '-' ||
+                      d == '.')) break;
+                l++;
+            }
+            if (l < 2 || pg[i + l] != 0) { i++; continue; }
+            uint64_t node = 0;
+            uint64_t pr = th_find_proc(pa + (uint64_t) i, &node);
+            if (pr) {
+                if (getenv("HV_PCOMM_OFF") && l >= 8 && g_pe_n < 12)
+                    fprintf(stderr, "hengevm: pcomm off 0x%llx (name %.*s)\n",
+                            (unsigned long long) ((pa + (uint64_t) i) - pr), l, pg + i);
+                int dup = 0;
+                for (int k = 0; k < g_pe_n; k++) if (g_pe[k].proc_pa == pr) dup = 1;
+                if (!dup) {
+                    g_pe[g_pe_n].proc_pa = pr;
+                    memcpy(g_pe[g_pe_n].comm, pg + i, l);
+                    g_pe[g_pe_n].comm[l] = 0;
+                    g_pe_n++;
+                }
+            }
+            i += l;
         }
     }
-    if (nprocs > 1)
-        fprintf(stderr, "hengevm: threads: %s has %d processes\n", name, nprocs);
-    if (!proc_pa) {
-        fprintf(stderr, "hengevm: threads: %s no proc (candidates %d, walk self-test pc %llx -> %llx,"
-                        " ttbr1 %llx)\n", name, candidates,
-                (unsigned long long) g_cpus[0].pc,
-                (unsigned long long) th_walk(g_cpus[0].pc),
-                (unsigned long long) g_cpus[0].ttbr1_el1);
-        return;
-    }
+}
+
+/* (task VA, threads head VA) of a process, or 0. */
+static uint64_t th_proc_task(uint64_t proc_pa, uint64_t *head) {
     uint64_t ro_pa = th_walk(th_pa64(proc_pa + 0x18, NULL));
-    if (!ro_pa) { fprintf(stderr, "hengevm: threads: %s ro missing\n", name); return; }
+    if (!ro_pa) return 0;
     uint64_t task = th_pa64(ro_pa + 8, NULL);
     uint64_t tpa = th_walk(task);
-    if (!tpa) { fprintf(stderr, "hengevm: threads: %s task %llx not walkable\n", name,
-                             (unsigned long long) task); return; }
-    uint64_t head = th_pa64(tpa + 0x50, NULL);
-    fprintf(stderr, "hengevm: threads: %s proc_pa %llx task %llx head %llx\n", name,
-            (unsigned long long) proc_pa, (unsigned long long) task, (unsigned long long) head);
+    if (!tpa) return 0;
+    if (head) *head = th_pa64(tpa + 0x50, NULL);
+    return task;
+}
+
+static void th_build_map(void) {
+    g_tm_n = 0;
+    for (int k = 0; k < g_pe_n; k++) {
+        uint64_t head = 0;
+        if (!th_proc_task(g_pe[k].proc_pa, &head) || !head) continue;
+        uint64_t cur = head;
+        for (int n = 0; n < 32; n++) {
+            if (!cur || !th_kaddr(cur)) break;
+            if (g_tm_n < 256) {
+                g_tm[g_tm_n].th = cur;
+                snprintf(g_tm[g_tm_n].comm, sizeof g_tm[g_tm_n].comm, "%s", g_pe[k].comm);
+                g_tm_n++;
+            }
+            uint64_t tp = th_walk(cur);
+            if (!tp) break;
+            uint64_t next = th_pa64(tp, NULL);
+            if (next == head) break;
+            cur = next;
+        }
+    }
+}
+
+static void th_dump_turnstile(uint64_t ts, int depth) {
+    if (!ts) return;
+    uint64_t tpa = th_walk(ts);
+    if (!tpa) { fprintf(stderr, "hengevm:       turnstile %llx (not walkable)\n",
+                        (unsigned long long) ts); return; }
+    fprintf(stderr, "hengevm:       turnstile %llx pa %llx:", (unsigned long long) ts,
+            (unsigned long long) tpa);
+    const char *owner = NULL;
+    for (uint64_t off = 0x300; off < 0x3c0; off += 8) {
+        uint64_t v = th_pa64(tpa + off, NULL);
+        if (!th_kaddr(v)) continue;
+        fprintf(stderr, " +0x%llx=%llx", (unsigned long long) off, (unsigned long long) v);
+        const char *c = th_comm_of(v);
+        if (c) { fprintf(stderr, "(%s)", c); if (!owner) owner = c; }
+    }
+    fprintf(stderr, "\n");
+    if (getenv("HV_TS_FULL")) {
+        for (uint64_t off = 0x300; off < 0x400; off += 8) {
+            uint64_t v = th_pa64(tpa + off, NULL);
+            fprintf(stderr, "hengevm:         ts+0x%llx = %llx%s\n", (unsigned long long) off,
+                    (unsigned long long) v, th_kaddr(v) ? "  (kptr)" : "");
+        }
+        for (uint64_t off = 0; off < 0x40; off += 8) {
+            uint64_t v = th_pa64(tpa + off, NULL);
+            fprintf(stderr, "hengevm:         ts+0x%02llx = %llx%s\n", (unsigned long long) off,
+                    (unsigned long long) v, th_kaddr(v) ? "  (kptr)" : "");
+        }
+    }
+    /* One level up: if the owner is itself blocked on a turnstile, that is the next link. */
+    if (depth <= 0) return;
+    for (uint64_t off = 0x300; off < 0x3c0; off += 8) {
+        uint64_t v = th_pa64(tpa + off, NULL);
+        if (!th_kaddr(v) || !th_comm_of(v)) continue;
+        uint64_t vp = th_walk(v);
+        if (!vp) continue;
+        uint64_t st = th_pa64(vp + 0x1c8, NULL) & 0xffffffffull;
+        uint64_t ts2 = th_pa64(vp + 0x28, NULL);
+        if (!ts2) continue;
+        fprintf(stderr, "hengevm:       owner %llx (%s) state 0x%llx waits on:\n",
+                (unsigned long long) v, th_comm_of(v), (unsigned long long) st);
+        th_dump_turnstile(ts2, depth - 1);
+    }
+}
+
+/* Where a blocked thread is, without knowing where kernel_stack sits inside struct thread: a
+   blocked thread still has its call chain on its 16 KiB stack, and a stack pointer is page
+   aligned, so any page-aligned kernel pointer inside struct thread is a candidate stack top.
+   Kernel text return addresses found on it name the functions it is waiting in.
+   Algorithm from tools/dump-stacks.py. */
+#define KSSIZE 0x4000u
+static void th_dump_stack(uint64_t tva) {
+    uint64_t tp = th_walk(tva);
+    if (!tp) return;
+    for (uint64_t off = 0; off < 0x1800; off += 8) {
+        uint64_t v = th_pa64(tp + off, NULL);
+        if (!th_kaddr(v) || (v & 0xfff)) continue;
+        for (int which = 0; which < 2; which++) {
+            uint64_t base = which ? v : v - KSSIZE;
+            uint64_t bp = th_walk(base);
+            if (!bp) continue;
+            static uint8_t buf[KSSIZE];
+            if (hv_phys_read(&g_machine, bp, buf, KSSIZE) != 0) continue;
+            int hits = 0;
+            for (uint32_t j = 0; j < KSSIZE; j += 8) {
+                uint64_t w;
+                memcpy(&w, buf + j, 8);
+                if (w < 0xfffffe0010000000ull || w >= 0xfffffe0040000000ull) continue;
+                if (!hits)
+                    fprintf(stderr, "hengevm:   stack th %llx base %llx text pcs:",
+                            (unsigned long long) tva, (unsigned long long) base);
+                if (hits++ < 14) fprintf(stderr, " %llx", (unsigned long long) w);
+            }
+            if (hits) { fprintf(stderr, "\n"); return; }
+        }
+    }
+}
+
+static void th_dump_one(int idx) {
+    uint64_t head = 0;
+    uint64_t task = th_proc_task(g_pe[idx].proc_pa, &head);
+    fprintf(stderr, "hengevm: proc %-16s pa %llx task %llx head %llx\n", g_pe[idx].comm,
+            (unsigned long long) g_pe[idx].proc_pa, (unsigned long long) task,
+            (unsigned long long) head);
+    if (!task || !head) return;
     uint64_t cur = head;
-    for (int n = 0; n < 24 && cur && th_kaddr(cur); n++) {
+    for (int n = 0; n < 32; n++) {
+        if (!cur || !th_kaddr(cur)) break;
         uint64_t tp = th_walk(cur);
         if (!tp) break;
         uint64_t next = th_pa64(tp, NULL);
@@ -1021,21 +1136,22 @@ static void th_dump_proc(const char *name) {
         uint64_t st = th_pa64(tp + 0x1c8, NULL) & 0xffffffffull;
         const char *tag = "";
         for (int c = 0; c < g_board.ncpus; c++)
-            if (g_cpus[c].tpidr_el1 == cur) tag = " (current on this cpu)";
-        fprintf(stderr, "hengevm:   th %llx state 0x%llx wait_event %llx turnstile %llx%s\n",
+            if (g_cpus[c].tpidr_el1 == cur) tag = " (running here)";
+        fprintf(stderr, "hengevm:   th %llx state 0x%llx wait_event %llx%s\n",
                 (unsigned long long) cur, (unsigned long long) st,
-                (unsigned long long) we, (unsigned long long) ts, tag);
-        th_dump_turnstile(ts);
+                (unsigned long long) we, tag);
+        if (getenv("HV_TH_STACK")) th_dump_stack(cur);
+        th_dump_turnstile(ts, 2);
         if (next == head) break;
         cur = next;
     }
-    (void) known_names;
 }
 
 void hv_threads_dump(void) {
-    static const char *const names[] = {"launchd", "restored_externa", "loginsupport",
-                                        "mobile_restore"};
-    for (int i = 0; i < (int) (sizeof names / sizeof names[0]); i++) th_dump_proc(names[i]);
+    th_scan_all();
+    th_build_map();
+    fprintf(stderr, "hengevm: threads: %d processes, %d threads mapped\n", g_pe_n, g_tm_n);
+    for (int i = 0; i < g_pe_n; i++) th_dump_one(i);
     for (int c = 0; c < g_board.ncpus; c++)
         fprintf(stderr, "hengevm: cpu%d pc %llx tpidr_el1 %llx el%u\n", c,
                 (unsigned long long) g_cpus[c].pc, (unsigned long long) g_cpus[c].tpidr_el1,
