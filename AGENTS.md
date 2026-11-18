@@ -294,6 +294,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 | `docs/semantic-deviations.md` | 与上游的语义等效性审计（E/X/D/U 四级） |
 | `docs/upstream-restore-semantics-2026-11-19.md` | **恢复模式的苹果语义（VZMacOSInstaller）+ 我们相对上游的差异清单**（T/V/H 三类，E/X/D/U 分级） |
 | `docs/jit-core-diff-2026-11-19.md` | **JIT 与核心模块的上游写法 + 逐文件差异**。判"上游错"需过两关：机制是架构级的，且能解释上游产品为什么能正常运行；否则记 U（"我们的环境需要"） |
+| `docs/exclusions-current-stall-2026-11-19.md` | **当前卡点的排除清单**（41 项已排除、4 项前提已变、4 项未定），排障前先看这张表，避免重走 |
 | `docs/android-install-debug.md` | Android 安装链路调试（设备端） |
 | `docs/android-install-status.md` | 安装现状 |
 | `docs/android-ui-plan.md` / `android-ui-design.md` | UI 结构与主题 |
