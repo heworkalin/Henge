@@ -1106,6 +1106,13 @@ static void th_dump_turnstile(uint64_t ts, int depth) {
         }
     }
     fprintf(stderr, "\n");
+    /* Arm on any turnstile, not just an unowned one: a normal unlock that does wake its waiter
+       shows the pattern the broken one is missing, and the pc/x30 of each write names the code. */
+    if (getenv("HV_TS_WATCH") && !g_machine.watch_pa) {
+        g_machine.watch_pa = tpa + 0x50;
+        fprintf(stderr, "hengevm: watch armed on turnstile %llx +0x50 (pa %llx)\n",
+                (unsigned long long) ts, (unsigned long long) (tpa + 0x50));
+    }
     {
         /* ts_proprietor: 0 means the lock has no owner, so whoever is waiting on it cannot be
            woken by the owner -- a lost wakeup. Non-zero: follow the owner one level, because an
@@ -1114,6 +1121,10 @@ static void th_dump_turnstile(uint64_t ts, int depth) {
         if (!prop || !th_kaddr(prop)) {
             fprintf(stderr, "hengevm:       proprietor NONE (unowned lock)\n");
             if (getenv("HV_TS_REF")) th_find_refs(ts);
+            /* Arm the write watch on this turnstile's proprietor: the next unlock that clears it
+               prints the writing pc and its caller, which is what says whether the wakeup path ran
+               from the same place. */
+
         } else {
             uint64_t pp = th_walk(prop);
             if (!pp) {

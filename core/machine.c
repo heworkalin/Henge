@@ -640,6 +640,30 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
                     (unsigned long long)m->watch_pa, (unsigned long long)v, len, (unsigned long long)pa,
                     (unsigned long long)m->access_pc, lr);
         }
+        /* Debug-only: catch every change to a turnstile's ts_proprietor as it happens, instead of
+           arming a watch on an address discovered after the fact (the interesting write is the
+           one that happened before the machine went idle, and it is never repeated). A candidate
+           is a store where pa-0x48 holds a kernel thread pointer, i.e. pa is ts+0x50 in the
+           layout waitq(40) free(16) inheritor_queue(8) inheritor_links(8) htable(8).
+           Requires HV_SLOW_MEM=1, because the JIT writes guest memory directly otherwise. */
+        {
+            static int ts_trace = -1;
+            if (ts_trace < 0) ts_trace = getenv("HV_TS_TRACE") ? 1 : 2;
+        if (ts_trace == 1 && len >= 8 && pa >= 0x84200000ull && pa < 0x84400000ull) {
+            uint64_t probe = 0, oldv = 0, newv = 0;
+            if (hv_phys_read(m, pa - 0x48, &probe, 8) == 0 &&
+                ((probe >> 56) == 0xff || (probe >> 56) == 0xfe)) {
+                memcpy(&oldv, r->host + off, 8);
+                memcpy(&newv, buf, 8);
+                /* Only the transition that matters: an owner thread pointer being cleared. */
+                if (((oldv >> 56) == 0xff || (oldv >> 56) == 0xfe) && newv == 0 && oldv != newv)
+                    fprintf(stderr, "hengevm: ts-trace ts %llx +0x50: %llx -> %llx pc %llx lr %llx\n",
+                            (unsigned long long) (pa - 0x50), (unsigned long long) oldv,
+                            (unsigned long long) newv, (unsigned long long) m->access_pc,
+                            (unsigned long long) (m->ncpus > 0 && m->cpus ? m->cpus[0]->x[30] : 0));
+            }
+        }
+        }
         memcpy(r->host + off, buf, len);
         return 0;
     }

@@ -219,6 +219,32 @@ hypervisor 让这两个 HVC 返回"成功"但实际不 halt，XNU 不会报错�
 park 过并收到 kick。**Henge 目前不会踩这个坑**（返回 -1），但任何改动 `HENGE_OEM` 默认值
 或返回值的工作都必须先看这一点。
 
+## 4.8 试过的下一条路：监视 ts_proprietor 的写入（以及为什么不够）
+
+思路：解锁把 `ts_proprietor` 写 0 的那条指令就是分叉点，抓到它就能看之后有没有进
+`turnstile_wakeup`。
+
+两件事必须知道：
+
+1. **`HV_WATCH_PA` 看不见 JIT 的写。** 翻译后的块直接写 guest 内存，不走
+   `hv_phys_write` 那条 C 路径（这也是 `HV_PTW_LOG` 需要 `HV_SLOW_MEM=1` 才看得到 JIT
+   写的原因）。所以必须先开 `HV_SLOW_MEM=1`。
+2. **开到 `HV_SLOW_MEM=1` 之后，170 秒还到不了稳态**，而"布防地址"必须先到稳态、
+   从 `HV_THREADS` 拿到 turnstile 地址才能设置。于是出现矛盾：
+   - 不 slow：能到稳态，但看不到写；
+   - slow：看得到写，但到不了稳态。
+   而且稳态本身**没有新的锁操作**（布防后 40 s 内 0 次写入）——丢失唤醒是**稳态之前
+   一次性发生、之后不再重演**的事件。
+
+用 `HV_TS_TRACE=1`（在 `hv_phys_write` 里检测 "`pa-0x48` 是内核指针且旧值是线程指针、
+新值是 0"）确实抓到了 unlock 写入，`pc` 集中在 `0x1d019588` / `0x1cfccf28` /
+`0x1c9636c8` / `0x1c890dbc` 等处。但**这个判据误报很多**：真正的 turnstile 在
+`0x84235xxx`，而统计里出现的是 `0x8432exxx`（同一地址被写十几万次），说明那是别的结构。
+
+**结论**：要缩小到真 turnstile，判据必须自洽验证 —— 取 `ts+0x08` 指向的线程，再读它的
+`+0x28`，要求指回同一个 turnstile（`thread->turnstile == ts`）。这需要 op 一次
+`hv_mmu_walk`，只能对**首次出现**的 `(ts, oldv)` 组合做（缓存），否则百万级 walk 太慢。
+
 ## 5. 下一步
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该
