@@ -346,7 +346,7 @@ Android 路径：`memfd_create` + 两次 `MAP_SHARED` 映射（`R-X` / `R-W`）�
 |---|---|---|
 | U-10 | helper/thunk 是否必须保存 `v0-v31` | 只能证明"我们的构建需要"；iOS 上游同一份源码长期正常 |
 | U-11 | `kernel_fixups` 默认为关 | 只在 24G90 上对照过"开/关行为一致"，其他固件未验证 |
-| U-12 | `hv_el0_note` 每块两次 store 的时序影响 | 数据量小，但没有做过"开/关"的对照跑 |
+| U-12 | `hv_el0_note` 每个 EL0 块约 17 次 store 的时序影响 | 13 个寄存器快照 + 2 个环 + 计数（代码注释 "Five stores" 已过时）；没有"开/关"对照跑，无法判断对恢复时序的影响 |
 | U-13 | Android memfd 双映射在真机 SELinux 域下的可用性 | 运行期探测并记录，但没有覆盖所有 App 目标 SDK/SELinux 域 |
 
 ---
@@ -366,3 +366,251 @@ guest 的 SIMD 寄存器与宿主共用，`x28` 固定指向 `HvCpu`。我们**�
 > 判定纪律：**iOS 与 Android 不一样，差异不等于上游 bug。**
 > 而且**上游是已发布、能正常运行的产品**——所以判"上游错"必须同时解释它为什么能跑。
 > 只有架构语义**加上**这个解释（或在对应平台上复现），才能把差异升级为 D。
+
+---
+
+# 5. 当前代码的完整 JIT 路径（端到端，不是 diff）
+
+本节按**我们改动后的代码**重走一遍：从宿主进入 `hv_run` 到块执行、helper 调用、退出。
+目的是把"改了哪里"放回完整上下文里，而不是对着一堆 diff 猜。
+
+## 5.1 进入执行
+
+```
+hv_run(cpu)                              core/dispatch.c
+  hv_big_lock(m)                         拿机器大锁（多 CPU 串行进入）
+  hv_fp_enter(cpu)                       把 HvCpu.FPCR/FPSR 装进宿主寄存器
+  r = run_loop(cpu, 0)
+  hv_fp_leave(cpu)                       FPCR/FPSR 写回
+  hv_big_unlock(m)
+```
+
+`run_loop` 每一轮（`core/dispatch.c:1346` 起）：
+
+```
+for (;;) {
+    if (m->stop) return HALT;                       ← 我们新增（D-6）
+    if (flush_pending || stw_active) { stop_the_world(); continue; }
+    hv_cpu_process_requests(cpu)
+    if (halted) return;  if (off) { wait_while_off(); continue; }
+    kicked = exchange(cpu->exit_req, 0)             ← 1 ms kicker / 设备中断
+    if (kicked) { cpu->excl_addr = ~0; hv_big_yield(m); }
+    if (tick && (kicked || 每 64 块 || 定时器到期)) tick(m, cpu)
+    why = ...; hv_check_interrupts(cpu)
+    if (cpu->pc == stop_pc) { stop_hook; pending_chain = NULL; }
+
+    code = hv_mmu_fetch(cpu, cpu->pc, &pa, &avail)   ← 取 guest 指令；失败=已取 abort
+    b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail)
+    ...
+    if (pending_chain && b->va == chain_pc && b->flags == chain_flags) chain(m, pending_chain, b);
+    hv_el0_note(cpu)                                 ← 我们新增（EL0 记录，见 §5.7 注）
+    ... (log>=2 的诊断)
+    hv_enter(cpu, b->code)                           ← 进入翻译代码
+    ... (退出分类；可链则记 pending_chain)
+}
+```
+
+## 5.2 lookup：块缓存与翻译
+
+```
+lookup(va, pa, flags, code, avail):
+  ① 每 CPU 的直接缓存 jc[]（va 命中且 pa/flags/gen 一致）→ 直接返回
+  ② 全局 hash find()
+  ③ 未命中：
+     - 若该页第一次当代码：置 ram->code_pages[pg]=1，并给所有 CPU 的 TLB
+       hv_tlb_protect_code_page()（之后对该页的写走慢路径，能发现自修改）
+     - hv_translate_emit(m, &nb, code, avail)       ← 在**本线程的静态 Emit E** 里生成
+     - hv_translate_place(m, &nb)                   ← 回填分支、写进 JIT 区域
+     - 加 tr_mu 锁发布到 hash；若别的 CPU 抢先做了，丢弃自己的
+```
+
+`hv_translate_emit`（`core/translate.c:2077`）做的第一件事（我们加的）是
+`put_trace_entry(e, b->va)`（仅 `log>=2` 时生成指令），随后逐条 `translate_one()`。
+
+## 5.3 hv_enter：宿主与 guest 的寄存器交接
+
+`host/enter.S:154`：
+
+```
+hv_enter(cpu, block):
+    stp x29,x30 / x19-x28 / d8-d15 (低 64 位) → 宿主栈      ← 宿主 callee-saved 只保这些
+    mov x28, x0                                            ← HvCpu *
+    LOAD_FLAGS_FP                                          ← 恢复 guest q0-q31 + NZCV
+    LOAD_X1_X30                                            ← 恢复 guest x1..x30
+    ldr x15, [sp, #160]                                    ← 块入口地址
+    mov x0, sp; str x0, [x28, #CPU_HOST_SP]                ← 存宿主 SP
+    ldr x0, [x28, #CPU_SP]; mov sp, x0                     ← 换成 guest SP
+    ldr x0, [x28, #0]                                      ← guest x0
+    isb
+    br x15
+```
+
+寄存器归属（当前代码）：
+
+| 宿主 | 内容 |
+|---|---|
+| `x28` | `HvCpu *`（永不外借） |
+| `x18` | 平台保留（Darwin thread state / Android SCS），**永不分配** |
+| `x6`、`x7`、`x15` | 纯 scratch，**永不分配**（guest x6/x7/x15 住 slot） |
+| `x16`、`x17` | **我们不再分配给 guest**（D-1）：`SAVE_X2_X29` 按编号把它们存进 guest x16/x17 的槽，所以宿主 x16/x17 必须一直就是 guest x16/x17 |
+| 其余（`candidates` 顺序） | 分配给被选中的 guest 寄存器；未选中的住 `HvCpu.X[reg]` |
+
+## 5.4 块内：一条 load/store 的完整路径
+
+`translate_mem()`（`core/translate.c:1063`）为每条访问生成：
+
+```
+1. 选 scratch: A = s[0], T = s[1], U = s[2]（pick + spill）
+2. 算有效地址到 A（立即数/寄存器偏移/字面量/写回形式）
+3. TLB 检查（用 T/U，不碰条件标志）：
+     LDR  U, [T, #tag_off]          ← 表项的 tag（物理页号基址，已调整）
+     SUB  U, addr, U
+     UBFM U, U, #14, #63            ← 取页号，非本页则为非零
+     CBNZ U -> cold 慢路径
+4. 命中：直接生成宿主 LDR/STR（addend 从表项 +24 取）
+5. 未命中：cold 里的 OOL_SLOW，blr 到 hv_helper_thunk（op word 带 rflags/retry）
+```
+
+- **组**（`role 1/2`）：同一基址的连续访问只检查一次 TLB，addend 存
+  `cpu->gaddend[slot]`；检查失败整组退回逐条翻译（`emit_group_copies`）。
+- **写回形式 / RMW / 原子 / 向量**：不走 refill，直接进 helper（`can_refill` 为假）。
+
+## 5.5 helper 调用：两层保存（我们的改动所在）
+
+翻译代码这一侧（`put_helper()`，`core/translate.c:558`）：
+
+```
+str x30, [x28, X30]                  ← 保存 guest x30
+STP_Q q0,q1 … q30,q31 → HvCpu.V      ← 【我们加的】保存全部 guest 向量寄存器
+ldr x15, [x28, HELPER_THUNK]
+adr x6, <HvHelperInfo 在 pool 里>
+blr x15
+ldr x0, [x28]                        ← resume 点（put_helper 返回它的下标，供 refill 重试）
+LDP_Q q0,q1 … q30,q31 ← HvCpu.V      ← 【我们加的】恢复
+```
+
+thunk 这一侧（`host/enter.S`）：
+
+```
+_hv_helper_thunk:
+    ldr w15, [x6, #12]; ubfx w15, w15, #8, #11     ← op 里有没有 refill 标志
+    cbz w15, 3f                                     ← 没有：直接去 helper_entry
+
+    （有 refill）
+    str x30 → CPU_REFILL_RET; str x6 → spill[3]
+    stp x0,x1 / x2,x3 / x4,x5 / x8,x9 / x10,x11 / x12,x13
+    str x14; stp x16,x17                             ← 按编号保存
+    mrs nzcv → CPU_NZCV; sp → CPU_SP; sp = CPU_HOST_SP
+    SAVE_FLAGS_FP                                    ← 【我们加的】保存 q0-q31
+    bl _hv_tlb_refill
+    恢复 x0-x5,x8-x14,x16,x17,x30,x6
+    LOAD_FLAGS_FP                                    ← 【我们加的】恢复 q0-q31
+    if (x7 == 0) ret 到 retry 点（重跑原访问）
+3:  stp x0,x1 → HvCpu; b _hv_helper_entry
+```
+
+`_hv_helper_entry`：
+
+```
+str x30 → CPU_HELPER_RET / CPU_HELPER_FROM
+SAVE_X2_X29                                    ← 含 x16/x17，按编号进 guest 槽
+sp → CPU_SP; sp = CPU_HOST_SP
+SAVE_FLAGS_FP                                  ← 【我们加的】
+bl _hv_helper (C)
+if (返回非 0) 回宿主（Lrestore_host）
+LOAD_FLAGS_FP / LOAD_X1_X30 / 换回 guest sp
+ret 到 CPU_HELPER_RET（或下一块起点）
+```
+
+**结论（重新推理）**：`put_helper` 与 thunk 各存一次 q0-q31 是**冗余但正确**的：
+
+- `put_helper` 的保存覆盖"helper 调用"这段；
+- thunk 的保存覆盖 `hv_tlb_refill` 这段；
+- `_hv_ijc_thunk` / `_hv_xjump_thunk` **没有** `put_helper` 外层，所以必须靠 thunk 自己保存；
+- `_hv_chain_thunk` 不调用 C（只查 slot），不需要保存。
+
+代价是每次 helper 调用多两次 512 字节的 STP/LDP；语义上没有问题。
+
+## 5.6 退出与链接
+
+```
+块末尾（put_exit / put_branch_exit）：
+    str pc → HvCpu.PC
+    ldr x1, [x28, #CPU_EXIT]; br x1          ← 回到 hv_exit
+
+hv_exit:
+    guest sp → CPU_SP; 换回宿主 sp
+    SAVE_X2_X29; str x30; SAVE_FLAGS_FP
+    恢复宿主 d8-d15 / x19-x28 / x29,x30; ret  → 回到 run_loop
+```
+
+- **可链退出**：`put_branch_exit` 把 slot 地址留在 `CPU_LAST_STUB`，
+  `run_loop` 记 `pending_chain`；下一个块正是目标时 `chain()` 回填（`hv_translate_place`
+  里也会对同页已有块做早期链接）。`slots == NULL` 时我们拒绝链接并打印（T-2）。
+- **间接跳转**：`_hv_ijc_thunk` → `hv_ijc_resolve`（C），命中则 `ret` 进块。
+- **跨页直接跳转**：`_hv_xjump_thunk` 先查 IJC 表（18 位，两路），未命中再 resolve。
+- **superblock**：`go_on()` 允许跨条件分支继续翻译（同页且 `cur_i+1 < 48`）；
+  我们加了 `nosuper_va()`（`HV_NOSUPERBLOCK_VA`）按范围关掉。
+
+## 5.7 我们改动在这条路径上的准确位置
+
+| 路径位置 | 改动 | 影响 |
+|---|---|---|
+| `hv_translate_emit` 开头 | `put_trace_entry` | 仅 `log>=2` 生成指令；默认无影响 |
+| `go_on`/`superblocks` | `nosuper_va` | 默认关；调试用 |
+| `pick`/`candidates` | 去掉 16/17 | 块内不再把 guest 寄存器放进宿主 x16/x17 |
+| `put_strip` | `BFM #16,#14` | AUT/XPAC 后 16 位签名字段清零 |
+| `translate_mem` | 无 | 快慢路径与上游一致 |
+| `put_helper` | 保存/恢复 q0-q31 | helper 调用期间 guest 向量寄存器不变 |
+| `_hv_helper_thunk`（refill 分支） | `SAVE/LOAD_FLAGS_FP` | `hv_tlb_refill` 期间同上 |
+| `_hv_ijc_thunk` / `_hv_xjump_thunk` | `SAVE/LOAD_FLAGS_FP` | `hv_ijc_resolve` 期间同上 |
+| `_hv_chain_thunk` | 无 | 不调 C，不需要 |
+| `hv_enter` / `hv_exit` | 无（上游已有 Q 保存） | — |
+| `run_loop` | `m->stop` 检查、`hv_el0_note`、诊断 | 每块 1 次原子读；每个 **EL0** 块约 17 次 store（见下） |
+| `lookup` | 无（只加计时变量） | — |
+| `hv_translate_place` 前的 `slots` 检查 | 拒绝链接并打印 | 防空指针；正常路径不变 |
+| `hv_run` | 计时包装（`HV_BLOCKTIME`） | 默认关 |
+| `enter.S` 符号 | `.hidden` | 取地址成为链接期常量，不走 GOT |
+| `jit_region` | Android memfd 双映射 | 区域分配方式；guest 不可见 |
+| `exception.c` | OEM HVC（WFK/KICK/MABS/UUID） | 上游走降级；我们实现 |
+| `dispatch.c` | `kernel_fixups` / `random-seed` | 默认关 |
+
+### 5.7.1 一个需要如实记录的细节：`hv_el0_note` 并不便宜
+
+`core/dispatch.c:2691` 的 `hv_el0_note()` 只对 `el == 0` 生效，但每个**用户态块**都做：
+
+```
+可选 1 次：把 x0 写进 hv_svc_ret[]（上一个 syscall 的返回值）
+2 次：hv_last_el0_va / hv_last_el0_ttbr0
+每页一次（不是每块）：hv_mmu_walk 解析该页的 PA
+13 次：x0 x22 x23 x19 x20 x21 lr sp x16 x1 x2 x3 x8
+2 次：hv_el0_trace_va[] / hv_el0_trace_x16[]（16K 环）
+1 次：hv_el0_trace_n++
+```
+
+合计约 **17 次 store + 1 次原子/页判断**（页面不变时不做 walk）。
+
+注意代码里的注释仍写着 *"Five stores."*，那是在只存 5 个寄存器时写的，后来陆续加到 13 个，
+注释没有跟着改。**实现以代码为准，注释已过时** —— 这也是"完整上下文"能发现、
+单看 diff 容易漏掉的东西。
+
+`hv_el0_note` 在 `m->log` 的任何取值下都会执行（不像 `hv_pc_hist_note` 那样要求 `log>=2`）。
+它的成本是有意的（换来"用户态最后停在哪"这一信息），但确实不是零成本；
+如果要评估它对时序的影响，应做"开/关"对照（当前未做，见 U-12）。
+
+## 5.8 现在能确定什么、不能确定什么
+
+**能确定（代码事实）**：
+
+1. 完整的进入/翻译/helper/退出路径如 §5.1–5.6，每一步都能在源码里指出行号；
+2. 我们的改动集中在**向量寄存器保存**（put_helper + 三个 thunk）、**寄存器候选集**、
+   **PAC strip**、**链接保护**、**`.hidden`**，外加一组默认关闭的诊断/开关；
+3. `put_helper` 与 thunk 的双重 Q 保存是冗余但正确的。
+
+**不能确定（且当前无法验证）**：
+
+1. 上游在 iOS 上为什么不触发同一问题 —— 没有苹果设备，**不猜**；
+2. `.hidden` 是否是 x16 污染的唯一来源 —— 需要对照运行才能确认，**不猜**。
+
+> 结论：本节只陈述**当前代码怎么走**。凡涉及"上游行为"的部分，一律留空，
+> 不用推理填补。
