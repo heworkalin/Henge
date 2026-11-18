@@ -259,6 +259,11 @@ L5 用户态卡死     🔍 当前  缺页 → 未建立映射 → 再缺页 →
 **复盘（走对的/偏路/错判/错误介入）与"Apple 时间洁癖"的实测证据**见
 `docs/retrospective-2026-11-19.md`。
 
+**给 guest 加 boot-args 只有一条正确路径**（`HV_EXTRA_BOOT_ARGS`，追加到 boot_args 结构）。
+`HV_RESTORE_BOOT_ARGS` 会拼进 iBoot 的 `setenvnp boot-args` 命令，命令一变长 iBoot 就不进恢复模式、
+boot_args 结构整页不写（rev 0 ver 0，dt length 0），内核因此拿不到任何 boot-args。
+实测对照见 `docs/boot-args-injection-2026-11-19.md`。
+
 **已经排除掉的东西**（43 项，按缺页/锁/设备/时钟/用户态/JIT 分类）见
 `docs/exclusions-current-stall-2026-11-19.md`。排障前先看它，不要重走。
 

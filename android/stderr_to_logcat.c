@@ -33,7 +33,13 @@
  */
 static char g_path[512];
 static FILE *g_file;
-static int g_rate = 120;          /* lines a second to logcat unless raised */
+/* The guest's own console (PL011) gets its own file: it is the only place the kernel and the
+   restore system speak in sentences, and mixed into the engine's line-by-line diagnostics it is
+   impossible to read. Written unbuffered-per-batch from the same reader, so order is preserved. */
+static const char SERIAL_PREFIX[] = "hengevm: serial: ";
+static char g_serial_path[512];
+static FILE *g_serial;
+static int g_rate = 600;          /* lines a second to logcat unless raised (HENGE_LOG_RATE) */
 static unsigned g_window_second;
 static int g_window_count;
 static unsigned long g_dropped;
@@ -42,6 +48,13 @@ void hv_log_set_file(const char *path) {
     if (!path) return;
     snprintf(g_path, sizeof g_path, "%s", path);
     if (!g_file) g_file = fopen(g_path, "a");
+    /* Same directory, same stem: .../henge.log -> .../henge-serial.log */
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    const char *dot = strrchr(base, '.');
+    size_t stem = dot ? (size_t)(dot - path) : strlen(path);
+    snprintf(g_serial_path, sizeof g_serial_path, "%.*s-serial.log", (int) stem, path);
+    if (!g_serial) g_serial = fopen(g_serial_path, "a");
 }
 
 /* Lines that always survive the limiter: a restore that fails says so in one of these. */
@@ -79,6 +92,13 @@ static void *reader(void *arg) {
                         fputc('\n', g_file);
                         static int since_flush;
                         if (++since_flush >= 64) { since_flush = 0; fflush(g_file); }
+                    }
+                    /* The guest's console, kept apart and never rate-limited. */
+                    if (g_serial && strncmp(line, SERIAL_PREFIX, sizeof SERIAL_PREFIX - 1) == 0) {
+                        fputs(line, g_serial);
+                        fputc('\n', g_serial);
+                        static int since_serial_flush;
+                        if (++since_serial_flush >= 16) { since_serial_flush = 0; fflush(g_serial); }
                     }
                     /* A sample to logcat, plus anything that reads like a milestone. */
                     unsigned sec = (unsigned) time(NULL);

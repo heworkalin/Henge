@@ -212,6 +212,17 @@ int hv_android_install_start(const char *rom, const char *disk, const char *aux,
         return -1;
     }
     if (cache_dir && *cache_dir) setenv("XDG_CACHE_HOME", cache_dir, 1);
+    /* The same two arguments the CLI is run with. A console app inherits them from its shell;
+       an app has no shell, so they are set here, and only when the caller has not set them
+       (overwrite = 0: an environment that names its own arguments still wins).
+         serial=3  - switch the guest's console to the UART
+         debug=0xA - DB_PRT (0x2) + DB_KPRT (0x8), which lifts disable_serial_output; without it
+                     the kernel still discards every kprintf after choosing the serial console.
+       This is the pair the CLI run reached ASR with. HV_RESTORE_BOOT_ARGS is deliberately left
+       alone: it is spliced into iBoot's own setenv commands, which is a different thing from
+       appending to the boot_args structure this engine hands the kernel. */
+    if (!getenv("HV_EXTRA_BOOT_ARGS"))
+        setenv("HV_EXTRA_BOOT_ARGS", "serial=3 debug=0xA", 0);
 
 
     // One machine per process, and the graphics device says so: reims-vgpu refuses to create a

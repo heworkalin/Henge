@@ -42,7 +42,12 @@ public class MainActivity extends Activity {
         Theme.apply(this);
         // 引擎输出统一落文件，logcat 只拿限速样本：一次启动的日志量远超 logcat 配额。
         try {
-            java.io.File dir = new java.io.File(getFilesDir(), "vm");
+            // External storage first: the full engine log is GB-sized and this is the only copy
+            // adb can pull on devices where run-as is refused. Internal storage stays the fallback.
+            // External first: the full engine log is GB-sized and this is the only copy adb can
+            // pull on devices where run-as is refused. Internal storage stays the fallback.
+            java.io.File base = getExternalFilesDir(null);
+            java.io.File dir = new java.io.File(base != null ? base : getFilesDir(), "vm");
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
             Native.nativeSetLogFile(new java.io.File(dir, "henge.log").getAbsolutePath());
