@@ -59,8 +59,13 @@ void hv_log_set_file(const char *path) {
 
 /* Lines that always survive the limiter: a restore that fails says so in one of these. */
 static int important(const char *line) {
-    static const char *const keys[] = {"panic", "error", "Error", "failed", "restore", "step",
-                                       "serial:", "halt", "exception", "Sending", "install"};
+    /* Milestones only. "serial:" and "exception" used to be here, and they fire hundreds of times
+       a second during a fault loop: every one of them bypassed the limiter, which made the logcat
+       calls the slowest part of this thread and backed the pipe up into the engine's own fprintf
+       (measured: the guest kept faulting while the console went silent for minutes). The file
+       still gets every line; this list is only about what is worth logcat's quota. */
+    static const char *const keys[] = {"panic", "error", "Error", "failed", "halt", "Sending",
+                                       "install", "ASR", "End of iBoot"};
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
         if (strstr(line, keys[i])) return 1;
     return 0;
@@ -146,6 +151,12 @@ int hv_android_capture_output(void) {
         if (r) { int v = atoi(r); if (v > 0) g_rate = v; }
     }
     if (pipe(g_pipe) != 0) return -1;
+#ifdef F_SETPIPE_SZ
+    /* Default is 64 KB. The engine writes from the CPU threads, so a reader that stalls (logcat,
+       a slow file) would otherwise block guest execution itself. Best effort: a refusal just
+       leaves the default. */
+    (void)!fcntl(g_pipe[1], F_SETPIPE_SZ, 1 << 20);
+#endif
     if (dup2(g_pipe[1], STDOUT_FILENO) < 0 || dup2(g_pipe[1], STDERR_FILENO) < 0) {
         close(g_pipe[0]);
         close(g_pipe[1]);

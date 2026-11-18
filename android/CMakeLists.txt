@@ -187,6 +187,7 @@ set(LZFSE_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lzfse/lzfse_fse.c
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lzfse/lzvn_decode_base.c)
 
+add_compile_options(-D_GNU_SOURCE -fno-stack-protector -U_FORTIFY_SOURCE -UNDEBUG)
 add_library(henge SHARED
     ${CORE_SRC}
     ${DEVICE_SRC}
@@ -211,12 +212,23 @@ set_target_properties(henge PROPERTIES
     C_VISIBILITY_PRESET hidden
 )
 
+# These mirror tools/build-install-android.sh, which builds the same engine into the CLI: the
+# body has to be one thing, with only the entry point differing. Anything added here that the CLI
+# does not pass is a difference that can show up as a behaviour difference during a bring-up, and
+# the CLI is the build that has been instrumented and measured. Add an option to both or neither.
+#
+# The NDK's CMake toolchain injects four options the CLI's direct clang invocation does not:
+#   -fstack-protector-strong   stack canaries change stack frames. AGENTS section 7 says guest code
+#                              paths must not carry them; the CLI has never had them.
+#   -DNDEBUG                   disables every assert() in the engine, i.e. a different program.
+#   -D_FORTIFY_SOURCE=2        rewrites memcpy/strcpy &c into checked variants.
+#   -O3                        (overridden by the -O2 below, listed for completeness)
+# and it does not inject _GNU_SOURCE, which the CLI passes. Undo the first three, add the last.
 target_compile_options(henge PRIVATE
     -O2
     -g
     -fPIC
     -fvisibility=hidden
-    -mbranch-protection=standard
     -Wall
     -Wextra
     -Wno-unused-parameter

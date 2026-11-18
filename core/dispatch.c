@@ -2015,7 +2015,10 @@ static int run_loop(HvCpu *cpu, int one) {
                         last_icount = cpu->icount;
                     }
                 }
-                hv_mmio_hist_dump(cpu->m);
+                /* Once a second is enough for a histogram that only changes when a driver
+                   does; at the default log level it was the largest single source of lines in a
+                   restore run (every register, every second, forever). */
+                if (cpu->m->log >= 3) hv_mmio_hist_dump(cpu->m);
                 if (cpu->index == 0) print_stats(cpu, 1);   /* the engine counts its own time; ask for it */
                 {
                     extern unsigned long long hv_hvc_count, hv_hvc_last_fn, hv_hvc_last_pc;

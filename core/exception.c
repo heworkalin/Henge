@@ -407,7 +407,11 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                 pend_valid[cpu->index] = 1;
             }
             for (int r = 0; r < 31; r++) hv_el0_flt_x[fi][r] = cpu->x[r];
-            if (cpu->m->log >= 1) {
+            /* One line per fault is too much: a userland bring-up takes tens of thousands of
+               them. The first 64 stay verbatim, then one in 4096, which keeps the shape of the
+               run readable. The fault ring keeps every entry regardless. */
+            static unsigned long long fault_lines;
+            if (cpu->m->log >= 1 && (fault_lines++ < 64 || (hv_el0_flt_n % 4096) == 0)) {
                 fprintf(stderr, "hengevm: el0 fault #%llu ec %llx pc %llx far %llx lr %llx sp %llx"
                                 " x0 %llx x1 %llx x8 %llx x19 %llx x20 %llx x21 %llx x22 %llx\n",
                         (unsigned long long) hv_el0_flt_n,
@@ -542,7 +546,9 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                             (unsigned long long) fw.table);
                 }
             }
-            if ((esr & 0x3c) == 0x0c && cpu->m->log >= 2) {
+            /* Same reasoning as the fault line above, and this one costs a page walk too. */
+            static int perm_shown;
+            if ((esr & 0x3c) == 0x0c && cpu->m->log >= 2 && perm_shown++ < 16) {
                 FILE *saved = hv_walk_dbg;
                 HvWalk fw;
                 hv_walk_dbg = stderr;
@@ -556,7 +562,12 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                the registers at the fault are the arguments the caller passed, and x30 says who
                the caller was -- which is the only thing that turns "somewhere a pointer went
                wrong" into a place to look. */
-            if ((w.fsc == 0 || (w.fsc & 0x3c) == 0x04) && cpu->m->log >= 2) {
+            /* Everything below -- the walk, the registers at the fault, the bytes before the
+               fault, the image headers -- is a bring-up diagnostic. Left uncapped it is the
+               largest block in the log (measured: 35k occurrences of "at the fault" in one
+               restore run). The first 32 are worth reading; after that the shape is known. */
+            static int fault_diag_shown;
+            if ((w.fsc == 0 || (w.fsc & 0x3c) == 0x04) && cpu->m->log >= 2 && fault_diag_shown++ < 32) {
                 /* The caller of the function that faulted: x30 is inside it, and [x29+8] is the
                    saved return address of its caller. Without it a fault inside a formatter says
                    nothing about who asked for the formatting. */
@@ -716,7 +727,11 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                  * header the fault is in how it is decoded; if it is shifted or absent, the fault is
                  * in the transfer — and the two need different fixes.
                  */
-                {
+                /* Scanning 64 MB of guest RAM per fault is the most expensive diagnostic in the
+                   engine (measured: 22,649 scans in one restore run), so it keeps a budget of
+                   its own, smaller than the block above. */
+                static int bvx2_shown;
+                if (bvx2_shown++ < 4) {
                     /*
                      * What the firmware is decoding. The ROM decompresses the iBSS it received, and
                      * the container is not necessarily IM4P: what matters is whether the stream
@@ -752,6 +767,9 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
                         fprintf(stderr, "\n");
                     }
                 }
+                /* One line per fault, tens of thousands of them in a bring-up run. */
+                static int atfault_shown;
+                if (atfault_shown++ < 32)
                 fprintf(stderr, "hengevm: at the fault: x0=%llx x1=%llx x2=%llx x3=%llx "
                                 "x4=%llx x5=%llx x6=%llx x7=%llx\n",
                         (unsigned long long) cpu->x[0], (unsigned long long) cpu->x[1],
