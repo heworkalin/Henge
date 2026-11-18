@@ -92,6 +92,155 @@ void hv_pstate_set(HvCpu *cpu, uint64_t spsr) {
 HvExcRec hv_exc_ring[HV_EXC_RING];
 uint32_t hv_exc_at;
 
+/* Debug-only fault-path probe.
+ *
+ * put_trace_entry() writes every block entry into cpu->trace_ring from the translated code
+ * itself, so chained blocks and direct bl targets are in it -- unlike HV_TRACE_PC, which only
+ * sees blocks that re-enter the dispatcher. That makes it the one instrument that can answer
+ * "did this exception's kernel path reach address F".
+ *
+ * Usage: HV_FAULT_PROBE=lo:hi (run VAs, 32-bit log form accepted; default is pmap_enter_options
+ * at slide 0), then read the counters with hv_fault_stats_dump(). Counting happens in hv_eret,
+ * i.e. after the handler ran, not at the fault itself. */
+#define FPROBE_MAX 4
+static uint64_t fprobe_lo[FPROBE_MAX] = {0xfffffe001ca2206cull, 0, 0, 0};
+static uint64_t fprobe_hi[FPROBE_MAX] = {0xfffffe001ca233acull, 0, 0, 0};
+static int fprobe_n = 1;
+static int fprobe_read;
+static uint32_t pend_esr[HV_MAX_CPUS];
+static uint8_t pend_valid[HV_MAX_CPUS];
+static uint64_t pend_far[HV_MAX_CPUS];
+static uint64_t pend_ttbr0[HV_MAX_CPUS];
+/* Did pmap_enter_options actually leave a mapping behind? Walked at eret, after the handler. */
+static uint64_t ptest_n[8], ptest_ok[8], ptest_zero[8], ptest_other[8];
+static uint64_t ptest_pn[8], ptest_pok[8], ptest_pzero[8];
+/* Is a fault a fresh address (demand paging making progress) or the same page over and over
+   (a loop)? A hash of faulting page numbers answers it; collisions only undercount repeats. */
+#define FARHASH 8192
+static uint64_t far_seen[FARHASH];
+static uint64_t far_pg[FARHASH], far_space[FARHASH];
+static uint16_t far_cnt[FARHASH];
+static uint64_t far_total, far_uniq, far_repeat;
+static uint64_t fstat_n[8], fstat_probe[8][FPROBE_MAX];
+/* 4 KiB buckets over 0x1ca00000..0x1cc00000 (the region the fault handler and pmap live in). */
+#define FHIST_BASE 0xfffffe001ca00000ull
+#define FHIST_N (8192u)
+static uint32_t fhist[FHIST_N];
+
+static int flt_class(uint32_t esr) {
+    uint32_t ec = (esr >> 26) & 0x3f, fsc = esr & 0x3f;
+    if (ec == 0x15) return 0;                                  /* svc */
+    if (ec == 0x24 || ec == 0x25) {
+        if (fsc >= 4 && fsc <= 7) return 1;                    /* translation */
+        if (fsc >= 0xd && fsc <= 0xf) return 2;                /* permission */
+        if (fsc >= 9 && fsc <= 0xb) return 3;                  /* access flag */
+        return 4;
+    }
+    if (ec == 0x21) return 5;                                  /* instruction abort */
+    return 6;
+}
+
+static void fprobe_init(void) {
+    if (fprobe_read) return;
+    fprobe_read = 1;
+    const char *e = getenv("HV_FAULT_PROBE");
+    if (!e || !*e) return;
+    /* Up to four comma separated lo:hi ranges. */
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", e);
+    fprobe_n = 0;
+    for (char *p = buf; p && *p && fprobe_n < FPROBE_MAX; ) {
+        char *comma = strchr(p, ',');
+        if (comma) *comma = 0;
+        uint64_t lo = 0, hi = 0;
+        if (sscanf(p, "%llx:%llx", (unsigned long long *) &lo, (unsigned long long *) &hi) == 2) {
+            if (hi && hi <= 0xffffffffull) {   /* 32-bit log form */
+                lo |= 0xfffffe0000000000ull;
+                hi |= 0xfffffe0000000000ull;
+            }
+            fprobe_lo[fprobe_n] = lo, fprobe_hi[fprobe_n] = hi, fprobe_n++;
+        }
+        p = comma ? comma + 1 : NULL;
+    }
+    if (!fprobe_n) { fprobe_lo[0] = 0xfffffe001ca2206cull, fprobe_hi[0] = 0xfffffe001ca233acull, fprobe_n = 1; }
+}
+
+static int ring_has(HvCpu *cpu, int which) {
+    for (uint32_t n = 0; n < 256; n++) {
+        uint64_t va = cpu->trace_ring[((cpu->trace_idx + n) & 255) * 4];
+        if (va >= fprobe_lo[which] && va < fprobe_hi[which]) return 1;
+    }
+    return 0;
+}
+
+void hv_fault_stats_dump(void) {
+    static const char *names[] = {"svc", "translation", "permission", "access-flag",
+                                  "other-dabort", "iabort", "other"};
+    fprobe_init();
+    fprintf(stderr, "hengevm: fault probe: exceptions per class, then paths reaching each range "
+                    "(trace_ring; needs HV_LOG>=2)\n");
+    for (int w = 0; w < fprobe_n; w++)
+        fprintf(stderr, "hengevm:   probe%d [0x%llx,0x%llx)\n", w,
+                (unsigned long long) fprobe_lo[w], (unsigned long long) fprobe_hi[w]);
+    for (int i = 1; i < 7; i++) {
+        if (!fstat_n[i]) continue;
+        fprintf(stderr, "hengevm:   %-12s n=%-6llu", names[i], (unsigned long long) fstat_n[i]);
+        for (int w = 0; w < fprobe_n; w++)
+            fprintf(stderr, "  p%d=%-6llu(%5.1f%%)", w,
+                    (unsigned long long) fstat_probe[i][w],
+                    100.0 * (double) fstat_probe[i][w] / (double) fstat_n[i]);
+        fprintf(stderr, "\n");
+    }
+
+    /* Which 2 MiB regions the translation/permission paths touched, by block count.
+       This is what says where a fault path actually goes, with no dispatcher in the way. */
+    uint32_t top[12] = {0}; uint64_t topv[12] = {0};
+    for (uint32_t i = 0; i < FHIST_N; i++) {
+        uint32_t c = fhist[i];
+        if (!c) continue;
+        for (int k = 0; k < 12; k++) {
+            if (c > top[k]) {
+                for (int j = 11; j > k; j--) { top[j] = top[j-1]; topv[j] = topv[j-1]; }
+                top[k] = c; topv[k] = FHIST_BASE + ((uint64_t) i << 12);
+                break;
+            }
+        }
+    }
+    fprintf(stderr, "hengevm: page table at eret (walk of the faulting VA after the handler):\n");
+    for (int i = 1; i < 7; i++) {
+        if (!ptest_n[i]) continue;
+        fprintf(stderr, "hengevm:   %-12s n=%-6llu mapped=%-6llu trans-L3=%-6llu other=%-6llu"
+                        " | reached_pmap n=%-6llu mapped=%-6llu trans-L3=%-6llu\n", names[i],
+                (unsigned long long) ptest_n[i], (unsigned long long) ptest_ok[i],
+                (unsigned long long) ptest_zero[i], (unsigned long long) ptest_other[i],
+                (unsigned long long) ptest_pn[i], (unsigned long long) ptest_pok[i],
+                (unsigned long long) ptest_pzero[i]);
+    }
+    fprintf(stderr, "hengevm: fault addresses: total=%llu unique_pages=%llu repeats=%llu (%.2f%%)\n",
+            (unsigned long long) far_total, (unsigned long long) far_uniq,
+            (unsigned long long) far_repeat,
+            far_total ? 100.0 * (double) far_repeat / (double) far_total : 0.0);
+    {
+        uint32_t top[6] = {0}; uint64_t topv[6] = {0}, tops[6] = {0};
+        for (uint32_t i = 0; i < FARHASH; i++) {
+            uint32_t c = far_cnt[i];
+            if (c < 2) continue;
+            for (int k = 0; k < 6; k++) if (c > top[k]) {
+                for (int j = 5; j > k; j--) { top[j]=top[j-1]; topv[j]=topv[j-1]; tops[j]=tops[j-1]; }
+                top[k]=c; topv[k]=far_pg[i]<<14; tops[k]=far_space[i]<<14; break;
+            }
+        }
+        fprintf(stderr, "hengevm: most repeated fault pages (asid-ish ttbr0: va x count):\n");
+        for (int k = 0; k < 6 && top[k]; k++)
+            fprintf(stderr, "hengevm:   ttbr0 0x%-11llx va 0x%-10llx x%u\n",
+                    (unsigned long long) tops[k], (unsigned long long) topv[k], top[k]);
+    }
+    fprintf(stderr, "hengevm: fault-path hot 4KiB pages in 0x1ca00000..0x1cc00000:\n");
+    for (int k = 0; k < 12 && top[k]; k++)
+        fprintf(stderr, "hengevm:   0x%-12llx %llu blocks\n",
+                (unsigned long long) topv[k], (unsigned long long) top[k]);
+}
+
 void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set_far, uint64_t ret) {
     {
         HvExcRec *r = &hv_exc_ring[hv_exc_at++ & (HV_EXC_RING - 1)];
@@ -113,6 +262,16 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
             hv_el0_flt_sp[fi] = cpu->sp;
             hv_el0_flt_esr[fi] = esr;
             hv_el0_flt_ttbr0[fi] = cpu->ttbr0_el1;
+            fprobe_init();
+            /* Only the first exception taken from EL0 counts: an IPI or a nested same-EL fault
+               during the handler must not overwrite it, or the ring we scan at eret is the
+               interrupt's path rather than the fault's. */
+            if (cpu->el == 0 && flt_class(esr) && cpu->index < HV_MAX_CPUS && !pend_valid[cpu->index]) {
+                pend_esr[cpu->index] = esr;
+                pend_far[cpu->index] = far;
+                pend_ttbr0[cpu->index] = cpu->ttbr0_el1;
+                pend_valid[cpu->index] = 1;
+            }
             for (int r = 0; r < 31; r++) hv_el0_flt_x[fi][r] = cpu->x[r];
             if (cpu->m->log >= 1) {
                 fprintf(stderr, "hengevm: el0 fault #%llu ec %llx pc %llx far %llx lr %llx sp %llx"
@@ -757,6 +916,54 @@ void hv_raise_abort(HvCpu *cpu, int insn, uint64_t va, uint32_t fsc, int wnr, in
 }
 
 void hv_eret(HvCpu *cpu) {
+    /* The handler has run (we are returning to EL0): the ring now holds its blocks. */
+    if (cpu->index < HV_MAX_CPUS && pend_valid[cpu->index] && (cpu->spsr_el1 & 0xf) == 0) {
+        uint32_t esr = pend_esr[cpu->index];
+        int cls = flt_class(esr);
+        pend_valid[cpu->index] = 0;
+        if (cls) {
+            fstat_n[cls]++;
+            int hit0 = 0;
+            for (int w = 0; w < fprobe_n; w++) if (ring_has(cpu, w)) { fstat_probe[cls][w]++; if (!w) hit0 = 1; }
+            {
+                HvWalk w;
+                /* Walk in the address space the fault came from: the handler may have switched
+                   TTBR0, and walking the current one answers for a different process. */
+                uint64_t saved_ttbr0 = cpu->ttbr0_el1;
+                cpu->ttbr0_el1 = pend_ttbr0[cpu->index];
+                hv_mmu_walk(cpu, pend_far[cpu->index], HV_ACC_READ, 0, &w);
+                cpu->ttbr0_el1 = saved_ttbr0;
+                ptest_n[cls]++;
+                int kind = w.fsc == 0 ? 0 : (w.fsc == HV_FSC_TRANSLATION(3) ? 1 : 2);
+                if (kind == 0) ptest_ok[cls]++;
+                else if (kind == 1) ptest_zero[cls]++;
+                else ptest_other[cls]++;
+                {
+                    /* Key on (address space, page): the same VA in two processes is a different
+                       fault and must not look like a repeat. */
+                    uint64_t space = (cpu->ttbr0_el1 & 0x0000ffffffffffffull) >> 14;
+                    uint64_t pg = pend_far[cpu->index] >> 14;
+                    uint64_t key = pg ^ (space * 0x9e3779b97f4a7c15ull);
+                    uint64_t h = (key * 0x9e3779b97f4a7c15ull >> 48) & (FARHASH - 1);
+                    if (far_seen[h] == key + 1) { far_repeat++; if (far_cnt[h] < 65535) far_cnt[h]++; }
+                    else { far_seen[h] = key + 1; far_pg[h] = pg; far_space[h] = space; far_cnt[h] = 1; far_uniq++; }
+                    far_total++;
+                }
+                if (hit0) {
+                    ptest_pn[cls]++;
+                    if (kind == 0) ptest_pok[cls]++;
+                    else if (kind == 1) ptest_pzero[cls]++;
+                }
+            }
+            if (cls == 1 || cls == 2) {
+                for (uint32_t n = 0; n < 256; n++) {
+                    uint64_t va = cpu->trace_ring[((cpu->trace_idx + n) & 255) * 4];
+                    if (va >= FHIST_BASE && va < FHIST_BASE + ((uint64_t) FHIST_N << 12))
+                        fhist[(va - FHIST_BASE) >> 12]++;
+                }
+            }
+        }
+    }
     if (cpu->m) {
         HvStats *st = &cpu->m->stats;
         uint32_t k = st->nelchg++ & 15;

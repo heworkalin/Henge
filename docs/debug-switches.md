@@ -115,6 +115,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | `HV_RAM_ANON` / `HV_RAM_FILE` / `HV_RAM_GREP` / `HV_RAM_GREP_OUT` | — | — | 载体/内容检查（`host/main.c`） |
 | `HV_RAM_NO_LEDGER` / `HV_RAM_NO_PREFAULT` | `1` | 关 | 关掉 RAM 记账 / 预取（性能对照） |
 | `HV_EL0_LAST`（规划） | — | — | 未实现；现由 `hv_el0_note()` 无条件记录 |
+| `HV_FAULT_PROBE` | `lo:hi[,lo:hi,...]`（最多 4 段，十六进制，32 位写法自动补成 `0xfffffe00...`） | 关（不设=不统计） | 对每个 EL0 同步异常，在**处理完、回 EL0 前**做三件事：① 用块入口 `trace_ring`（`put_trace_entry`，不经 dispatcher，chain/superblock/`bl` 直调全覆盖）判断路径是否经过各段；② 用 `hv_mmu_walk()` 按 **fault 时刻的 TTBR0** 遍历该 fault 地址，统计 PTE 是否已建立；③ 按 `(TTBR0, VA 页)` 统计重复缺页与热点页。结果由 `hv_fault_stats_dump()` 打印（SIGUSR1 或 CLI 结束时）。只统计，不改 guest 语义。**前提 `HV_LOG>=2`**（`trace_ring` 只在 `log>=2` 时由 JIT 写入） |
 
 **引擎内部记录（gdb 直接读，不需要开关）**
 

@@ -891,6 +891,7 @@ void hv_android_scan_procs(void) {
     scan_proc_names();
     scan_kernel_log();
     hv_trace_dump();
+    { extern void hv_fault_stats_dump(void); hv_fault_stats_dump(); }
     dump_last_el0();
     /* Did the boot ever run a kext? __PRELINK_TEXT holds every device driver on this platform, so
        kext=0 with kernel>0 means the boot never got as far as driving a device -- which is what the

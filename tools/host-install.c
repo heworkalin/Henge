@@ -128,6 +128,7 @@ int main(int argc, char **argv) {
         if (trace_dump_req) {
             trace_dump_req = 0;
             hv_trace_dump();
+            { extern void hv_fault_stats_dump(void); hv_fault_stats_dump(); }
         }
         double progress = 0;
         int step = hv_android_install_status(&progress);

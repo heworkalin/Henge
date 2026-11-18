@@ -265,12 +265,16 @@ b.ne <错误路径>
 cbz  w26, <正常返回>
 ```
 
-而 `+0x194` 之前是 `bl 0xe82adc`（run VA `0x1ca9a0dc`）——**这个调用没有被 trace 记录**。
+而 `+0x194` 之前是 `bl 0xe82adc`。**注意 objdump 打印的是文件偏移**：
+run VA = `0x1bb18000 + 0xe82adc = 0x1c9a00dc`，是 **`vm_fault` 入口**
+（`0x1c9a0014..0x1c9a2300`），不是 `0x1ca9a0dc`。早期这里按 `0x1ca9a0dc` 去查过，
+那个地址其实是 dtrace/machtrace 的一个 0xac 小函数，属于读错对象。
 
 ## 最后一个盲区
 
 `bl` 的目标块执行时**不重新进入 dispatcher**（JIT 直接调用已编译代码并返回），
-所以 `0x1ca9a0dc` 及其内部（是否调用 `pmap_enter`）在 trace 里完全不可见。
+所以 `vm_fault`（`0x1c9a00dc`）及其内部（是否调用 `pmap_enter`）在 `HV_TRACE_PC` 里不可见。
+（块入口 `trace_ring` 能看见，见下一节。）
 同理，`pmap_enter_options` 的"26 块"这个数字也**可能偏低**，虽然 26 对 6000 的差距太大，
 大概率仍然说明它没被大量调用，但**严格说不能由 trace 定论**。
 
@@ -283,3 +287,119 @@ cbz  w26, <正常返回>
 这是目前唯一能不依赖 dispatcher 的观测方式。工作量约：translate 侧 20 行 +
 dispatch 侧一个计数槽 + 一个导出函数，风险在于插桩代码必须不破坏寄存器分配，
 所以只对指定 VA 插、默认关闭。
+
+
+---
+
+# 追加（2026-11-19）：L5 的四个结论被推翻
+
+用 `put_trace_entry` 的块入口 `trace_ring`（不经过 dispatcher，chain / superblock /
+`bl` 直调全覆盖）加 `core/exception.c` 的临时探针，重新测了一轮。探针全部由
+`HV_FAULT_PROBE=lo:hi,...` 控制，默认只探 `pmap_enter_options`。
+
+## 1. 统计 bug：`pend_esr` 会被 IPI 覆盖
+
+第一版测出 "translation fault 1035 次，到达 `pmap_enter_options` **0 次**"，并据此写了
+"pmap 从来没被调用"。**这是假的**：`pend_esr` 在 `hv_take_exception` 里设置，在 `hv_eret`
+里消费；缺页处理期间进来的 **IPI 中断**会把它覆盖成中断的 ESR，于是 `hv_eret` 那一刻
+扫到的 ring 是**中断的路径**（`0x1ca36xxx` = cpu_xcall / machine_routines / locks_arm），
+不是缺页路径。直方图当时显示 `0x1ca38000` 等页为热点，正是 IPI 代码。
+
+修法（两处，缺一不可）：
+- 只记第一个从 EL0 取的异常，且带 `pend_valid` 标志，不允许覆盖；
+- `hv_eret` 里只在**目标 EL 是 EL0**（`spsr_el1 & 0xf == 0`）时消费。
+
+修好后同一轮的真实数据：
+
+```
+translation n=1107  handler 98.6%  vm 层 98.6%  pmap_enter_options 95.2%
+permission  n=431   handler 99.8%  vm 层 98.8%  pmap_enter_options 97.9%
+```
+
+**所以 `pmap_enter_options` 是正常被调用的。** 之前"26 块/几乎不调用"的判断是被
+trace 盲区和这个统计 bug 双重误导。
+
+## 2. PTE 不是 0：`pmap_enter_options` 确实写成功了
+
+在 `hv_eret`（handler 已跑完、即将回 EL0）用 `hv_mmu_walk()` 按 **fault 时刻的 TTBR0**
+遍历该 fault 地址：
+
+```
+translation n=1291  mapped=1291  trans-L3=0  （reached_pmap 的 1288 次全部 mapped）
+permission  n=502   mapped=502   trans-L3=0  （reached_pmap 的 500 次全部 mapped）
+```
+
+**100% 已映射，一个 L3 translation 都没有。** "PTE 恒为 0、写了但没生效"不成立。
+
+注意 walk 必须用 `pend_ttbr0`（fault 时的地址空间）而不是当前 `cpu->ttbr0_el1`，
+否则 handler 切了进程就会答成别人的页表。
+
+## 3. 不是死循环，是极慢推进
+
+两次采样（t=75s / t=188s，同一轮）：
+
+| | total | unique pages | repeats |
+|---|---|---|---|
+| t=75s | 930 | 403 | 527 |
+| t=188s | 2867 | **1504** | 1363 |
+| 增量 113s | 1937 | **+1101（≈10 页/s）** | +836 |
+
+唯一页持续增长 → **在推进**，只是慢。重复 47% 且分散在同一进程
+（`ttbr0 0x8583c000`）的几十个页上，每页 10~21 次，**不是单页死锁**。
+（哈希键必须含 TTBR0；只用 VA 页号会把不同进程的同名 VA 算成重复。）
+
+## 4. 真正的现象：系统 95% 空闲
+
+引擎自己的 stats：
+
+```
+stats 199s: blocks 0.00M/s, exc 18/s irq 26/s, wfi 100/s (95% idle)
+el1 pc fffffe001ca35e68      ← 固定在 idle 循环
+idle daif 3c0 cntp_ctl 2 cntp_cval 0
+```
+
+每秒只有 ~18 次异常（≈缺页数）和 ~26 次中断，块执行速率是 0。也就是说：
+
+> **没有 runnable 线程。CPU 在 idle 循环里等中断，靠已过期的物理定时器周期性醒来，
+> 醒一次推进十几页又睡回去。**
+
+这与 `docs/investigation-tree.md` 里"所有线程挂 `WQT_QUEUE`、两个 CPU 都 WFI"是同一件事。
+缺页只是"醒来时干了点活"的副产品，**不是卡点本身**。
+
+## 5. 顺带纠正：`bl 0xe82adc` 不是 `0x1ca9a0dc`
+
+objdump 对裸 binary 打印的是**文件偏移**：`0x1bb18000 + 0xe82adc = 0x1c9a00dc`
+（`vm_fault` 入口，函数 `0x1c9a0014..0x1c9a2300`）。`0x1ca9a0dc` 是 dtrace/machtrace
+的一个 0xac 小函数，和缺页无关。
+
+## 6. 函数命名方法（本次用的）
+
+没有符号也能命名：`adrp` + `add` 的字符串引用。解析指令位域自己算目标，不要信
+objdump 的地址显示（`--adjust-vma` 对裸 binary 不可靠）：
+
+```
+adrp: imm = (immhi<<2)|immlo（21 位有符号），目标页 = (pc & ~0xfff) + (imm<<12)
+add : 目标 = 页 + (imm12 << (12*shift)), shift ∈ {0,1}
+```
+
+结果（同一 kernelcache，slide=0）：
+
+| 地址 | 身份 |
+|---|---|
+| `0x1ca21f84` | `pmap_map`（冷 panic 块在 `0x1ca2203c`） |
+| `0x1ca2206c` | `pmap_enter_options_internal`（字符串 `0x1ca22d68` 自证） |
+| `0x1ca3e22c` | sleh.c 异常分发（`'Exception on 2-byte instruction'`） |
+| `0x1ca3eea0` | sleh.c user abort handler（`'vm_fault() KERN_FAILURE from user fault'`） |
+| `0x1ca36xxx..0x1ca39xxx` | machine_routines / cpu_common / locks_arm / arm_vm_init（**不是 pmap**） |
+| `0x1ca9a06c` | dtrace/machtrace 小函数（与缺页无关） |
+
+## 7. 下一步
+
+卡点从"缺页不写 PTE"改为"**没有 runnable 线程**"。要查的是：
+
+1. 内核 waitq 里到底谁在等谁（`tools/henge-gdb/procs.py`、`dump-waitq.py` 一类）；
+2. 是否有本该到来的中断/完成事件没有送达（设备模型 vs 等待方）；
+3. idle 期间 `exc 18/s` 的异常里，除缺页外还有什么。
+
+`HV_FAULT_PROBE` 探针保留在 `core/exception.c`（默认只探 `pmap_enter_options`，
+只统计不改变 guest 语义）。
