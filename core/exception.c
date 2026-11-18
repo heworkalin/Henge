@@ -214,7 +214,7 @@ void hv_svc_dump_tail(void) {
                 hv_mmu_walk(cpu, hv_svc_x0[s], HV_ACC_READ, 0, &w);
                 cpu->ttbr0_el1 = saved_ttbr0;
                 if (w.fsc) continue;
-                uint8_t buf[0x20];
+                uint8_t buf[0x100];
                 if (hv_phys_read(cpu->m, w.pa, buf, sizeof buf) != 0) continue;
                 uint32_t bits, size, rport, lport, vport, id;
                 memcpy(&bits, buf, 4), memcpy(&size, buf + 4, 4);
@@ -224,6 +224,15 @@ void hv_svc_dump_tail(void) {
                                 " voucher %x id %d\n",
                         (unsigned long long) hv_svc_pc[s], bits, size, rport, lport, vport,
                         (int) id);
+                /* The body after the header: for an IOKit call the selector and arguments live
+                   here, and they are what name the service. */
+                fprintf(stderr, "hengevm:   body:");
+                for (int k = 0x18; k < 0x98; k += 8) {
+                    uint64_t v;
+                    memcpy(&v, buf + k, 8);
+                    fprintf(stderr, " %llx", (unsigned long long) v);
+                }
+                fprintf(stderr, "\n");
                 shown++;
             }
         }
