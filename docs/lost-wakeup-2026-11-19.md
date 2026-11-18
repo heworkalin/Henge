@@ -167,6 +167,58 @@ ref pa 84fdc860 ctx:
 
 不是死锁（proprietor 全 0），不是队列为空（`+0x08` 非空），也不是没解锁（绑定已解除）。
 
+## 4.7 排除：PV ticket lock 与这个卡点无关
+
+arm64 XNU 的自旋锁是**半虚拟化 ticket lock**（`osfmk/arm64/lock_ticket_pv.c`），
+park/唤醒走 OEM hypercall：
+
+| 调用 | 编号 |
+|---|---|
+| `VMAPPLE_VCPU_WFK`（park） | `0xc3000005` |
+| `VMAPPLE_VCPU_KICK`（唤醒） | `0xc3000006` |
+
+两条都经过 `vmapple_hvc()`，而它的第一行是：
+
+```c
+if (!getenv("HENGE_OEM")) return 0;
+```
+
+即**默认不处理整个 OEM 范围**。未处理的返回值为 0 → 调用处转而调用 `psci()`：
+
+```c
+if (!hv) cpu->x[0] = psci(cpu, cpu->x[0]);
+```
+
+`psci()` 对 `0xc3000005/6` 落到 `default: return (uint64_t)-1;`（NOT_SUPPORTED），
+所以 guest 看到的 `x0 = -1`（判据是 `hvc_5` 里的 `*(int64_t*)x0 >= 0`），
+**正确地认为 PV 锁不受支持**，回退到普通自旋。
+
+日志直接印证（`HV_LOG>=1` 会打 "unknown hypervisor call"）：
+
+```
+$ grep -c "unknown hypervisor call" host.log
+3
+$ ... | sed -E 's/.*call (0x[0-9a-f]+).*//' | sort | uniq -c
+      3 0x8300ff01        ← OEM UID 查询，不是 WFK/KICK
+```
+
+**没有任何 `0xc3000005` / `0xc3000006` 调用** → guest 从未使用 PV ticket lock。
+
+因此：
+
+- 不是 PV 锁的 park/kick 丢失；
+- 也不是"hypervisor 假报成功"（返回的是 `-1`，guest 走回退路径）。
+
+卡点仍然是 **`lck_mtx`（睡眠锁）的 turnstile 唤醒**，与自旋锁无关。
+
+### 附带的方法论注意
+
+`hvg_hc_kick_cpu()` / `hvg_hc_wait_for_kick()` **不检查返回值**
+（`__assert_only const bool success` + `assert`，release 构建里被编译掉）。所以假如某个
+hypervisor 让这两个 HVC 返回"成功"但实际不 halt，XNU 不会报错也不会回退——它会认为已经
+park 过并收到 kick。**Henge 目前不会踩这个坑**（返回 -1），但任何改动 `HENGE_OEM` 默认值
+或返回值的工作都必须先看这一点。
+
 ## 5. 下一步
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该
