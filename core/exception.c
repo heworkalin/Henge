@@ -179,6 +179,35 @@ static int ring_has(HvCpu *cpu, int which) {
    (Darwin takes it in x16) and ret says the call has not returned yet if it is the newest one. */
 void hv_svc_dump_tail(void) {
     uint64_t n = hv_svc_n, cnt = n < 48 ? n : 48;
+    /* The tail is dominated by the pthread exit sequence (__disable_threadsignal=331,
+       bsdthread_terminate=361), which says a thread pool is shrinking, not what the system is
+       doing. A mix over the last 4096 calls, plus the last call that is not part of an exit,
+       shows the actual work. */
+    {
+        uint32_t hist[600];
+        memset(hist, 0, sizeof hist);
+        uint64_t total = n < 4096 ? n : 4096;
+        for (uint64_t i = n - total; i < n; i++) {
+            uint32_t no = (uint32_t) hv_svc_x16[i & (HV_SVC_CAP - 1)];
+            if (no < 600) hist[no]++;
+        }
+        fprintf(stderr, "hengevm: syscall mix over last %llu:", (unsigned long long) total);
+        for (uint32_t no = 0; no < 600; no++)
+            if (hist[no]) fprintf(stderr, " %u=%u", no, hist[no]);
+        fprintf(stderr, "\n");
+        for (uint64_t i = n; i-- > 0; ) {
+            uint64_t s = i & (HV_SVC_CAP - 1);
+            uint32_t no = (uint32_t) hv_svc_x16[s];
+            if (no == 331 || no == 361 || no == 334 || no == 332) continue;
+            fprintf(stderr, "hengevm: last non-exit syscall: pc %llx sys %u x0 %llx x1 %llx"
+                            " x2 %llx x3 %llx ret %lld\n",
+                    (unsigned long long) hv_svc_pc[s], no,
+                    (unsigned long long) hv_svc_x0[s], (unsigned long long) hv_svc_x1[s],
+                    (unsigned long long) hv_svc_x2[s], (unsigned long long) hv_svc_x3[s],
+                    (long long) hv_svc_ret[s]);
+            break;
+        }
+    }
     fprintf(stderr, "hengevm: last %llu syscalls (oldest first; number is guest x16):\n",
             (unsigned long long) cnt);
     for (uint64_t i = n - cnt; i < n; i++) {

@@ -1259,6 +1259,31 @@ static void th_dump_one(int idx) {
                 fprintf(stderr, "\n");
             }
         }
+        /* The saved kernel PC: struct machine_thread holds arm_saved_state_t *kpcb, and inside
+           that, ash(8) + ss_64.pc(0x100). Scanning thread for a kernel pointer whose +0x108 is
+           kernel text finds it without knowing machine_thread's offset (it varies with config).
+           This is the reliable answer to "which function is this thread blocked in" -- a stack
+           scan shows stale data too. */
+        if (getenv("HV_TH_PCB")) {
+            for (uint64_t off = 0; off < 0x1800; off += 8) {
+                uint64_t ptr = th_pa64(tp + off, NULL);
+                if (!th_kaddr(ptr)) continue;
+                uint64_t pp = th_walk(ptr);
+                if (!pp) continue;
+                uint64_t pc = th_pa64(pp + 0x108, NULL);
+                if (pc < 0xfffffe001c890000ull || pc >= 0xfffffe001eec92f4ull) continue;
+                /* kpcb lives on the thread's kernel stack, so sp must be a stack address; a
+                   pointer whose "pc" merely falls in the text range is usually data. */
+                uint64_t sp0 = th_pa64(pp + 0x100, NULL);
+                if (sp0 < 0xfffffe2000000000ull || sp0 >= 0xfffffe4000000000ull) continue;
+                fprintf(stderr, "hengevm:   kpcb thread+0x%llx: pc %llx lr %llx sp %llx"
+                                " (pc+0x%llx in kernel text)\n",
+                        (unsigned long long) off, (unsigned long long) pc,
+                        (unsigned long long) th_pa64(pp + 0xf8, NULL),
+                        (unsigned long long) th_pa64(pp + 0x100, NULL),
+                        (unsigned long long) (pc - 0xfffffe001bb18000ull));
+            }
+        }
         if (getenv("HV_TH_STACK")) th_dump_stack(cur);
         th_dump_turnstile(ts, 2);
         if (next == head) break;

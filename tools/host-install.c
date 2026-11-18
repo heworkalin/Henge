@@ -131,6 +131,7 @@ int main(int argc, char **argv) {
             { extern void hv_fault_stats_dump(void); hv_fault_stats_dump(); }
             { extern void hv_svc_dump_tail(void); hv_svc_dump_tail(); }
             if (getenv("HV_THREADS")) { extern void hv_threads_dump(void); hv_threads_dump(); }
+            if (getenv("HV_SCAN_PROC")) hv_android_scan_procs();
         }
         double progress = 0;
         int step = hv_android_install_status(&progress);

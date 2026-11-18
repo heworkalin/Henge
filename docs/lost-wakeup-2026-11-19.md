@@ -1,4 +1,4 @@
-# L6：丢失唤醒（unowned turnstile）
+# L6：从"缺失的唤醒"到"restored_external 卡在 set_progress_0"
 
 日期 2026-11-19。承接 `docs/fault-pmap-2026-11-18.md`（L5 四条结论被推翻）。
 本文的结论是**直接观测**，不是从 trace 推断。
@@ -341,7 +341,57 @@ thread+0x30 = fffffe1e3807e9e0  flags 2        type 2  → turnstile, tsid = 0
 `WAITQ_FLAGS.type`（1 vs 2）——这一步应该在第一次用某个偏移时就做，而不是等到多个结论
 都建立在它上面之后。
 
-## 5. 下一步
+## 4.13 转折：串口显示它卡在 set_progress_0，最后一条 syscall 是 kevent_id
+
+`HV_EXTRA_BOOT_ARGS="serial=3"` 打开恢复内核日志后，restored_external 打的是
+**CHECKPOINT 序列**：
+
+```
+CHECKPOINT BEGIN: MAIN:[0x0400] umask          → END ✓
+CHECKPOINT BEGIN: MAIN:[0x0402] setvbuf        → END ✓
+CHECKPOINT BEGIN: MAIN:[0x0406] set_progress_0 → 没有 END ✗
+```
+
+即它启动后只走了三步 libc 初始化，**第一个实质动作"设置恢复进度"就卡住了**。
+
+用 `HENGE_STOP_ON="set_progress_0"` 在那一刻 dump syscall 环，最后几条是：
+
+```
+sys 338 stat64  "/var/log/asl"
+sys 397 write_nocancel
+sys 375 kevent_id
+```
+
+`kevent_id` 是 XNU 给 libdispatch（GCD）的事件接口。所以卡点可以一句话说清：
+
+> **它写了一条日志，然后在 kqueue 上等一个事件；那个事件源再没触发。**
+
+这也和前面所有内核层观测一致，而且现在它们都成了"结果"而不是"原因"：
+`state = WAIT`、`waitq` 挂着它、`turnstile tsid = 0`（不是在等锁）、event 从不被 post、
+CPU 98% idle。
+
+顺带排除或确认的：
+
+- **USB 链路是通的**：`virtio-usb` 13161 个请求 / 13161 个响应，完全配对，没有未完成；
+- PCIe 工作（ecam 有读写），`ApplePCIe=0` 是误判（kext 没有 `p_comm`）；
+- 块设备不是瓶颈（没有 inflight 差异）。
+
+还有一个可疑项：串口里 `restore-step-uptime = -756316507015`，**guest 看到的 uptime 是负的**。
+如果 `set_progress_0` 用它做时间判断/超时，值得单独查。
+
+## 5. 下一步（新的方向）
+
+1. **kqueue 监听的是什么**：从 guest 内存解出该 kqueue 的事件源（fd / dispatch source），
+   看是 vnode、device、还是 libdispatch 的内部 pipe。这是"等谁"的直接答案。
+2. **谁该触发它**：如果监听的是某个 IOKit user client 或设备 fd，那就要看该设备的完成路径
+   是否上报了事件。
+3. **时钟**：确认 `-756316507015` 的 uptime 是否会让超时/时间逻辑直接算错。
+
+### 4.13 之前的 §4.5–§4.12 仍然有效的部分
+
+那些章节里"读错结构"的部分已在 §4.12 更正；仍然成立的原始观测（state/WAIT、waitq 非 0、
+lck_mtx 干净、CAS 正确、USB 配对完整）在本节结论下全部自洽。
+
 
 1. **定位具体的锁对象**：从 `lck_mtx_t` 反查（`owner` 字段应为 0，`waiters` 指向该
    turnstile），得到"哪个 mutex 丢了唤醒"。turnstile 与锁对象的关系走
