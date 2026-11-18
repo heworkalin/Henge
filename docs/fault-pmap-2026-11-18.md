@@ -218,3 +218,68 @@ guest 页是 **16 KiB**，`0x1c893000..0x1c896fff` 是同一页。向量表（`0
 
 用户态阶段 `pmap_enter_options` 范围仍只有 26 块 / 2 次入口，对应 6 449 次 EL0 同步异常。
 **缺页基本不进入 `pmap_enter_options`** —— 这一条不受上面任何机制解释的影响。
+
+---
+
+# 追加三：按 ESR 配对的真实数据（同日）
+
+修了一个让开关"看起来没生效"的 bug：`HV_NOCHAIN_VA`/`HV_NOSUPERBLOCK_VA` 的范围是
+32 位写法（日志习惯），却和 64 位 VA 比较 → 永远不匹配。现在会自动提升到
+`0xfffffe00xxxxxxxx`。**之前"整页关 superblock 后仍然直接回 EL0"的观察，是开关没生效。**
+
+修好后对 `0x1c893000..0x1c897000` 关链 + 关 superblock：vector 块执行后
+**100% 进入 `0x1c8943e4`**（cpu0 694/694，cpu1 5758/5758）。
+
+## ESR × 路径（cpu1，用户态，6451 次异常与 6367 个 vector 一一配对）
+
+| ESR / 类型 | 次数 | 平均块数 | 到达 `pmap_enter_options` |
+|---|---|---|---|
+| `56000080` svc | 4803 | 37.6 | 0（应当为 0） |
+| `92000007` trans-L3 | 1094 | 60.4 | **6** |
+| `9200004f` perm-L2/L3 | 432 | 56.8 | **7** |
+| `82000007` instruction abort | 30 | 131.5 | 1 |
+| `92000006` trans-L2 | 8 | 54.1 | 0 |
+
+所以缺页（trans）每次确实走了 **~60 个基本块**的内核处理，不是"快速返回"。
+
+## 缺页路径的实际函数序列（trans-L3，典型）
+
+```
+0x1c8943e4   x6    EL0 同步异常入口（fleh/sleh）
+0x1c894b4c   x9    汇编层分发
+0x1ca3e22c   x8    C 层：lsr w8,w20,#26 → 按 EC 查表跳转（arm_exception_handler）
+0x1ca3eea0   x1    （见下）
+0x1ca3f034   x2    thread+0xcc 的 ldclr/tst，函数出口
+```
+
+`0x1ca3e22c` 是 ESR 解码 + EC 跳转表（表基址在 `...eef0`，掩码 `0xeef0` 覆盖
+translation/access-flag/permission 三类 DFSC），确认它把 `0x92000007` 判为合法缺页。
+
+`0x1ca3eea0` 内部 trans fault 只经过 **+0x194（`0x1ca3f034`）**：
+
+```
+add  x23, x22, #0xcc        ; x22 = TPIDR_EL1
+ldclr w8, w8, [x23]         ; 清 thread+0xcc 的位
+tst  w8, #0xff00
+b.ne <错误路径>
+cbz  w26, <正常返回>
+```
+
+而 `+0x194` 之前是 `bl 0xe82adc`（run VA `0x1ca9a0dc`）——**这个调用没有被 trace 记录**。
+
+## 最后一个盲区
+
+`bl` 的目标块执行时**不重新进入 dispatcher**（JIT 直接调用已编译代码并返回），
+所以 `0x1ca9a0dc` 及其内部（是否调用 `pmap_enter`）在 trace 里完全不可见。
+同理，`pmap_enter_options` 的"26 块"这个数字也**可能偏低**，虽然 26 对 6000 的差距太大，
+大概率仍然说明它没被大量调用，但**严格说不能由 trace 定论**。
+
+## 要彻底定论，需要一次插桩（不是开关能解决的）
+
+在 `core/translate.c` 生成块时，对**指定 VA** 的块入口插入一个计数器写
+（保存/恢复两个寄存器，受环境变量控制，默认不插）。这样每次执行该块都能被计数，
+与 chain/superblock/直接调用全部无关。
+
+这是目前唯一能不依赖 dispatcher 的观测方式。工作量约：translate 侧 20 行 +
+dispatch 侧一个计数槽 + 一个导出函数，风险在于插桩代码必须不破坏寄存器分配，
+所以只对指定 VA 插、默认关闭。

@@ -811,6 +811,11 @@ static int nosuper_va(uint64_t va) {
         nsb_read = 1;
         const char *e = getenv("HV_NOSUPERBLOCK_VA");
         if (e) sscanf(e, "%llx:%llx", (unsigned long long *) &nsb_lo, (unsigned long long *) &nsb_hi);
+        /* Same 32-bit log form as HV_NOCHAIN_VA: lift it, or the range matches nothing. */
+        if (nsb_hi && nsb_hi <= 0xffffffffull) {
+            nsb_lo |= 0xfffffe0000000000ull;
+            nsb_hi |= 0xfffffe0000000000ull;
+        }
     }
     return nsb_lo && va >= nsb_lo && va < nsb_hi;
 }

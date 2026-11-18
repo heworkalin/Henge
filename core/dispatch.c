@@ -1157,6 +1157,12 @@ static int nochain_va(uint64_t va) {
         nc_read = 1;
         const char *e = getenv("HV_NOCHAIN_VA");
         if (e) sscanf(e, "%llx:%llx", (unsigned long long *) &nc_lo, (unsigned long long *) &nc_hi);
+        /* Logs print kernel pcs as their low 32 bits; accept that form and lift it, or the
+           range silently matches nothing and the switch looks broken. */
+        if (nc_hi && nc_hi <= 0xffffffffull) {
+            nc_lo |= 0xfffffe0000000000ull;
+            nc_hi |= 0xfffffe0000000000ull;
+        }
     }
     return nc_lo && va >= nc_lo && va < nc_hi;
 }
@@ -2559,9 +2565,11 @@ static int run_loop(HvCpu *cpu, int one) {
                 if (e) sscanf(e, "%llx:%llx", (unsigned long long *) &xe_lo, (unsigned long long *) &xe_hi);
             }
             if (xe_lo && b->va >= xe_lo && b->va < xe_hi)
-                fprintf(stderr, "traceexit va %llx -> exit %d pc %llx el%u icount %llu\n",
-                        (unsigned long long) b->va, cpu->exit_reason,
+                fprintf(stderr, "traceexit c%u va %llx -> exit %d pc %llx el%u blk_el1 %d esr %x icount %llu\n",
+                        cpu->index, (unsigned long long) b->va, cpu->exit_reason,
                         (unsigned long long) cpu->pc, cpu->el,
+                        (b->flags & HV_BLOCK_EL1) != 0,
+                        (unsigned) cpu->esr_el1,
                         (unsigned long long) cpu->icount);
         }
 
