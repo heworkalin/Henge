@@ -54,6 +54,10 @@ CURL_CA_BUNDLE=$PWD/work/ca-bundle.pem ./build/host/host-install \
 
 ---
 
+**默认输出（无开关）**：引擎启动时打印一行 `hengevm: timebase measured <MHz> (<ticks> in <s>)`，
+实测 guest 看到的时间基。counter 是 `CLOCK_MONOTONIC_RAW` 的软件缩放（不是硬件 `CNTFRQ`），
+换设备不会改变频率，但缩放代码本身可能出错，所以每次启动都测一次。
+
 ## 2. 引导参数与内核镜像
 
 | 开关 | 取值 | 默认 | 作用 |
@@ -115,7 +119,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | `HV_RAM_ANON` / `HV_RAM_FILE` / `HV_RAM_GREP` / `HV_RAM_GREP_OUT` | — | — | 载体/内容检查（`host/main.c`） |
 | `HV_RAM_NO_LEDGER` / `HV_RAM_NO_PREFAULT` | `1` | 关 | 关掉 RAM 记账 / 预取（性能对照） |
 | `HV_EL0_LAST`（规划） | — | — | 未实现；现由 `hv_el0_note()` 无条件记录 |
-| `HV_THREADS` | `1` | 关 | 把每个进程（`launchd`/`restored_externa`/`loginsupport`/`mobile_restore`）的线程链表 dump 出来：`state` / `wait_event` / `turnstile`，并对每个被等待的 turnstile 打印尾部内核指针（`ts_proprietor` 的候选）。**在引擎内读 guest RAM，不需要 gdb**（proot 下 gdb 会把 PIE 全局变量解析成未重定位地址）。由 SIGUSR1 或 `hv_android_scan_procs()` 触发。偏移：`proc+0x18`→`proc_ro`、`proc_ro+8`→`task`、`task+0x50`→线程链头、`thread+0x10`→`wait_event`、`+0x28`→`turnstile`、`+0x1c8`→`state` |
+| `HV_THREADS` | `1` | 关 | 把每个进程（`launchd`/`restored_externa`/`loginsupport`/`mobile_restore`）的线程链表 dump 出来：`state` / `wait_event` / `turnstile`，并对每个被等待的 turnstile 打印尾部内核指针（`ts_proprietor` 的候选）。**在引擎内读 guest RAM，不需要 gdb**（proot 下 gdb 会把 PIE 全局变量解析成未重定位地址）。由 SIGUSR1 或 `hv_android_scan_procs()` 触发。偏移：`proc+0x18`→`proc_ro`、`proc_ro+8`→`task`、`task+0x50`→线程链头、`thread+0x10`→`wait_event`、`+0x28`→**waitq**、`+0x30`→**turnstile**、`+0x1c8`→`state`（`+0x28`/`+0x30` 只差 8 字节且外观都是内核指针，必须用 `WAITQ_FLAGS.type` 区分：1=waitq、2=turnstile） |
 | `HV_TH_STACK` | `1` | 关 | 配合 `HV_THREADS`：对每个线程扫它的 16 KiB 内核栈（从 `struct thread` 里找页对齐的栈顶指针，不依赖 `kernel_stack` 偏移），打印栈上的内核代码地址。用于回答"这个阻塞线程停在哪个函数"。算法同 `tools/dump-stacks.py`。**注意栈上会有旧数据**，短栈（只有两三个地址交替）应先怀疑残留而不是调用链 |
 | `HV_TS_FULL` | `1` | 关 | 配合 `HV_THREADS`：把每个 turnstile 的 `+0x300..+0x400` 与 `+0x00..+0x40` 全字段打印出来（不只是内核指针）。`ts_proprietor` 的偏移随构建而变，用这个对照而不是假定 |
 | `HV_PCOMM_OFF` | `1` | 关 | 配合 `HV_THREADS`：打印扫描到的 `p_comm` 在 `struct proc` 内的偏移（名字长度 ≥8 才打印）。用来确认固定偏移；`0x8/0x30/0x50` 这类小偏移是随机数据的误报 |
@@ -146,7 +150,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | `HV_VUSB_LATE` | `1` | 关 | 把 vusb 放到 PCI 槽位最后（默认放到块设备之前，因为它的驱动用 INTx，槽位顺序是唯一差异） |
 | `HV_VUSB_PROBE` | `1` | 关 | 探测 vusb 应答 |
 | `HENGE_USB_REENUM` | `1` | **关** | userland 起来 8 秒后 `hv_vusb_force_rescan()`。**曾导致 `Killed`**：8 秒后 `d` 可能已被 installer 释放。只用于对照实验 |
-| `HENGE_STOP_ON` | 串口子串，可用 `\|` 分隔多个 | 关 | **串口同步断点**：console 出现匹配行时 `raise(SIGSTOP)` 停住整个进程，gdb 附加读内存后 `kill -CONT` 继续。串口是 guest 与引擎唯一的共同同步点，所以这是「在已知时刻抓状态」的唯一无轮询办法。`devices/vmapple.c` 的 `vmapple_serial_out()` |
+| `HENGE_STOP_ON` | 串口子串，可用 `\|` 分隔多个 | 关 | **串口同步断点**：console 出现匹配行时 `raise(SIGSTOP)` 停住整个进程，gdb 附加读内存后 `kill -CONT` 继续。串口是 guest 与引擎唯一的共同同步点，所以这是「在已知时刻抓状态」的唯一无轮询办法。`devices/vmapple.c` 的 `vmapple_serial_out()`。**命中时会先 dump syscall 环（含 `mach_msg2_trap` 的 header/body）和线程表，再 `SIGSTOP`** |
 | `HENGE_STOP_EVERY` | `1` | 关 | 每次匹配都停（否则只停第一次）。配合多个模式用它走一条事件阶梯，每级拿一次快照 |
 | `HV_RESET_ENUM` | `1` | 关 | 恢复「枚举前先 reset」的旧行为（`host/libusb_shim.c:93`） |
 | `HV_LIBUSB_LOG` | `1` | 关 | 宿主 libusb shim 日志（arrived/left/enumerate failed）——**看 host 是否看到设备切换就靠它** |

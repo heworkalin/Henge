@@ -408,3 +408,218 @@ lck_mtx 干净、CAS 正确、USB 配对完整）在本节结论下全部自洽�
 `android/install.c` 的 `hv_threads_dump()` / `th_dump_stack()` / `th_dump_turnstile()`，
 全部由环境变量控制，默认关闭，只读不写 guest 状态。
 `tools/host-install.c` 的 SIGUSR1 触发（`HV_THREADS=1`）。
+
+---
+
+# 7. 第二轮（同日）：kqueue 背后是 mach IPC，而整机已进入累积死锁
+
+本节承接 §4.13。§4.13 的结论是"卡在 `kevent_id` 等事件"，本节把它往下推了一层，
+同时纠正了本节过程中犯的两个错误（详见 §7.8、§7.9）。
+
+## 7.1 时钟：实测，不假设
+
+`core/sysreg.c` 的 counter 是 `mach_absolute_time()`，而 `android/compat/compat_android.c`
+把它实现成 **`CLOCK_MONOTONIC_RAW` 的软件缩放**（`ns/1e9*HV_TICK_HZ + ns%1e9*24/1000`），
+不是硬件 `CNTFRQ`。所以：
+
+- 换设备不会改变这个频率（与 SoC 的 19.42 MHz 那类差异无关）；
+- 但**缩放代码本身**可能溢出/精度错，所以仍需实测。
+
+`android/install.c` 在 kicker 启动前加了一段测量（`hv_counter()` 前后取
+`CLOCK_MONOTONIC_RAW`，中间 `nanosleep(200ms)`），实测：
+
+```
+hengevm: timebase measured 23.9998 MHz (4802009 ticks in 0.2001 s)
+```
+
+**结论：在这台设备 + 这份 compat 实现下，24 MHz 是对的**（误差 0.0008%）。
+这段测量保留，换设备/换 compat 实现时可直接验证。
+
+> 注意：这**不能**推出"guest 看到的 uptime 一定正确"。串口里
+> `restore-step-uptime = -756316507015`，而公开的正常日志是 `1`。这个负值
+> **仍未解释**；但在 §7.8 的前提下（死锁时内核给不出真实状态），它本身也不能直接当证据。
+
+## 7.2 `kevent_id` 是调度层的等待，业务等待是 mach
+
+`hv_svc` 环里存在大量 `sys` 号为负的记录，例如 `18446744073709551569` = `0xFFFFFFFFFFFFFFD1`
+= **-47**。BSD syscall 表里没有负数，这些是 **mach trap**：
+
+```
+/tmp/xnu/osfmk/mach/syscall_sw.h:128
+kernel_trap(mach_msg2_trap, -47, 8)
+```
+
+**`-47 = mach_msg2_trap`**，即 libdispatch / IOKit 的 IPC。给 `hv_svc_dump_tail()`
+加了 mach_msg2 的 header 解码（用每条 syscall 自带的 ttbr0 读 guest 用户内存），得到：
+
+```
+pc 10cdc0c30  bits 1200  size 36  remote 0  local 507  voucher 0  id 2989
+```
+
+- `bits = 0x1200` → **`MACH_RCV_MSG`（接收模式）**
+- `local = 0x507` → 等待的 port 名
+- `id = 2989` → 消息 id
+- 另有发送方向：`remote 0x7fb`
+
+所以 §4.13 的 `kevent_id` 是 libdispatch 在**调度层**等事件；真正的**业务等待**是
+`mach_msg2_trap` 的接收。两者不矛盾，前者是"workqueue 怎么拿任务"，后者是"任务等谁"。
+
+## 7.3 body 解出 `ramrod-nvram-session`
+
+把 body（header 之后 0x80 字节）按字节打印并解 ASCII，出现可读串：
+
+```
+ramrod-nvram-session
+```
+
+同一 body 里还出现 `0xe00002f0`。
+
+**注意对齐**：最初按 8 字节 qword 解码得到 "rmarod"，是错的；必须按**连续字节**解，
+字符串不保证 8 字节对齐。
+
+## 7.4 `kIOReturnNotFound` 与 ramrod 是什么（联网核对）
+
+| 查询 | 结果 |
+|---|---|
+| `0xe00002f0` | `/tmp/xnu/iokit/IOKit/IOReturn.h:200` → **`kIOReturnNotFound`**（"data was not found"） |
+| `kIOReturnNotFound` 在 NVRAM 语境 | `OpenCorePkg/Utilities/LogoutHook/nvramdump.c:41`：`IORegistryEntryCreateCFProperty()` 返回 0 → `return kIOReturnNotFound`，即 **IORegistry 里没有该变量** |
+| NVRAM 变量操作在哪 | XNU `iokit/Kernel/IONVRAM.cpp`（`IODTNVRAMVariables::setProperties/setVariables`），是**内核 IOKit 服务**，不是用户态 daemon |
+| `ramrod` | Apple 的**固件更新/恢复工具**，位于恢复 ramdisk 的 `/usr/libexec/ramrod/`，由 `restored_external` 驱动 |
+
+真实设备上同类失败会打出明确的错误行（libimobiledevice#1543）：
+
+```
+CHECKPOINT_INTERNAL_ERROR(checkpoint_nvram_set): failed to set NVRAM variable
+restore-outcome=initial_engine_no_return -536870181
+```
+
+`-536870181` = `0xE00002DB` = **`kIOReturnNoSpace`**（NVRAM 空间不足）。
+
+> **但我们的日志里没有这条错误行。** 在 §7.8 的前提下，这一"缺失"不能推出
+> "没走到 checkpoint_nvram_set"。
+
+## 7.5 与公开日志对比：格式相同，**参数不同**
+
+`set_progress_0` 之后，正常设备的日志是：
+
+```
+BEGIN: MAIN:[0x0406] set_progress_0
+  restore-step-ids = {0x11030406:3}
+  restore-step-names = {0x11030406:set_progress_0}
+  restore-step-uptime = 1
+  found display: primary
+  Display state is 1
+  executing /usr/sbin/nvram ...
+  inverting UI color / display-scale / found applelogo at /usr/share/progressui/
+  ... 之后继续 is_host_compatible / cleanup_recovery_os_volume
+```
+
+我们的同段：
+
+```
+{1>5} ... {5>7}
+  BEGIN: MAIN:[0x0400] umask            → END ✓
+  BEGIN: MAIN:[0x0402] setvbuf          → END ✓
+  BEGIN: MAIN:[0x0406] set_progress_0   → 无 END
+```
+
+**必须注意的差异**：
+
+| 项 | 我们 | 公开日志 |
+|---|---|---|
+| 前缀 | `{1>5}` → `{5>7}` | `{3>6}` / `{3>7}` / `{4>7}` / `{4>18}` |
+| 类型 | `BEGIN/END/NOTICE/PROGRESS/MONITOR` | 同左，但序列更全 |
+| `restore-step-uptime` | **-756316507015** | **1** |
+
+所以**不能拿公开日志去解释我们自己的参数**（`{a>b}` 是上下文，不是固定格式）。
+`found display` / `applelogo` 之类的行我们从头到尾**没有出现过**。
+
+> 另外一个容易误判的点：`grep applelogo` 在我们的日志里能命中 2 行，但那是
+> **idevicerestore 解包 `applelogo@2x~mac-USBc.im4p`**，不是 guest 的显示日志。
+
+## 7.6 `set_progress_0` 那一刻的线程表
+
+`HENGE_STOP_ON="set_progress_0"` 命中时同时调用 `hv_threads_dump()`（新增），结果：
+
+```
+hengevm: threads: 64 processes, 3 threads mapped
+proc kernelmanagerd   task ...  th ... state 0x1 wait_event 0
+proc launchd          task ...  th ... state 0x1 wait_event 2500
+proc restored_externa task ...  th ... state 0x1 wait_event 1f00
+```
+
+- 三个进程**各只有一个线程**，全部 `state = WAIT`
+- **只映射到 3 个线程** → 扫描范围明显不足（内核 task 的线程没扫到）
+
+这台机器上"等待图"小得不正常，所以**不能**据此断定"只有这三个在等"。要说明整机状态，
+必须覆盖所有 task 的全部线程。
+
+## 7.7 纠正：CLI 没有图形通路，不能用它验证显示
+
+曾提出"在设备上用 CLI 跑，因为真 PVG 能验证显示"。**这是错的**，两条 CLI 构建都编 stub：
+
+```
+tools/build-install-host.sh:53    ... android/compat/pvg_metal_stub.c   （宿主 CLI）
+tools/build-install-android.sh:80 ... android/compat/pvg_metal_stub.c   （设备 CLI）
+```
+
+`pvg_metal_stub.c` 的注释原文：
+
+> *"Android has no Metal. The replacement is reims-vgpu ... until Stage 2 wires reims-vgpu in
+> there is no replay to call. ... the FIFO is still consumed, and **nothing is drawn**."*
+
+而且 `/data/local/tmp` 下的 CLI 进程**没有窗口系统连接、没有 SurfaceView、没有标准显示接口
+权限**，即使有真实现也无处呈现：
+
+| 路径 | PVG | 能显示 |
+|---|---|---|
+| 宿主 CLI | stub | ✗ |
+| 设备 CLI | stub | ✗（且无权限） |
+| APK | 真实现（iOS `pvg_metal.m` / Android reims-vgpu） | ✓（SurfaceView） |
+
+**结论：显示/进度 UI 只能用 APK 验证，且需要用户在界面点"安装"。**
+
+## 7.8 最重要的纠正：这不是崩溃，是累积死锁；此时日志与返回值都不可信
+
+用户指出的事实（本节最重要）：
+
+> **我们这边没有崩溃。执行到一半之后，一直出现各种死锁，最后内核无法判断具体状态，
+> 给不出真实有效的内容和报错。**
+
+这直接否定了本节此前（以及 §7.4）的一种推理方式：
+
+| 错误推理 | 为什么在死锁下无效 |
+|---|---|
+| "日志里没有 `CHECKPOINT_INTERNAL_ERROR`，所以没走到那一步" | 打印这行要拿锁、要线程、要写日志——死锁时这条路径本身就坏 |
+| "某个 syscall 没有返回，所以卡在它里面" | 可能返回了，但记录/输出机制已卡住 |
+| "返回值 `kIOReturnNotFound` 说明变量不存在" | 内核状态不一致时，返回值本身未必可信 |
+
+**日志缺失、报错缺失、返回码异常，都是死锁的"结果"，不是"原因"，也不能用来排除路径。**
+
+仍然唯一可靠的事实，是多次实测得到的形态：
+
+```
+所有线程 WAIT、两个 CPU 都进 WFI（98% idle）、无 panic、无异常退出
+```
+
+## 7.9 本轮仍然站得住的观测（与 §7.8 不冲突）
+
+这些是**结构性/配对性**证据，不依赖日志能否写出：
+
+- 缺页路径正常：PTE 100% 建立，且在推进（见 `docs/fault-pmap-2026-11-18.md` 的更正）；
+- `lck_mtx` 扫描：18601 候选，`needs_wakeup && owner == 0` **0 条**（单时刻采样）；
+- `thread+0x28` 是 waitq（type=1）、`thread+0x30` 是 turnstile（type=2，tsid=0）；
+- PV ticket lock 未启用（只有 3 条 `0x8300ff01` OEM 调用，无 WFK/KICK 的 `0xc3000005/6`）；
+- virtio-usb `13161 requests / 13161 responses` 完全配对；
+- 块设备 busy 0%，aux 有 0.5 MB/s +每秒 flush（NVRAM 落盘路径在工作）。
+
+## 7.10 下一步（在 §7.8 前提下）
+
+不再从日志/返回码反推，改为**直接画死锁现场**：
+
+1. 把线程扫描从"3 个线程"扩到**所有 task（含 kernel_task）的全部线程**；
+2. 每个线程记录 `wait_event` / `waitq` / `turnstile` / 持有的 `lck_mtx` / 内核栈；
+3. 拼**等待图**，判断是"存在环"还是"事件源消失"；
+4. **两次采样对比**（detach → 等 → 再采样），区分"卡死不动"与"慢速推进"。
+
+在此之前，`set_progress_0` 的语义（写 NVRAM + 找显示）只能作为**待验证假设**，不能当结论。

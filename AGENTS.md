@@ -252,6 +252,11 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 11. **“被推翻”要分三种**：① 观察对、归因错；② **前提已变**（当时确实如此，
     底层修好/开关关掉后不再复现）；③ 真误判（读错数据、用错工具）。
     ② 必须保留并记下它的有效前提，否则以后重新打开某个开关时会把历史现象当“新问题”重查一遍。
+12. **死锁状态下不能用“日志/报错缺失”做排除**：打印日志本身要拿锁、要线程、要写 I/O；
+    内核判断不了状态时，返回码也可能不可信。唯一可靠的形态是线程/CPU 状态本身。
+13. **CLI 不等于能显示**：宿主与设备 CLI 都编 `android/compat/pvg_metal_stub.c`，而且 CLI
+    进程没有窗口系统/Surface 权限 —— 显示与进度 UI 只能用 APK 验证。
+14. **字符串不按 8 字节对齐**，要按连续字节解（`ramrod-nvram-session` 按 qword 会读成 `rmarod`）。
 
 ## 7. 关键不变量（改这些会静默爆炸）
 
@@ -310,25 +315,33 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 ### 10.2 当前卡点（唯一一个）
 
 引导链、kext、IOKit、ramdisk、launchd bootstrap 全部通过，`restored_external` 已经真正在跑
-（19 万+ 块、2.8 万 syscall），然后进入**用户态缺页循环**：
+（19 万+ 块、2.8 万 syscall）。**缺页这条线已经证明是正常的**（PTE 100% 建立并在推进），
+旧的"PTE 恒为 0"是采样方式的问题。现在的现象是：
 
-```
-访问 → 缺页（translation fault L3）→ 处理返回 → 页表项仍未建立 → 再访问 → 再缺页
-→ 所有线程挂在 WQT_QUEUE → 两个 CPU 都进 WFI（不是崩溃，是无活可干）
-```
+> **没有崩溃**。执行到一半之后各处**陆续卡住、累积成多重死锁**，最后内核已无法判断自身状态，
+> 因此既给不出真实内容，也给不出有效报错。
 
-**已经确定的事实**（详见 `docs/investigation-tree.md` 与 `docs/fault-*.md`）：
+形态（多次实测）：**所有线程 `WAIT`、两个 CPU 都进 `WFI`（98% idle）、无 panic、无异常退出。**
 
-- 缺页页在 `vm_map` 里**有登记**（entry 存在，大小正常）；
-- 页表项（PTE）**确实为 0**；同一地址会**重复**缺页（`0x1007401cc` 在一轮里出现两次）；
-- ESR 为 `translation fault L3`、`EA=0`（不是外部 abort）、`WnR=0`（读）；
-- 故障横跨**匿名零页**与**子映射（线程栈）**两类 entry → 指向**共同下游**（写页表）；
-- `pmap_enter_options`（link `0xfffffe001ca2206c..0x1ca233ac`）**确实被执行过**；
-- 排除：磁盘 I/O（ramdisk 在内存）、网络（0/0）、外部 abort、PTE 写到错误物理页
-  （`HV_SLOW_MEM=1` 下 `TLB-fresh mismatch` = 0）、引擎读错页表（`hv_walk_dbg` 与手工遍历一致）。
+**由此得到一条硬约束**：死锁状态下，**日志缺失 / 报错缺失 / 返回码异常都是“结果”而不是
+“原因”，不能用来排除任何路径**。
 
-**下一步（唯一可信）**：用 `HV_TRACE_PC` 统计 `pmap_enter_options` 范围内的**真实**执行次数，
-并检查每次 fault 之后执行流是否进入它 —— 这才能分开“调用了但没写成功”与“根本没调用”。
+已经落到的最具体位置（**待验证假设，不是结论**）：
+
+- `restored_external` 的串口 CHECKPOINT 停在 `BEGIN: MAIN:[0x0406] set_progress_0`（无 END）；
+  `0x0400 umask`、`0x0402 setvbuf` 都正常返回；
+- 该时刻 `restored_externa` / `launchd` / `kernelmanagerd` 各只有一个线程，全部 `WAIT`
+  （但线程扫描只映射到 3 个线程，覆盖不足）；
+- 业务等待是 **mach IPC**：`-47 = mach_msg2_trap`（mach trap 表，不在 BSD syscall 表），
+  `MACH_RCV_MSG`、local port `0x507`、id `2989`；`kevent_id` 只是 libdispatch 调度层；
+- body 里解出 `ramrod-nvram-session`（`ramrod` = Apple 恢复工具，位于恢复 ramdisk）与
+  `0xe00002f0`（`kIOReturnNotFound`）。
+
+**下一步（唯一可信方向）**：不再从日志/返回码反推，直接画死锁现场 —— 把线程扫描扩到
+**所有 task（含 `kernel_task`）的全部线程**，记录每个线程的 `wait_event` / `waitq` /
+`turnstile` / 持有锁 / 内核栈，拼等待图，两次采样对比，区分"存在环"与"事件源消失"。
+
+完整事实与过程见 `docs/lost-wakeup-2026-11-19.md` §7。
 
 ### 10.3 已验证可用的工具
 
@@ -337,7 +350,8 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 | `tools/lcfs.py` | 从 `LC_FUNCTION_STARTS` 建函数索引（220 image / 149 938 函数），内核主代码没有符号时唯一可用 |
 | `tools/ksym.py` | kernelcache 符号解析（181 781 符号，只覆盖 kext） |
 | `hv_el0_flt_*` / `hv_el0_flt_ttbr0[]` | EL0 故障完整寄存器环 + 地址空间 |
-| `hv_el0_trace_*` / `hv_svc_*` | 用户态块轨迹 / syscall 参数与返回值 |
+| `hv_el0_trace_*` / `hv_svc_*` | 用户态块轨迹 / syscall 参数与返回值（含 `mach_msg2_trap` 的 header/body 解码） |
+| `hv_threads_dump()` | 引擎内线程表 dump（不需要 gdb）；`HENGE_STOP_ON` 命中时会自动调用 |
 | `HENGE_STOP_ON` + 现场保护 | 串口同步断点，停住后机器不拆 |
 
 ### 10.4 其它未解决
