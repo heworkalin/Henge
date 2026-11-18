@@ -1057,6 +1057,43 @@ static void th_dump_turnstile(uint64_t ts, int depth) {
         if (c) { fprintf(stderr, "(%s)", c); if (!owner) owner = c; }
     }
     fprintf(stderr, "\n");
+    /* Layout from XNU: waitq(40) free_turnstiles(16) inheritor_queue(8) inheritor_links(8)
+       htable_link(8) then ts_proprietor, i.e. around +0x50 on arm64 release builds. Print the
+       head unconditionally: a zero here is the whole answer (a lock with no owner). */
+    fprintf(stderr, "hengevm:       ts head:");
+    for (uint64_t off = 0x28; off < 0x90; off += 8) {
+        uint64_t v = th_pa64(tpa + off, NULL);
+        fprintf(stderr, " +0x%llx=%llx%s", (unsigned long long) off, (unsigned long long) v,
+                th_kaddr(v) ? "*" : "");
+        if (th_kaddr(v)) {
+            const char *c = th_comm_of(v);
+            if (c) fprintf(stderr, "(%s)", c);
+        }
+    }
+    fprintf(stderr, "\n");
+    {
+        /* ts_proprietor: 0 means the lock has no owner, so whoever is waiting on it cannot be
+           woken by the owner -- a lost wakeup. Non-zero: follow the owner one level, because an
+           owner that is itself blocked is the next link of the chain. */
+        uint64_t prop = th_pa64(tpa + 0x50, NULL);
+        if (!prop || !th_kaddr(prop)) {
+            fprintf(stderr, "hengevm:       proprietor NONE (unowned lock)\n");
+        } else {
+            uint64_t pp = th_walk(prop);
+            if (!pp) {
+                fprintf(stderr, "hengevm:       proprietor %llx not walkable (freed thread?)\n",
+                        (unsigned long long) prop);
+            } else {
+                uint64_t pst = th_pa64(pp + 0x1c8, NULL) & 0xffffffffull;
+                uint64_t pts = th_pa64(pp + 0x28, NULL);
+                fprintf(stderr, "hengevm:       proprietor %llx state 0x%llx waits_on %llx%s\n",
+                        (unsigned long long) prop, (unsigned long long) pst,
+                        (unsigned long long) pts, th_comm_of(prop) ? th_comm_of(prop) : "");
+                if (depth > 0 && pts && th_kaddr(pts) && pts != ts)
+                    th_dump_turnstile(pts, depth - 1);
+            }
+        }
+    }
     if (getenv("HV_TS_FULL")) {
         for (uint64_t off = 0x300; off < 0x400; off += 8) {
             uint64_t v = th_pa64(tpa + off, NULL);
@@ -1137,9 +1174,29 @@ static void th_dump_one(int idx) {
         const char *tag = "";
         for (int c = 0; c < g_board.ncpus; c++)
             if (g_cpus[c].tpidr_el1 == cur) tag = " (running here)";
-        fprintf(stderr, "hengevm:   th %llx state 0x%llx wait_event %llx%s\n",
+        uint64_t wq = th_pa64(tp + 0x20, NULL);
+        fprintf(stderr, "hengevm:   th %llx state 0x%llx wait_event %llx waitq %llx%s\n",
                 (unsigned long long) cur, (unsigned long long) st,
-                (unsigned long long) we, tag);
+                (unsigned long long) we, (unsigned long long) wq, tag);
+        /* The waitq it is parked on: any thread pointer inside names the others waiting there.
+           Two processes on one queue means one post would move both, which is the difference
+           between "waiting for work" and "waiting for a poster that is itself waiting". */
+        if (wq && th_kaddr(wq)) {
+            uint64_t wqp = th_walk(wq);
+            if (wqp) {
+                fprintf(stderr, "hengevm:     waitq %llx pa %llx:", (unsigned long long) wq,
+                        (unsigned long long) wqp);
+                for (uint64_t off = 0; off < 0x120; off += 8) {
+                    uint64_t v = th_pa64(wqp + off, NULL);
+                    if (!th_kaddr(v)) continue;
+                    const char *c = th_comm_of(v);
+                    fprintf(stderr, " +0x%llx=%llx", (unsigned long long) off,
+                            (unsigned long long) v);
+                    if (c) fprintf(stderr, "(%s)", c);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         if (getenv("HV_TH_STACK")) th_dump_stack(cur);
         th_dump_turnstile(ts, 2);
         if (next == head) break;
