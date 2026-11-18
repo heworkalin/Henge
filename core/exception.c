@@ -6,6 +6,10 @@
 uint64_t hv_svc_pc[HV_SVC_CAP];
 uint64_t hv_svc_x16[HV_SVC_CAP], hv_svc_x0[HV_SVC_CAP], hv_svc_x1[HV_SVC_CAP];
 uint64_t hv_svc_x2[HV_SVC_CAP], hv_svc_x3[HV_SVC_CAP];
+/* The address space a syscall came from: without it, the arguments cannot be read back. */
+uint64_t hv_svc_ttbr0[HV_SVC_CAP];
+/* The machine a syscall last came from, so the ring can be decoded without a CPU argument. */
+static HvMachine *g_svc_m;
 uint32_t hv_svc_imm[HV_SVC_CAP], hv_svc_el[HV_SVC_CAP];
 uint64_t hv_svc_n;
 /* Set when a syscall traps and cleared when userland runs again: a syscall still pending at the
@@ -195,6 +199,42 @@ void hv_svc_dump_tail(void) {
         for (uint32_t no = 0; no < 600; no++)
             if (hist[no]) fprintf(stderr, " %u=%u", no, hist[no]);
         fprintf(stderr, "\n");
+        /* Read the last arguments back out of guest user memory: for a syscall that blocks, the
+           pointed-to structures are the only record of what it is waiting for. */
+        {
+            int shown = 0;
+            HvCpu *cpu = (g_svc_m && g_svc_m->cpus[0]) ? g_svc_m->cpus[0] : NULL;
+            if (!cpu) goto g_svc_skip_args;
+            for (uint64_t i = n; i-- > 0 && shown < 3; ) {
+                uint64_t s = i & (HV_SVC_CAP - 1);
+                uint32_t no = (uint32_t) hv_svc_x16[s];
+                uint64_t args[2] = { hv_svc_x0[s], hv_svc_x1[s] };
+                fprintf(stderr, "hengevm: argdump pc %llx sys %u ttbr0 %llx\n",
+                        (unsigned long long) hv_svc_pc[s], no,
+                        (unsigned long long) hv_svc_ttbr0[s]);
+                for (int a = 0; a < 2; a++) {
+                    if (!args[a]) continue;
+                    /* Walk in the space the call came from, not the current one. */
+                    uint64_t saved_ttbr0 = cpu->ttbr0_el1;
+                    cpu->ttbr0_el1 = hv_svc_ttbr0[s];
+                    HvWalk w;
+                    hv_mmu_walk(cpu, args[a], HV_ACC_READ, 0, &w);
+                    cpu->ttbr0_el1 = saved_ttbr0;
+                    if (w.fsc) continue;
+                    uint8_t buf[0x40];
+                    if (hv_phys_read(cpu->m, w.pa, buf, sizeof buf) != 0) continue;
+                    fprintf(stderr, "hengevm:   arg%d %llx:", a, (unsigned long long) args[a]);
+                    for (int k = 0; k < 0x40; k += 8) {
+                        uint64_t v;
+                        memcpy(&v, buf + k, 8);
+                        fprintf(stderr, " %llx", (unsigned long long) v);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                shown++;
+            }
+        g_svc_skip_args:;
+        }
         for (uint64_t i = n; i-- > 0; ) {
             uint64_t s = i & (HV_SVC_CAP - 1);
             uint32_t no = (uint32_t) hv_svc_x16[s];
@@ -1238,6 +1278,8 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             hv_svc_x1[slot] = cpu->x[1];
             hv_svc_x2[slot] = cpu->x[2];
             hv_svc_x3[slot] = cpu->x[3];
+            hv_svc_ttbr0[slot] = cpu->ttbr0_el1;
+            g_svc_m = cpu->m;
             hv_svc_el[slot] = cpu->el;
             hv_svc_ret[slot] = 0;
             hv_svc_path[slot][0] = 0;

@@ -472,6 +472,22 @@ static void *kicker_thread(void *arg) {
     (void) arg;
     uint64_t n = 0;
     int scanned = 0;
+    {   /* Measure the timebase the guest will see instead of trusting the 24 MHz constant: the
+           counter is a software scaling of CLOCK_MONOTONIC_RAW, so a wrong scale or a wrong
+           HV_TICK_HZ silently shifts every guest timestamp. */
+        extern uint64_t hv_counter(void);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
+        uint64_t a = hv_counter();
+        struct timespec d = { 0, 200 * 1000 * 1000 };
+        nanosleep(&d, NULL);
+        uint64_t b = hv_counter();
+        clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
+        double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        if (secs > 0.01)
+            fprintf(stderr, "hengevm: timebase measured %.4f MHz (%llu ticks in %.4f s)\n",
+                    (double)(b - a) / secs / 1e6, (unsigned long long)(b - a), secs);
+    }
     fprintf(stderr, "hengevm: kicker up (scan=%s)\n", getenv("HV_SCAN_PROC") ? "yes" : "no");
     while (g_running) {
         usleep(1000);
