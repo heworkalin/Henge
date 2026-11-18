@@ -67,7 +67,7 @@
 | 28 | 外部 abort | ✅ 排除 | ESR 为 translation fault、`EA=0` |
 | 29 | `bdif` 只报 online 不报 offline | ✅ 已知限制 | 不是 bug：这是 `usb_handoff_to_kernel()` 主动 bounce 的原因 |
 | 30 | xHCI 的 4 个 bug | ✅ 无关 | restore 走 virtio-usb/bdif，不走 xhci |
-| 31 | 显示/PVG 导致卡住 | 🔶 未定 | 宿主与设备 CLI 都编 `pvg_metal_stub.c`，且 CLI 无显示接口权限；只有 APK 能验 |
+| 31 | 显示/PVG 导致卡住 | ✅ 排除（作为卡点原因） | ① 卡在 NVRAM 会话的 mach 消息（body `ramrod-nvram-session`），还没走到显示；② 安装阶段显示只需**设备模型**，`pvg_lite.c` 的模式/ack/swap 完整，stub 只替换"画"（`pvg_metal_*`）；③ 上游 `BootDisplay.swift` 注释：虚拟 Mac 的固件**不画 logo**，boot framebuffer 只有进度条 |
 
 ---
 
@@ -132,6 +132,23 @@
 | **合计** | **41** | **4** | **4** |
 
 ---
+
+## 8.5 显示在安装阶段的真实语义（补充说明）
+
+用户问过"上游安装时显示是正常处理还是桩就够了"。结论：**桩够用**，但前提是设备模型在。
+
+| 层 | 上游怎么处理 | 我们的现状 |
+|---|---|---|
+| guest 的显示设备 | PVG 设备提供 display（`pvg_lite.c`：一种模式、共享状态页、`ack`、`swap`） | **有**（`devices/vmapple.c` 无条件创建 `b->pvg`） |
+| guest 的"找显示" | IOKit/CoreDisplay 找到 PVG 的 display 服务 | 设备模型在，服务应该在 |
+| 真实渲染（Metal replay） | `pvg_metal.m` 把 FIFO 重放到 Metal | **桩**：MMIO/FIFO 仍被消费，只是不画 |
+| boot 画面 | 固件**不画 logo**，framebuffer 里只有进度条；logo 是 App 叠的（`ios/Henge/BootDisplay.swift` 注释） | 无画面，但不影响 guest |
+| 安装进度 | idevicerestore 的 `RESTORE_STEP_*` 回调 → App 界面 | CLI 只打日志 |
+
+所以：
+- **安装阶段不需要真实渲染**，guest 也不需要"看到"自己画的东西；
+- 我们卡住的位置在 `set_progress_0` 的 **NVRAM 会话**（mach body 已解出），还没到 display；
+- 只有等到"macOS 起来、WindowServer 需要真实帧"时，stub 才会成为问题 —— 那不是当前阶段。
 
 ## 9. 现在真正剩下的（只有这些）
 
