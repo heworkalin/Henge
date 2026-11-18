@@ -26,8 +26,31 @@
 #define CLIDR        0x0a200023ull         /* L1 split, L2 unified */
 #define CNTFRQ       24000000ull
 
+/* The guest's counter starts when the guest starts.
+ *
+ * mach_absolute_time() here is the host's CLOCK_MONOTONIC_RAW scaled to 24 MHz, i.e. ticks since
+ * the HOST booted (days). A virtual Mac's CNTVCT_EL0 starts at power-on, and XNU records the value
+ * it sees during boot as rtclock_base_abstime; userspace then computes mach_absolute_time as
+ * CNTVCT - base. With the host's value handed through unchanged and base reading 0, the guest's
+ * uptime became the host's uptime (measured: 6.16 days), which ramrod reported as a negative
+ * restore-step-uptime. Subtracting the first value seen here makes the guest's counter start near
+ * zero, exactly as the hardware's does, and keeps every comparison (timers, boottime, commpage)
+ * on one consistent base.
+ */
+static uint64_t cntv_base;
+static int cntv_base_set;
+
 static uint64_t counter(void) {
-    return mach_absolute_time(); /* 24 MHz on Apple silicon */
+    uint64_t now = mach_absolute_time(); /* 24 MHz on Apple silicon */
+    if (!__atomic_load_n(&cntv_base_set, __ATOMIC_ACQUIRE)) {
+        uint64_t zero = 0;
+        if (__atomic_compare_exchange_n(&cntv_base, &zero, now, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&cntv_base_set, 1, __ATOMIC_RELEASE);
+        else
+            while (!__atomic_load_n(&cntv_base_set, __ATOMIC_ACQUIRE)) { }
+    }
+    return now - __atomic_load_n(&cntv_base, __ATOMIC_RELAXED);
 }
 
 uint64_t hv_counter(void) {

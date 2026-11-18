@@ -1385,12 +1385,201 @@ static void th_scan_mtx(void) {
                     " needs_wakeup && no owner\n", total, orphan, stale);
 }
 
+/* ---- IPC: which task owns a mach port ----------------------------------
+ *
+ * Layout from xnu-11417 (osfmk/ipc/*.h), computed by tools/xnu-ipc-layout.py:
+ *   ipc_space: is_table +0x18, is_task +0x20
+ *   ipc_entry: 0x18 bytes, ie_object +0x00, ie_bits +0x08
+ *   name -> index = name >> 8; generation = (name & 0xff) << 24
+ *
+ * struct task and struct ipc_port are too large (and too configuration-dependent)
+ * to hard-code a field offset for, so both are found by self-check: a candidate
+ * ipc_space is a pointer P inside the task with P+0x20 == task; a candidate
+ * ip_receiver is a pointer R inside the port with R+0x20 == a known task.
+ * A wrong guess can then only produce "not found", never a wrong name.
+ */
+static uint32_t th_k32(uint64_t va) {
+    uint64_t pa = th_walk(va);
+    uint32_t v = 0;
+    if (!pa || hv_phys_read(&g_machine, pa, &v, 4) != 0) return 0;
+    return v;
+}
+
+static int th_task_to_proc(uint64_t task, char *out, size_t n) {
+    for (int k = 0; k < g_pe_n; k++) {
+        if (th_proc_task(g_pe[k].proc_pa, NULL) == task) {
+            snprintf(out, n, "%s", g_pe[k].comm);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t th_itk_space(uint64_t task) {
+    if (!task) return 0;
+    for (uint64_t off = 0; off < 0x1000; off += 8) {
+        uint64_t p = th_k64(task + off);
+        if (!th_kaddr(p)) continue;
+        if (th_k64(p + 0x20) != task) continue;          /* is_task must point back */
+        if (!th_kaddr(th_k64(p + 0x18))) continue;        /* is_table must be a kernel pointer */
+        return p;
+    }
+    return 0;
+}
+
+/* For one port name: every space that has it, and who receives on that port. */
+static void th_ipc_probe(void) {
+    const char *e = getenv("HV_IPC_PROBE");
+    if (!e || !*e) return;
+    char list[256];
+    snprintf(list, sizeof list, "%s", e);
+    for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
+        uint64_t name = strtoull(tok, NULL, 0);
+        if (!name) continue;
+        uint32_t idx = (uint32_t)(name >> 8), gen = (uint32_t)((name & 0xff) << 24);
+        int found = 0;
+        for (int k = 0; k < g_pe_n; k++) {
+            uint64_t task = th_proc_task(g_pe[k].proc_pa, NULL);
+            uint64_t space = th_itk_space(task);
+            if (!space) continue;
+            uint64_t table = th_k64(space + 0x18);
+            if (!th_kaddr(table)) continue;
+            uint64_t entry = table + (uint64_t)idx * 0x18;
+            uint32_t bits = th_k32(entry + 0x08);
+            if ((bits & 0xff000000u) != gen) continue;    /* generation differs: another name */
+            if ((bits & 0x001f0000u) == 0) continue;      /* no right: dead entry */
+            uint64_t port = th_k64(entry);
+            if (!th_kaddr(port)) continue;
+            /* ip_receiver: a pointer inside the port whose space belongs to a known task */
+            uint64_t rt = 0;
+            for (uint64_t off = 0; off < 0x800; off += 8) {
+                uint64_t cand = th_k64(port + off);
+                if (!th_kaddr(cand)) continue;
+                uint64_t t = th_k64(cand + 0x20);
+                if (!t) continue;
+                char tmp[20];
+                if (!th_task_to_proc(t, tmp, sizeof tmp)) continue;
+                if (!th_kaddr(th_k64(cand + 0x18))) continue;
+                rt = t;
+                break;
+            }
+            char owner[20] = "?";
+            if (rt) th_task_to_proc(rt, owner, sizeof owner);
+            fprintf(stderr, "hengevm: ipc name %#llx (idx %u gen %#x) in %s: "
+                            "port %#llx bits %#x receiver %#llx (%s)\n",
+                    (unsigned long long) name, idx, gen, g_pe[k].comm,
+                    (unsigned long long) port, bits, (unsigned long long) rt, owner);
+            found++;
+        }
+        if (!found)
+            fprintf(stderr, "hengevm: ipc name %#llx: not found in any task's space\n",
+                    (unsigned long long) name);
+    }
+}
+
+/* ---- clock: what the guest actually believes its timebase is ----------
+ *
+ * XNU's arm timebase_callback() (osfmk/arm/rtclock.c:106) turns
+ *   { num = gPEClockFrequencyInfo.timebase_frequency_hz, den = 1 }
+ * into rtclock_timebase_const = { numer = den*1e9, denom = num }, i.e.
+ * { 1e9, 24e6 } for a 24 MHz counter. mach_timebase_info() returns exactly that
+ * pair, and userspace scales ticks with it, so a wrong denom shows up directly as
+ * calendar time far in the future.
+ *
+ * The pair is a plain {u32 numer, u32 denom} in kernel data, so it can be found
+ * by value: look for numer = 1e9 and print the word after it. 1e9/24e6 is
+ * correct; 1e9/1 means "one tick per second", which is what a 60-year offset
+ * looks like.
+ */
+static uint32_t g_clk_denom[8];
+static int g_clk_denom_n;
+
+static void hv_clock_probe(void) {
+    if (!getenv("HV_CLOCK_PROBE")) return;
+    /* Only the kernel image first: rtclock_timebase_const lives there, and a hit
+       elsewhere is some process's cached copy, not the source of truth. */
+    {
+        uint64_t klo = g_machine.kimage_pa, khi = klo + 0x7000000ull;
+        enum { CH = 1 << 20 };
+        static uint8_t kb[CH];
+        int kn = 0;
+        for (uint64_t pa = klo; pa < khi && kn < 64; pa += CH) {
+            if (hv_phys_read(&g_machine, pa, kb, CH) != 0) continue;
+            for (uint32_t i = 0; i + 8 <= CH; i += 4) {
+                uint32_t numer, denom;
+                memcpy(&numer, kb + i, 4);
+                if (numer != 1000000000u) continue;
+                memcpy(&denom, kb + i + 4, 4);
+                if (denom == 0 || denom > 100000000u) continue;
+                fprintf(stderr, "hengevm: clock: KERNEL image pair at pa %#llx: numer %u denom %u\n",
+                        (unsigned long long) (pa + i), numer, denom);
+                kn++;
+                if (kn >= 64) break;
+            }
+        }
+        if (!kn) fprintf(stderr, "hengevm: clock: no {1e9,denom} pair in the kernel image\n");
+    }
+    enum { CHUNK = 1 << 20 };
+    static uint8_t buf[CHUNK];
+    int shown = 0;
+    for (int r = 0; r < g_machine.nram && shown < 8; r++) {
+        uint64_t pa = g_machine.ram[r].pa, sz = g_machine.ram[r].size;
+        for (uint64_t off = 0; off + CHUNK <= sz && shown < 8; off += CHUNK) {
+            if (hv_phys_read(&g_machine, pa + off, buf, CHUNK) != 0) continue;
+            for (uint32_t i = 0; i + 8 <= CHUNK; i += 4) {
+                uint32_t numer, denom;
+                memcpy(&numer, buf + i, 4);
+                if (numer != 1000000000u) continue;
+                memcpy(&denom, buf + i + 4, 4);
+                if (denom == 0 || denom > 100000000u) continue;
+                int dup = 0;
+                for (int k = 0; k < g_clk_denom_n; k++) if (g_clk_denom[k] == denom) dup = 1;
+                if (!dup && g_clk_denom_n < 8) g_clk_denom[g_clk_denom_n++] = denom;
+                fprintf(stderr, "hengevm: clock: timebase pair at pa %#llx: numer %u denom %u%s\n",
+                        (unsigned long long) (pa + off + i), numer, denom,
+                        denom == 24000000u ? " (24 MHz: correct)" :
+                        denom == 1u ? " (1 Hz: one tick per second -- wrong)" : "");
+                shown++;
+                if (shown >= 8) break;
+            }
+        }
+    }
+    if (!shown) fprintf(stderr, "hengevm: clock: no {1e9, denom} pair found in RAM\n");
+
+    /* The device tree is what pe_identify_machine copies that value from, and an
+       ADT property is key[32] + u32 length + data. Print what the tree actually
+       says, so "24 MHz in the story but 1 Hz in the kernel" is decided by data. */
+    int dt_shown = 0;
+    for (int r = 0; r < g_machine.nram && dt_shown < 32; r++) {
+        uint64_t pa = g_machine.ram[r].pa, sz = g_machine.ram[r].size;
+        for (uint64_t off = 0; off + CHUNK <= sz && dt_shown < 32; off += CHUNK) {
+            if (hv_phys_read(&g_machine, pa + off, buf, CHUNK) != 0) continue;
+            for (uint32_t i = 0; i + 48 <= CHUNK; i += 4) {
+                if (memcmp(buf + i, "timebase-frequency", 18)) continue;
+                uint32_t len;
+                memcpy(&len, buf + i + 32, 4);
+                if (len == 0 || len > 8) continue;
+                uint64_t v = 0;
+                memcpy(&v, buf + i + 36, len);
+                fprintf(stderr, "hengevm: clock: device tree timebase-frequency at pa %#llx: "
+                                "len %u value %#llx (little-endian read)\n",
+                        (unsigned long long) (pa + off + i), len, (unsigned long long) v);
+                dt_shown++;
+                if (dt_shown >= 32) break;
+            }
+        }
+    }
+    if (!dt_shown) fprintf(stderr, "hengevm: clock: no timebase-frequency in RAM\n");
+}
+
 void hv_threads_dump(void) {
     th_scan_all();
     th_build_map();
     fprintf(stderr, "hengevm: threads: %d processes, %d threads mapped\n", g_pe_n, g_tm_n);
     for (int i = 0; i < g_pe_n; i++) th_dump_one(i);
     if (getenv("HV_TS_MTX")) th_scan_mtx();
+    th_ipc_probe();
+    hv_clock_probe();
     for (int c = 0; c < g_board.ncpus; c++)
         fprintf(stderr, "hengevm: cpu%d pc %llx tpidr_el1 %llx el%u\n", c,
                 (unsigned long long) g_cpus[c].pc, (unsigned long long) g_cpus[c].tpidr_el1,

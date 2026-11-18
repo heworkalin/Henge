@@ -76,7 +76,7 @@
 | # | 假设 | 结论 | 证据 |
 |---|---|---|---|
 | 32 | 时间基频率不对（假设 24 MHz 有误） | ✅ 排除 | 实测 **23.9998 MHz**（`timebase measured`），软件缩放无溢出 |
-| 33 | `restore-step-uptime` 为负数导致超时算错 | 🔶 未定 | 我们的值是 `-756316507015`，正常设备是 `1`；但在"内核状态不可信"的前提下，这个值本身不能当证据 |
+| 33 | 时间不对（uptime 为负 / 时间是 2087）导致卡住 | ✅ **已修，且不解释卡点** | 根因与修复见 §8.6：guest 的 CNTVCT 从**宿主开机**起算（实测 6.16 天），commpage offset=0，于是 uptime 变成宿主开机时长、`restore-step-uptime` 溢出为负（`-756316507015` ns）。修正后 `restore-step-uptime = 8`、时间戳与宿主 UTC 一致，**但卡点仍在** `BEGIN: MAIN:[0x0406] set_progress_0` |
 
 ---
 
@@ -132,6 +132,58 @@
 | **合计** | **42** | **4** | **3** |
 
 ---
+
+## 8.6 时间偏差：根因、修复，以及它不解释卡点（2026-11-19）
+
+### 现象
+
+```
+guest 串口时间戳   [22:35:37.0470-GMT] / 另一轮 launchd 显示 2087-06-30
+restore-step-uptime = -756316507015          ← 负值，且每轮都相同
+```
+
+### 根因（gdb 实测，未重跑进程）
+
+| 检查 | 结果 |
+|---|---|
+| 宿主 `date` / `/proc/uptime` | 2026-11-19，uptime 552 498 秒（6.4 天）✓ |
+| `hv_counter()` | 12 778 900 511 786 ticks；÷24e6 = **532 454 秒 = 6.16 天** |
+| guest commpage `_COMM_PAGE_TIMEBASE_OFFSET` | **0**（用户态 `mach_absolute_time` = CNTVCT − 0） |
+| `g_board.rtc.offset` | 0（guest 从未写 PL031 → RTC 本身是 2026） |
+| 设备树 `timebase-frequency` | 24000000（20+ 处，全部正确） |
+| 内核镜像里的 `{1e9,24e6}` / `{1e9,1}` | 都不存在（那 3 处 `{1e9,1}` 是 libsystem 的常量对） |
+
+**根因**：`core/sysreg.c` 的 `counter()` 直接返回 `mach_absolute_time()`，而 compat 把它实现为
+宿主 `CLOCK_MONOTONIC_RAW` 的 24 MHz 缩放 —— **从宿主开机起算**。真实硬件的 `CNTVCT_EL0`
+从芯片上电起算，XNU 在 boot 时记录 `rtclock_base_abstime`，用户态算的是
+`CNTVCT − base`。我们这边 base 读到 0，于是 guest 的 uptime = 宿主开机时长（6.16 天），
+ramrod 把它按纳秒读就成了负数（−756 秒）。
+
+### 修复
+
+`counter()` 第一次被调用时锁定当时的 `mach_absolute_time()` 作为基准，之后返回差值：
+
+```c
+static uint64_t cntv_base;
+static int cntv_base_set;
+static uint64_t counter(void) {
+    uint64_t now = mach_absolute_time();
+    if (!__atomic_load_n(&cntv_base_set, __ATOMIC_ACQUIRE)) { /* CAS 锁定 now */ }
+    return now - __atomic_load_n(&cntv_base, __ATOMIC_RELAXED);
+}
+```
+
+### 验证（设备实测）
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| `restore-step-uptime` | `-756316507015` | **`8`** |
+| 串口时间戳 | 22:35 / 2087 | **16:08-GMT（与宿主 UTC 一致）** |
+| 到 CHECKPOINT 的时间 | 180 秒仍在缺页 | **25 秒内 18 条 CHECKPOINT** |
+| 卡点 | `BEGIN set_progress_0` | **仍是 `BEGIN set_progress_0`，无 END** |
+
+**结论**：时间偏差已修，但**它不是卡点原因**（修复后卡点不变）。
+它的独立价值在于：后续恢复流程里的签名有效期、日志时间线、超时判断都不再建立在错误的时间上。
 
 ## 8.5 显示在安装阶段的真实语义（补充说明）
 
