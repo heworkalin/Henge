@@ -257,6 +257,14 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 13. **CLI 不等于能显示**：宿主与设备 CLI 都编 `android/compat/pvg_metal_stub.c`，而且 CLI
     进程没有窗口系统/Surface 权限 —— 显示与进度 UI 只能用 APK 验证。
 14. **字符串不按 8 字节对齐**，要按连续字节解（`ramrod-nvram-session` 按 qword 会读成 `rmarod`）。
+15. **时间在 Apple 生态里是签名的前置条件，不是"显示问题"。** TSS 票据、证书有效期、
+    APTicket/nonce、`restore-outcome` 时间戳都带时间窗口；guest 的时间错（哪怕只是 uptime
+    溢出成负、或日期漂到未来），个性化材料在它看来就不在有效期内，恢复流程会停住。
+    **这不是 Linux**：Linux 里时间偏差通常只影响日志与超时，Apple 里它直接决定验证能否通过。
+    实测：只改 `counter()` 的基准（时间从 2087/负 uptime 修正为 2026/正 uptime），恢复就从
+    `set_progress_0` 卡死推进到 **ASR 90%**（`docs/exclusions-current-stall-2026-11-19.md` §8.6）。
+16. **"改了一个变量后卡点没变"必须观察足够久再下结论。** 25 秒时 `set_progress_0` 还在原地，
+    但那只是"还没到继续的那一刻"；差几分钟就得出过相反结论。
 
 ## 7. 关键不变量（改这些会静默爆炸）
 
@@ -315,11 +323,32 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 **只有安装流程走完之后才会碰 UI**。届时若需要用 `gdb` 推送 / `run-as` 之类手段调试，
 那**只适用于调试**；真正控制 `.so` 的行为要走别的方案（不要在 UI 里依赖调试通道）。
 
-### 10.2 当前卡点（唯一一个）
+### 10.2 当前状态（2026-11-19 更新）
 
-引导链、kext、IOKit、ramdisk、launchd bootstrap 全部通过，`restored_external` 已经真正在跑
-（19 万+ 块、2.8 万 syscall）。**缺页这条线已经证明是正常的**（PTE 100% 建立并在推进），
-旧的"PTE 恒为 0"是采样方式的问题。现在的现象是：
+**旧的"整机死锁"卡点已经解决，根因是时间机制错误，不是死锁本身。**
+
+- `core/sysreg.c` 的 `counter()` 过去直接返回宿主 `CLOCK_MONOTONIC_RAW` 缩放到 24 MHz 的值，
+  即**从宿主开机起算**（实测 6.16 天），而 guest 的 commpage offset 读到 0；
+- 于是 guest 的 uptime = 宿主开机时长，`restore-step-uptime` 溢出成负（`-756316507015` ns），
+  时间漂到 2087；
+- **Apple 的个性化恢复材料带时间窗口**，时间不符即无法通过验证 → `restored_external` 停在
+  `set_progress_0`（见 §6 铁律 15）；
+- 修复：`counter()` 第一次调用时锁定基准、之后返回差值（guest 计数器从 0 开始）。
+
+修复后的实测（设备）：
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| `restore-step-uptime` | `-756316507015` | `8` |
+| 串口时间戳 | 22:35 / 2087 | 16:08-GMT（= 宿主 UTC） |
+| `set_progress_0` | 稳定卡住 | 通过 |
+| 后续 checkpoint | 从未到达 | `update_fillmore` → `fdr_verify_sealed_manifest` → `commit_sep_os` → `await_system_image_invert_retry` |
+| 系统镜像传输 | — | 11,733,565,440 bytes → `/mnt1/apfs_invert_asr_img` |
+| ASR 进度 | 0% | **90%** |
+
+当前推进到 ASR 90%（显示进度 54%），**接下来要看它是否跑到 100% 并完成重启**。
+
+以下是旧卡点的历史记录，保留作参考（缺页线已证明正常）：
 
 > **没有崩溃**。执行到一半之后各处**陆续卡住、累积成多重死锁**，最后内核已无法判断自身状态，
 > 因此既给不出真实内容，也给不出有效报错。
