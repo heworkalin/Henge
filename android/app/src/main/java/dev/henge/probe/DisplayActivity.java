@@ -92,16 +92,24 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         Ui.inset(root);
         root.setBackgroundColor(0xFF000000);   // the guest's own black, not the page colour
 
+        surface = new SurfaceView(this);
+        surface.getHolder().addCallback(this);
+        root.addView(surface, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        /* After the SurfaceView, not before.
+         *
+         * A SurfaceView punches a hole in the window's content and shows its own surface through
+         * it; anything added *before* it in the same FrameLayout sits below that hole and is covered
+         * by it. Added first, this ImageView received a frame every 250 ms and was never once
+         * visible -- which is what "the boot framebuffer is read but nothing is displayed" looked
+         * like from outside.
+         */
         fbView = new ImageView(this);
         fbView.setBackgroundColor(0xff000000);
         fbView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         fbView.setVisibility(View.GONE);
         root.addView(fbView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        surface = new SurfaceView(this);
-        surface.getHolder().addCallback(this);
-        root.addView(surface, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         status = Ui.mono(this, "", 11f);

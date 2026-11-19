@@ -336,10 +336,10 @@ void hv_reims_pvg_attach_window(HvReimsPvg *p, void *native_window) {
         fail("rvg_display_attach_android_window", st);
         return;
     }
-    /* Always, and with the size: this line is the answer to "did the GPU ever get a window", and
-       without it a black screen and a working-but-empty screen look identical in the log. */
-    fprintf(stderr, "reims: display attached to the host's window (%dx%d)\n",
-            p->mode_width, p->mode_height);
+    /* Always, and with the window's size: this line is the answer to "did the GPU ever get a
+       window", and without it a black screen and a working-but-empty screen look identical in the
+       log. The guest's mode is reported separately when it sets one. */
+    fprintf(stderr, "reims: display attached to the host's window\n");
 }
 
 /** What the display is doing: {has a mode, guest presents, host presents}. For the app's status. */
