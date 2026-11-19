@@ -1,5 +1,14 @@
 # 明天的工作：用 CLI 跑 GPU 的离屏渲染（2026-11-19 记）
 
+## ⚠️ 磁盘镜像约束（操作者明确要求，动手前先读）
+
+- **CLI 的安装流程只跑一次。** 成功之后 `workB/disk.img`（逻辑大小 64 GiB）**不得删除**，
+  也**不得再启动第二次安装**——每跑一次安装都会创建/覆盖一个 64 GiB 的镜像。
+- 这个镜像要**保留并复用于 GPU 启动渲染测试**（把它当成"已安装的 macOS"来引导）。
+- 需要新实验环境时，先确认能否复用现有镜像；确实需要新镜像，**必须先问操作者**。
+- 2026-11-19 傍晚：App（APK）的数据目录已由操作者清空，所以现在唯一的安装资产
+  只能是 CLI 跑出来的那一份。**不要用 App 再装一遍**，那也是 64 GiB。
+
 ## 为什么要做
 
 CLI（`tools/build-install-android.sh`）编的是 `pvg_metal_stub.c`，Metal replay 是空实现，
@@ -102,10 +111,11 @@ if (p->frame_pending && p->have_mode) {
 | `metal2vulkan` 的降级项（NativeNanEncoding / NativeMinMax / 收敛性） | 只影响渲染精度，不影响启动 |
 | 链接 1 GB 静态库 | 增量构建没事，干净重建会很慢 |
 
-## 今天的落点（第二天接手先看这里）
+## 当前落点（第二天接手先看这里）
 
-- **APK 已经能真正安装**：`disk blocks` 0 → 6.7 M（约 3.3 GB），进度 22%，
-  `ramrod_probe_media_internal` / GPT / 合成 APFS 容器都在跑
-- 根因是**编译选项不一致**，见 `docs/jni-cli-build-parity-2026-11-19.md`
-- 最新提交 `3035700`
-- 22% 之后磁盘增长变慢，需确认它是卡住还是在做慢操作（`henge-serial.log` 看最后一条）
+- **APK 已经能真正安装**：`disk blocks` 0 → 6.7 M（约 3.3 GB），进度到过 22%，
+  `ramrod_probe_media_internal` / GPT / 合成 APFS 容器都在跑。
+  那次运行的数据目录**已被操作者清空**，不再是资产。
+- 根因是**编译选项不一致**，见 `docs/jni-cli-build-parity-2026-11-19.md`（提交 `3035700`）。
+- **接下来用 CLI 跑一次完整安装**（`/data/local/tmp/henge`，workB），
+  跑完保留 `workB/disk.img`，之后 GPU 测试直接复用，不再重装。
