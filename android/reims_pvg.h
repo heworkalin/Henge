@@ -44,4 +44,10 @@ void hv_reims_pvg_poll(HvReimsPvg *p);
 
 void hv_reims_pvg_destroy(HvReimsPvg *p);
 
+/*
+ * Writes the guest's current frame to `path` as a BMP, off-screen: no window needed.
+ * Returns 0 when a file was written, -1 before the guest has set a mode or on a refusal.
+ */
+int hv_reims_pvg_grab(HvReimsPvg *p, const char *path);
+
 #endif /* HENGE_REIMS_PVG_H */

@@ -158,6 +158,9 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
 static void gfx_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
     HvReimsPvg *p = opaque;
     (void)size;
+    /* Bring-up: which register the guest programs on the GPU device. */
+    if (p->log >= 1) fprintf(stderr, "reims: gfx write +%#llx = %#llx\n",
+                             (unsigned long long) off, (unsigned long long) val);
     rvg_device_mmio_write(p->device, off, (uint32_t)val);
 }
 
@@ -172,6 +175,12 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t val, unsigned size)
     HvReimsPvg *p = opaque;
     (void)size;
     if (!p->iosurface) return;
+    /* Bring-up: the guest's writes to the mapper's registers, so a refusal from inside reims can
+       be tied to the value that caused it. The register meanings are reims's (REG_RING_SIZE at
+       0x1008 is a count of 16-byte commands, and ring_size*16 must be a whole 16 KiB page). */
+    if (p->log >= 1 && off <= 0x1020)
+        fprintf(stderr, "reims: iosfc write +%#llx = %#llx\n", (unsigned long long) off,
+                (unsigned long long) val);
     rvg_iosurface_device_mmio_write(p->iosurface, off, val);
 }
 
@@ -316,6 +325,83 @@ void hv_reims_pvg_poll(HvReimsPvg *p) {
         p->frame_pending = 0;
         if (p->log) fprintf(stderr, "reims: frame %ux%u\n", p->mode_width, p->mode_height);
     }
+}
+
+/*
+ * Encodes the guest's current frame into a CPU-readable target and writes it to `path` as a BMP.
+ *
+ * This is the off-screen half of the display, and the Android-side counterpart of what the app
+ * does through a Surface: rvg_frame_target_create makes a texture "the library can draw into and
+ * the CPU can read", rvg_display_encode_frame copies the display's current frame into it, and
+ * rvg_frame_target_read_pixels brings it back. No window is involved, which is what makes a
+ * command-line bring-up able to see what the guest drew.
+ *
+ * Returns 0 when a file was written. Refuses before the guest has set a mode: until then there
+ * is no frame to encode.
+ */
+int hv_reims_pvg_grab(HvReimsPvg *p, const char *path) {
+    if (!p || !p->display || !p->device || !p->have_mode) return -1;
+
+    RvgFrameTargetConfig cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg;
+    cfg.width = p->mode_width;
+    cfg.height = p->mode_height;
+    cfg.format = RVG_PIXEL_FORMAT_BGRA8_UNORM;   /* the format the display presents in */
+
+    RvgFrameTarget *target = NULL;
+    if (rvg_frame_target_create(p->device, &cfg, &target) != RVG_OK) return -1;
+
+    RvgFrame *frame = NULL;
+    int ok = 0;
+    if (rvg_display_encode_frame(p->display, target, NULL, &frame) == RVG_OK) {
+        if (rvg_frame_commit(frame) == RVG_OK && rvg_frame_wait(frame) == RVG_OK) ok = 1;
+        rvg_frame_release(frame);
+    }
+    if (!ok) {
+        rvg_frame_target_release(target);
+        return -1;
+    }
+
+    size_t row = (size_t)p->mode_width * 4, size = row * p->mode_height;
+    uint8_t *px = malloc(size);
+    if (!px) {
+        rvg_frame_target_release(target);
+        return -1;
+    }
+    ok = rvg_frame_target_read_pixels(target, px, row, size) == RVG_OK;
+    rvg_frame_target_release(target);
+    if (!ok) {
+        free(px);
+        return -1;
+    }
+
+    /* BMP, 32-bit BGRA, rows bottom-up: the buffer is already BGRA, so only the row order has to
+       be flipped. */
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(px);
+        return -1;
+    }
+    uint8_t h[54];
+    memset(h, 0, sizeof h);
+    h[0] = 'B', h[1] = 'M';
+    uint32_t file_size = (uint32_t)(54 + size), data_off = 54, hdr = 40;
+    int32_t w = p->mode_width, ht = p->mode_height;
+    uint16_t planes = 1, bpp = 32;
+    memcpy(h + 2, &file_size, 4);
+    memcpy(h + 10, &data_off, 4);
+    memcpy(h + 14, &hdr, 4);
+    memcpy(h + 18, &w, 4);
+    memcpy(h + 22, &ht, 4);
+    memcpy(h + 26, &planes, 2);
+    memcpy(h + 28, &bpp, 2);
+    fwrite(h, 1, sizeof h, f);
+    for (int y = p->mode_height - 1; y >= 0; y--) fwrite(px + (size_t)y * row, 1, row, f);
+    fclose(f);
+    free(px);
+    if (p->log) fprintf(stderr, "reims: wrote %s (%ux%u)\n", path, p->mode_width, p->mode_height);
+    return 0;
 }
 
 void hv_reims_pvg_destroy(HvReimsPvg *p) {

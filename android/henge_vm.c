@@ -29,6 +29,7 @@
 #include "dispatch.h"
 #include "machine.h"
 #include "vmapple.h"
+#include "xhci.h"
 
 #ifdef HENGE_HAVE_REIMS
 #include "reims_pvg.h"
@@ -285,6 +286,65 @@ static int hap_disks_open(char **cursor, char *end, const char *disk, const char
         return -1;
     }
     return 0;
+}
+
+/*
+ * Injects one HID usage-page-7 key (0x29 = Escape), the same call the app makes through
+ * hv_vm_key_hid. Here because the board is static to this file: a command-line bring-up needs a
+ * way to wake a guest that is sitting at a prompt or a login window. Any thread, per xhci.h.
+ */
+void hv_android_key(uint8_t usage, int down) {
+    if (g_up && g_board.usb) hv_xhci_key(g_board.usb, usage, down);
+}
+
+/*
+ * Writes the guest's current frame to `path` (BMP), off-screen. The Android build's counterpart of
+ * what the app gets from its Surface: reims encodes into a CPU-readable target, so a command-line
+ * run can look at what macOS drew without any window at all.
+ */
+int hv_android_grab_frame(const char *path) {
+#ifdef HENGE_HAVE_REIMS
+    if (!g_up || !g_board.pvg) return -1;
+    return hv_reims_pvg_grab(g_board.pvg, path);
+#else
+    (void)path;
+    return -1;
+#endif
+}
+
+/*
+ * The boot framebuffer, found the way host/vm.c finds it: scan the first GB of guest RAM for the
+ * boot_args structure (revision 2..3, version 1..3, a kernel virtual base in 0xfffffe..., a
+ * physical base inside guest RAM) and take the framebuffer description out of it. iBoot puts that
+ * structure near 0x78ed0000, which is not the 0x837f0000 page the engine's own boot-args patch
+ * looks at -- measured: that page stays at rev 0 ver 0 while the kernel's arguments live here.
+ *
+ * This is the Android-side counterpart of hv_vm_boot_display's fallback, and it is what lets a
+ * command-line run see the firmware's progress bar before the guest ever programs its display.
+ */
+int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_t *height,
+                                uint32_t *stride) {
+    uint8_t *ram = g_board.ram;
+    uint64_t size = g_board.ram_size;
+    if (!ram || !size) return -1;
+    uint64_t limit = size < (1ull << 30) ? size : 1ull << 30;
+    for (uint64_t off = 0; off + 0x1000 <= limit; off += 0x4000) {
+        const uint64_t *q = (const uint64_t *)(ram + off);
+        const uint16_t *h = (const uint16_t *)(ram + off);
+        if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue;
+        if (q[1] >> 40 != 0xfffffe || q[2] < VMAPPLE_MEM || q[2] >= VMAPPLE_MEM + size) continue;
+        if (q[3] == 0 || q[3] > size) continue;
+        uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
+        if (w < 320 || w > 8192 || hh < 200 || hh > 8192) continue;
+        if (row < w * 4 || (depth & 0xff) != 32) continue;
+        if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;
+        *pixels = ram + (base - VMAPPLE_MEM);
+        *width = (uint32_t)w;
+        *height = (uint32_t)hh;
+        *stride = (uint32_t)row;
+        return 0;
+    }
+    return -1;
 }
 
 void hv_android_vm_stop(void) {

@@ -28,13 +28,28 @@ RESTORE=${RESTORE:-$AND/libhengerestore.a}
 CURL=$PWD/work/andcli/curl
 OSSL=$PWD/work/andcli/ossl
 LIBZIP=${LIBZIP:-$AND/../restore/deps/libzip/lib/libzip.a}
+# reims-vgpu: the paravirtual GPU as a host library. Built out of tree by cargo; the CLI links it
+# so the GPU path can be exercised without the app (which is the only other place it exists today).
+REIMS_DIR=${REIMS_DIR:-$PWD/android/third_party/reims-vgpu}
+REIMS_LIB=$REIMS_DIR/target/aarch64-linux-android/release/libreims_vgpu_c.a
+REIMS_INC=$REIMS_DIR/crates/reims-vgpu-c/include
 
 for f in "$RESTORE" "$CURL/lib/libcurl.a" "$OSSL/lib/libssl.a" "$OSSL/lib/libcrypto.a"; do
     [ -f "$f" ] || { echo "build-install-android.sh: missing $f" >&2; exit 1; }
 done
 
-INC="-Icore -Ihost -Idevices -Iandroid/compat/include -Ithird_party/mbedtls/include -I$CURL/include -I$OSSL/include"
+INC="-Icore -Ihost -Idevices -Iandroid -I$REIMS_INC -Iandroid/compat/include -Ithird_party/mbedtls/include -I$CURL/include -I$OSSL/include"
 DEFS="-D_GNU_SOURCE -D__ANDROID__ -include android/compat/include/hv_darwin_compat.h"
+# Same switch the app's CMake uses: devices/vmapple.c then hands a normal boot to reims-vgpu and
+# keeps pvg_lite for installer boots.
+REIMS_ARG=""
+if [ -f "$REIMS_LIB" ]; then
+    DEFS="$DEFS -DHENGE_HAVE_REIMS=1"
+    REIMS_ARG=$REIMS_LIB
+    echo "reims-vgpu: linking $REIMS_LIB"
+else
+    echo "reims-vgpu: not built (no GPU device model in this CLI)"
+fi
 CFLAGS="-std=gnu11 -O2 -g -w --target=aarch64-linux-android$API $INC $DEFS"
 mkdir -p "$OUT/obj"
 
@@ -81,6 +96,9 @@ build android/compat/compat_android.c android/compat/commoncrypto_android.c \
 build third_party/mbedtls/library/aes.c third_party/mbedtls/library/sha256.c \
       third_party/mbedtls/library/platform_util.c third_party/mbedtls/library/constant_time.c
 build android/install.c
+# The app's normal-boot entry (HV_BOOT_ONLY path in host-install.c): same engine, no restore OS.
+build android/henge_vm.c
+[ -n "$REIMS_ARG" ] && build android/reims_pvg.c
 if stale "$OUT/obj/host_enter.o" host/enter.S; then
     $CC -D_GNU_SOURCE -D__ANDROID__ -Ihost -Icore --target=aarch64-linux-android$API \
         -c host/enter.S -o "$OUT/obj/host_enter.o"
@@ -92,6 +110,6 @@ rm -f "$OUT/obj/tidshim.o" "$OUT/obj/tidshim.c"
 objs=$(ls "$OUT"/obj/*.o)
 $CC $CFLAGS tools/host-install.c $objs "$RESTORE" \
     "$CURL/lib/libcurl.a" "$OSSL/lib/libssl.a" "$OSSL/lib/libcrypto.a" \
-    ${LIBZIP:+$LIBZIP} -o "$OUT/host-install" \
-    -lm -ldl -llog ${ZLIB:+-lz} 2>&1 | tail -25
+    ${LIBZIP:+$LIBZIP} $REIMS_ARG -o "$OUT/host-install" \
+    -lm -ldl -llog -landroid ${ZLIB:+-lz} 2>&1 | tail -25
 ls -lh "$OUT/host-install"
