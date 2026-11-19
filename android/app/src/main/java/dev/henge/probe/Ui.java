@@ -118,14 +118,23 @@ final class Ui {
         return row;
     }
 
-    /** A button that fills an equal share of `row`. */
+    /**
+     * A button that fills an equal share of `row`.
+     *
+     * Built the same way as outlinedButton(), not as a default android.widget.Button: the platform
+     * button carries its own tint that follows neither our accent nor our surfaces, so a row of
+     * them read as belonging to another app. This was visible on the diagnostics screen, where
+     * 复制 and 分享 sat under a themed list looking nothing like it.
+     */
     static Button rowButton(Activity a, LinearLayout row, String text, Runnable onClick) {
-        Button b = new Button(a);
-        b.setText(text);
-        b.setAllCaps(false);
-        b.setOnClickListener(v -> onClick.run());
+        Button b = outlinedButton(a, text, onClick);
         row.addView(b, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        /* Equal shares need a gap between them, or the outlines touch. */
+        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) b.getLayoutParams();
+        lp.setMarginStart(dp(a, 4));
+        lp.setMarginEnd(dp(a, 4));
+        b.setLayoutParams(lp);
         return b;
     }
 

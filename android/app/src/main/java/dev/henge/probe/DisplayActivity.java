@@ -327,24 +327,39 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             return;
         }
 
-        String result;
-        try {
-            result = Native.nativeBoot(rom.getAbsolutePath(), disk.getAbsolutePath(),
-                    aux.getAbsolutePath(), Prefs.ramMb(this), Prefs.cpus(this),
-                    getCacheDir() == null ? null : getCacheDir().getAbsolutePath());
-        } catch (Throwable t) {
-            result = "引导异常:\n" + android.util.Log.getStackTraceString(t);
-            AppLog.w("显示页: 引导异常", t);
-        }
-        AppLog.i("显示页: boot → " + result.replace('\n', ' '));
-        setStatus(result);
-        booted = true;
-        VmHost.setRunning(true);
-        immerse(true);
-        rebuildControls();
-        showControls();
-        ui.removeCallbacks(pollBoot);
-        ui.post(pollBoot);
+        // The boot report is a log line, not a screen: it names files, RAM size and CPU count,
+        // which is what an engineer wants and what a person starting a Mac should never see. The
+        // screen says whether it started; the report goes to the log.
+        setStatus("正在启动…");
+        ui.post(() -> {
+            String result;
+            try {
+                result = Native.nativeBoot(rom.getAbsolutePath(), disk.getAbsolutePath(),
+                        aux.getAbsolutePath(), Prefs.ramMb(this), Prefs.cpus(this),
+                        getCacheDir() == null ? null : getCacheDir().getAbsolutePath());
+            } catch (Throwable t) {
+                result = "引导异常: " + android.util.Log.getStackTraceString(t);
+                AppLog.w("显示页: 引导异常", t);
+            }
+            for (String line : result.split("\n")) {
+                if (!line.trim().isEmpty()) AppLog.i("显示页: boot | " + line.trim());
+            }
+            if (Native.nativeIsUp()) {
+                booted = true;
+                VmHost.setRunning(true);
+                setStatus("运行中");
+                immerse(true);
+                rebuildControls();
+                showControls();
+                ui.removeCallbacks(pollBoot);
+                ui.post(pollBoot);
+            } else {
+                setStatus("启动失败");
+                AppLog.w("显示页: 启动失败（原因见上面的 boot 报告）", null);
+                rebuildControls();
+                showControls();
+            }
+        });
     }
 
     private void stop() {
