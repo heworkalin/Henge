@@ -271,6 +271,13 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
     char *end = report + cap;
     say(&cursor, end, "\n--- boot ---\n");
 
+    /* One machine per process. A second boot would build a second board over the same disk image
+       and orphan the first one's threads. */
+    if (g_up || g_running) {
+        say(&cursor, end, "  already        : a machine is running; stop it first\n");
+        return -1;
+    }
+
     if (!rom || !disk || !aux) {
         say(&cursor, end, "  files          : MISSING — ROM, root disk and auxiliary storage are all "
                           "needed\n");
@@ -329,6 +336,11 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
         return -1;
     }
     g_running = 1;
+    /* `g_up` is what every other entry point treats as "there is a board to talk to":
+       hv_android_attach_window, hv_android_is_up, hv_android_display_ready, teardown. It used to
+       be set only by the smoke entry, so a real boot left attach_window returning immediately and
+       the app concluded the boot had failed while the guest was already running. */
+    g_up = 1;
     say(&cursor, end, "  running        : %d cpu thread(s) + 1 ms kicker\n", g_cpu_thread_count);
     return 0;
 }

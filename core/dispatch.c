@@ -1820,7 +1820,11 @@ dt_probe_done:;
             /* The layout lives in the device tree, and the device tree pointer is in boot_args:
                the first sixteen words of it say where it is and how long, which is what a map
                dump has to start from. */
-            {
+            /* Sixteen words of a page the kernel is not handed (that one lives at 0x78ed0000, see
+               hv_android_boot_framebuffer): a probe, not a status. It printed on every boot at the
+               default log level, and its answer is "this page is empty", which HV_DT_PROBE can
+               show again when that is in question. */
+            if (getenv("HV_DT_PROBE")) {
                 static int ba_done;
                 if (!ba_done) {
                     ba_done = 1;
