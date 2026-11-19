@@ -1,5 +1,39 @@
 # 明天的工作：用 CLI 跑 GPU 的离屏渲染（2026-11-19 记）
 
+## ✅ 2026-11-19 18:39：CLI 安装成功（资产已就位）
+
+```
+install: restore finished: 0
+step 100 (100%)
+disk.img        68,719,476,736 逻辑, 38,856,048 x 512B = 19.8 GB 实际
+disk.img.bak.tar 19,874,666,496 字节（tar -S 打包，sparse 保留，没膨胀成 64 GB）
+```
+
+位置：`/data/local/tmp/henge/workB/`（设备内部存储）
+
+**备份与恢复**（`cp --sparse=always` 和 `dd conv=sparse` 在 toybox 上都不可用，
+前者不认选项、后者报 `bad conv=sparse`，所以用 tar `-S`）：
+
+```bash
+cd /data/local/tmp/henge/workB
+# 备份（已完成）
+tar -S -cf disk.img.bak.tar disk.img
+# 恢复（disk.img 被启动实验写坏时）
+rm -f disk.img
+tar -S -xf disk.img.bak.tar
+stat -c 'blocks=%b' disk.img    # 应回到 38,856,048 附近；若接近 134M 说明没有恢复 sparse
+```
+
+**启动已安装的 macOS**（不是安装，可以重复；不碰安装内容）：
+
+```bash
+cd /data/local/tmp/henge
+HV_LOG=1 HV_EXTRA_BOOT_ARGS='serial=3 debug=0xA' \
+  ./host-install AVPBooter.vmapple2.bin workB/disk.img workB 2048 2 > runB-start.log 2>&1 &
+```
+
+注意第二个参数是 **disk.img 的路径**，**没有 IPSW** → `vc.installer = 0` → 正常启动路径。
+
 ## ⚠️ 磁盘镜像约束（操作者明确要求，动手前先读）
 
 - **CLI 的安装流程只跑一次。** 成功之后 `workB/disk.img`（逻辑大小 64 GiB）**不得删除**，
