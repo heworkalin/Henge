@@ -301,18 +301,19 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
     display_callbacks.cursor_show = on_cursor_show;
     display_callbacks.cursor_move = on_cursor_move;
 
-    RvgWindowConfig window;
-    memset(&window, 0, sizeof window);
-    window.struct_size = sizeof window;
-    window.callbacks = NULL;
-
+    /* No window at creation: "NULL is no window. Otherwise the library opens a window for the
+     * display", and on Android the only way to open one is an ANativeWindow, which arrives later
+     * through rvg_display_attach_android_window (that call switches the display to it). Passing an
+     * empty-window config here asked the library to open a window it could not, and the display was
+     * left holding a present target that never became valid -- which is where the CLI's
+     * use-after-free inside EfiDisplay::rebuild_mode came from. */
     RvgDisplayConfig display_config;
     memset(&display_config, 0, sizeof display_config);
     display_config.struct_size = sizeof display_config;
     display_config.port = 0;
     display_config.serial_number = 1;
     display_config.callbacks = &display_callbacks;
-    display_config.window = &window;
+    display_config.window = NULL;
 
     st = rvg_display_create(p->device, &display_config, &p->display);
     if (st != RVG_OK) {
