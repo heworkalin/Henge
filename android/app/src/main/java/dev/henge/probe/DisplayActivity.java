@@ -193,6 +193,8 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
      * first half of a boot visible at all.
      */
     private final int[] renderStats = new int[3];
+    private final long[] cpuSnapshot = new long[3 * 8];
+    private long[] lastPc = new long[8];
     private int ticks;
 
     private final Runnable pollBoot = new Runnable() {
@@ -209,6 +211,25 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
                         + " | 模式=" + renderStats[0]
                         + " | guest 呈现=" + renderStats[1]
                         + " | host 呈现=" + renderStats[2]);
+            }
+            /* Every five seconds, which CPUs moved. A guest that is working has pcs that change;
+               a guest that stopped has one that does not, and the value names where it stopped.
+               Without this, "nothing on screen" and "nothing running" looked the same. */
+            if (ticks % 20 == 0) {
+                int n = Native.nativeCpuSnapshot(cpuSnapshot);
+                StringBuilder moved = new StringBuilder();
+                for (int i = 0; i < n && i < lastPc.length; i++) {
+                    long pc = cpuSnapshot[i * 3];
+                    boolean changed = pc != lastPc[i];
+                    lastPc[i] = pc;
+                    if (changed) moved.append(i).append(' ');
+                }
+                StringBuilder where = new StringBuilder();
+                for (int i = 0; i < n && i < lastPc.length; i++)
+                    where.append(i).append("=0x").append(Long.toHexString(cpuSnapshot[i * 3]))
+                         .append(cpuSnapshot[i * 3 + 2] != 0 ? "(halt) " : " ");
+                AppLog.i("显示页: cpu 5s 内变化=" + (moved.length() == 0 ? "无（全部停住）" : moved.toString().trim())
+                        + " | " + where.toString().trim());
             }
             if (Native.nativeDisplayReady()) {
                 // The GPU owns the screen now: drop the copy, let the surface show through.

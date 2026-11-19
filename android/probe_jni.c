@@ -275,6 +275,22 @@ Java_dev_henge_probe_Native_nativeLog(JNIEnv *env, jclass clazz, jstring line) {
     }
 }
 
+/** Each CPU's {pc, el, halted}, flattened; returns how many CPUs were written. */
+JNIEXPORT jint JNICALL
+Java_dev_henge_probe_Native_nativeCpuSnapshot(JNIEnv *env, jclass clazz, jlongArray out) {
+    (void)clazz;
+    extern int hv_android_cpu_snapshot(uint64_t *out, int max_cpus);
+    jsize len = (*env)->GetArrayLength(env, out);
+    if (len < 3) return 0;
+    uint64_t *tmp = calloc((size_t) len, sizeof(uint64_t));
+    if (!tmp) return 0;
+    int n = hv_android_cpu_snapshot(tmp, (int) (len / 3));
+    jlong *jl = (jlong *) tmp;
+    (*env)->SetLongArrayRegion(env, out, 0, (jsize) (n * 3), jl);
+    free(tmp);
+    return n;
+}
+
 /** Render state for the app: {has mode, guest presents, host presents}. */
 JNIEXPORT void JNICALL
 Java_dev_henge_probe_Native_nativeRenderStats(JNIEnv *env, jclass clazz, jintArray out) {

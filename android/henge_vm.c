@@ -489,6 +489,24 @@ int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_
  * whenever the surface comes back. This is what the app's display has been missing: the
  * SurfaceView exists, but nothing ever gave reims-vgpu a window, so frames had nowhere to go.
  */
+/**
+ * Each CPU's guest pc, el and halted flag: {pc, el, halted} per CPU.
+ *
+ * Returns how many CPUs were written. This is what tells a running guest from a stopped one: a pc
+ * that changes is a guest making progress, and a fixed pc over seconds says exactly where it
+ * stopped, which no amount of device-level logging can.
+ */
+int hv_android_cpu_snapshot(uint64_t *out, int max_cpus) {
+    if (!out || max_cpus <= 0) return 0;
+    int n = g_board.ncpus < max_cpus ? g_board.ncpus : max_cpus;
+    for (int i = 0; i < n; i++) {
+        out[i * 3 + 0] = g_cpus[i].pc;
+        out[i * 3 + 1] = g_cpus[i].el;
+        out[i * 3 + 2] = g_cpus[i].halted ? 1 : 0;
+    }
+    return n;
+}
+
 int hv_android_is_up(void) { return g_up && g_running; }
 
 /**

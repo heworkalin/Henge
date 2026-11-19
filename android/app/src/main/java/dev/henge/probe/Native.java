@@ -39,6 +39,9 @@ final class Native {
     /** Puts an app log line into the engine's stream, and so into its log file. */
     static native void nativeLog(String line);
 
+    /** Each CPU's {pc, el, halted} flattened; returns how many CPUs were written. */
+    static native int nativeCpuSnapshot(long[] out);
+
     /** Render state: {has mode, guest presents, host presents}. */
     static native void nativeRenderStats(int[] out);
 
