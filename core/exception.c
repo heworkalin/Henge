@@ -1370,7 +1370,7 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             /* Which hypercalls the kernel makes, in order: the PAC key setup is the first thing it
                does, so an hvc list that starts later means the entry never got that far. */
             static unsigned hvc_n;
-            if (hvc_n < 32) {
+            if (cpu->m->log >= 2 && hvc_n < 32) {
                 unsigned long long was = cpu->x[0];
                 cpu->x[0] = (uint64_t) was;
                 fprintf(stderr, "hengevm: hvc #%u fn %llx x1 %llx pc %llx el%u\n", hvc_n,

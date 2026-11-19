@@ -53,7 +53,7 @@ build compat android/compat/compat_android.c android/compat/commoncrypto_android
               android/compat/corefoundation_android.c android/compat/pvg_metal_stub.c
 build mbed third_party/mbedtls/library/aes.c third_party/mbedtls/library/sha256.c \
             third_party/mbedtls/library/platform_util.c third_party/mbedtls/library/constant_time.c
-build app android/install.c
+build app android/install.c android/henge_vm.c
 
 if stale "$OUT/obj/host_enter.o" host/enter.S; then $CC -D_GNU_SOURCE -D__ANDROID__ -Ihost -Icore -c host/enter.S -o "$OUT/obj/host_enter.o"; fi
 

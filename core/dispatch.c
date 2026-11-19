@@ -1579,7 +1579,9 @@ static int run_loop(HvCpu *cpu, int one) {
                                 if (!map_done) {
                                     map_done = 1;
                                     static uint8_t pg[4096];
-                                    for (uint64_t q = 0x83000000ull; q < 0x84000000ull; q += 0x1000) {
+                                    static int kmap_scan = -1;
+                                    if (kmap_scan < 0) kmap_scan = getenv("HV_KMAP_SCAN") != NULL;
+                                    for (uint64_t q = 0x83000000ull; q < 0x84000000ull && kmap_scan; q += 0x1000) {
                                         if (hv_phys_read(cpu->m, q, pg, sizeof pg) != 0) continue;
                                         for (unsigned i = 0; i + 16 < sizeof pg; i += 8) {
                                             const char *t = (const char *) pg + i;
@@ -1655,6 +1657,17 @@ static int run_loop(HvCpu *cpu, int one) {
                                             }
                                         }
                                     }
+                                    /* Everything below is a one-off probe of where the device tree
+                                       landed, and it runs on every boot at the default log level:
+                                       64 register lines, a 256-page scan for the FDT magic, and 16
+                                       more words. It answers a question that has already been
+                                       answered; HV_DT_PROBE=1 brings it back when the tree's layout
+                                       is in question again. The tree itself is still read and
+                                       written by the HV_DT_DUMP path above. */
+                                    static int dt_probe = -1;
+                                    if (dt_probe < 0) dt_probe = getenv("HV_DT_PROBE") != NULL;
+                                    if (!dt_probe) goto dt_probe_done;
+                                    {
                                     uint32_t m4 = 0;
                                     (void) hv_phys_read(cpu->m, 0x78324000ull, &m4, 4);
                                     fprintf(stderr, "hengevm: dt magic at 78324000 = %08x\n", m4);
@@ -1684,6 +1697,8 @@ static int run_loop(HvCpu *cpu, int one) {
                                             for (int k = 0; k < 16; k++)
                                                 fprintf(stderr, "hengevm: dt+%02x %08x\n", k * 4, w[k]);
                                     }
+                                    }
+dt_probe_done:;
                                 }
                             }
                             /* What the host actually put in the staging buffer for the slot that

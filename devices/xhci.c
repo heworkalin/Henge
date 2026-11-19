@@ -341,7 +341,7 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
     /* Every request the trackpad gets goes to the log, unconditionally: the guest's
        driver handshake is exactly what we are trying to watch. Capped so a polling
        driver cannot flood it. */
-    if (x->slots[slot].dev == 1 && x->tp_reqs < 80) {
+    if (xlog() && x->slots[slot].dev == 1 && x->tp_reqs < 80) {
         x->tp_reqs++;
         fprintf(stderr, "hengevm: xhci: tp request %02x %02x value %04x index %04x len %u\n",
                 type, req, value, setup[4] | setup[5] << 8, setup[6] | setup[7] << 8);

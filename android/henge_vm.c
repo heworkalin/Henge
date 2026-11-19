@@ -18,7 +18,14 @@
  * piece of work and not this one.
  */
 
+/* glibc hides siginfo_t / SA_SIGINFO behind _GNU_SOURCE; the host build compiles this file too,
+   since it holds the functions the shared command-line tool calls. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
