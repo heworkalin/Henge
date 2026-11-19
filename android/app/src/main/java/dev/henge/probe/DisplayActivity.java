@@ -53,6 +53,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     private Bitmap fbBitmap;
     private int[] fbPixels;
     private final int[] fbMeta = new int[3];
+    private boolean fbLastOk;
     private TextView status;
     private View controls;
     /** The sliver left behind when the controls hide: a way back that costs no screen. */
@@ -184,7 +185,16 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
                 return;
             }
             if (fbPixels == null) fbPixels = new int[2048 * 1280];
-            if (Native.nativeBootFramebuffer(fbPixels, fbMeta)) {
+            boolean have = Native.nativeBootFramebuffer(fbPixels, fbMeta);
+            if (have != fbLastOk) {
+                // The first display buffer is the only thing visible before macOS programs the GPU;
+                // its absence is the difference between a black screen and a progress bar, so which
+                // of the two it is gets a line in the log.
+                AppLog.i(have ? "显示页: 帧缓冲 " + fbMeta[0] + "x" + fbMeta[1]
+                              : "显示页: 帧缓冲尚未发布（固件还没写它）");
+                fbLastOk = have;
+            }
+            if (have) {
                 int w = fbMeta[0], h = fbMeta[1];
                 if (w > 0 && h > 0) {
                     if (fbBitmap == null || fbBitmap.getWidth() != w || fbBitmap.getHeight() != h)

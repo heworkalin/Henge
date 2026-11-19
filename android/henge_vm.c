@@ -454,6 +454,8 @@ int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_
     uint8_t *ram = g_board.ram;
     uint64_t size = g_board.ram_size;
     if (!ram || !size) return -1;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("HV_BOOTFB_LOG") != NULL;
     uint64_t limit = size < (1ull << 30) ? size : 1ull << 30;
     for (uint64_t off = 0; off + 0x1000 <= limit; off += 0x4000) {
         const uint64_t *q = (const uint64_t *)(ram + off);
@@ -462,6 +464,14 @@ int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_
         if (q[1] >> 40 != 0xfffffe || q[2] < VMAPPLE_MEM || q[2] >= VMAPPLE_MEM + size) continue;
         if (q[3] == 0 || q[3] > size) continue;
         uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
+        if (trace) {
+            fprintf(stderr, "bootfb: candidate at %#llx rev %u ver %u virt %#llx phys %#llx "
+                            "base %#llx row %llu %llux%llu depth %llu\n",
+                    (unsigned long long) off, h[0], h[1], (unsigned long long) q[1],
+                    (unsigned long long) q[2], (unsigned long long) base,
+                    (unsigned long long) row, (unsigned long long) w,
+                    (unsigned long long) hh, (unsigned long long) depth);
+        }
         if (w < 320 || w > 8192 || hh < 200 || hh > 8192) continue;
         if (row < w * 4 || (depth & 0xff) != 32) continue;
         if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;

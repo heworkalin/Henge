@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -44,17 +45,66 @@ static unsigned g_window_second;
 static int g_window_count;
 static unsigned long g_dropped;
 
+/* mkdir -p, ignoring what already exists. */
+static void make_dirs(const char *path) {
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        (void)mkdir(tmp, 0770);
+        *p = '/';
+    }
+    (void)mkdir(tmp, 0770);
+}
+
+/**
+ * Starts this run's log files: <path's directory>/log/<YYYY-MM-DD>/<HHMM>.log, and
+ * <HHMM>-serial.log beside it for the guest's own console.
+ *
+ * One file per run under a date directory, instead of one file that grows without bound: a single
+ * henge.log reached 182 MB, and a log nobody can open is a log nobody reads. The name is the start
+ * time, because a run does not get to clean up after itself -- it is killed, crashes, or is
+ * force-stopped, and none of those run code that could rename anything.
+ *
+ * `path` may be a file (the app passes .../vm/henge.log) or a directory; either way the layout
+ * above is what is written.
+ */
 void hv_log_set_file(const char *path) {
     if (!path) return;
-    snprintf(g_path, sizeof g_path, "%s", path);
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", path);
+    /* A trailing name with a dot in it is a file: keep only its directory. */
+    char *slash = strrchr(dir, '/');
+    if (slash && strchr(slash, '.')) *slash = 0;
+
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    char day[32], clock[16];
+    strftime(day, sizeof day, "%Y-%m-%d", &lt);
+    strftime(clock, sizeof clock, "%H%M", &lt);
+
+    char base[640];
+    snprintf(base, sizeof base, "%s/log/%s", dir, day);
+    make_dirs(base);
+
+    /* A second run in the same minute gets its own file rather than appending to the first. */
+    for (int n = 1; n < 100; n++) {
+        if (n == 1) snprintf(g_path, sizeof g_path, "%s/%s.log", base, clock);
+        else snprintf(g_path, sizeof g_path, "%s/%s-%d.log", base, clock, n);
+        FILE *f = fopen(g_path, "a+");
+        if (!f) continue;
+        if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0) { g_file = f; break; }
+        fclose(f);
+    }
     if (!g_file) g_file = fopen(g_path, "a");
-    /* Same directory, same stem: .../henge.log -> .../henge-serial.log */
-    const char *slash = strrchr(path, '/');
-    const char *base = slash ? slash + 1 : path;
-    const char *dot = strrchr(base, '.');
-    size_t stem = dot ? (size_t)(dot - path) : strlen(path);
-    snprintf(g_serial_path, sizeof g_serial_path, "%.*s-serial.log", (int) stem, path);
+    snprintf(g_serial_path, sizeof g_serial_path, "%s/%s-serial.log", base, clock);
     if (!g_serial) g_serial = fopen(g_serial_path, "a");
+    if (g_file) {
+        fprintf(g_file, "# henge %s %s\n", day, clock);
+        fflush(g_file);
+    }
 }
 
 /* Lines that always survive the limiter: a restore that fails says so in one of these. */
