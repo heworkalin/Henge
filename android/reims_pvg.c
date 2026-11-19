@@ -290,6 +290,21 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
         p->display = NULL;
     }
 
+    /* The modes the guest is offered. rvg_display_set_modes is what connects a display to the
+     * guest at all: "The guest's display page for the port takes the first 128: the first list it
+     * takes connects the display to the guest" -- until then the guest has nothing to set and the
+     * display never reports a mode. The app passes the screen's own modes; a command-line run has
+     * no screen, so it offers the sizes a Mac reports by default. */
+    if (p->display) {
+        RvgDisplayMode modes[3];
+        memset(modes, 0, sizeof modes);
+        modes[0].width = 1920, modes[0].height = 1080, modes[0].refresh_rate_hz = 60.0;
+        modes[1].width = 2560, modes[1].height = 1440, modes[1].refresh_rate_hz = 60.0;
+        modes[2].width = 1280, modes[2].height = 800,  modes[2].refresh_rate_hz = 60.0;
+        rvg_display_set_modes(p->display, modes, 3);
+        if (p->log) fprintf(stderr, "reims: offered 3 display modes (1920x1080, 2560x1440, 1280x800)\n");
+    }
+
     hv_machine_add_mmio(m, gfx_pa, REIMS_PVG_MMIO_SIZE, p, gfx_read, gfx_write, "reims-gfx");
     hv_machine_add_mmio(m, iosfc_pa, REIMS_PVG_MMIO_SIZE, p, iosfc_read, iosfc_write,
                         "reims-iosurface");
