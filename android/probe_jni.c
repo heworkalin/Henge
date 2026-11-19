@@ -22,6 +22,7 @@
  */
 
 #include <jni.h>
+#include <android/native_window_jni.h>
 
 #include "bootrom.h"
 
@@ -215,6 +216,24 @@ Java_dev_henge_probe_Native_nativeSetLogFile(JNIEnv *env, jclass clazz, jstring 
     if (!path) return;
     const char *p = (*env)->GetStringUTFChars(env, path, NULL);
     if (p) { hv_log_set_file(p); (*env)->ReleaseStringUTFChars(env, path, p); }
+}
+
+/*
+ * The display surface. ANativeWindow_fromSurface() gives the window the engine's GPU device draws
+ * into; it takes its own reference, so the caller may drop the Surface afterwards.
+ */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeAttachWindow(JNIEnv *env, jclass clazz, jobject surface) {
+    (void)clazz;
+    extern void hv_android_attach_window(void *window);
+    if (!surface) return;
+    ANativeWindow *window = ANativeWindow_fromSurface(env, surface);
+    if (!window) {
+        fprintf(stderr, "henge: ANativeWindow_fromSurface returned NULL\n");
+        return;
+    }
+    hv_android_attach_window(window);
+    ANativeWindow_release(window);   /* the engine keeps its own reference */
 }
 
 JNIEXPORT void JNICALL

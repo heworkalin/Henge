@@ -207,6 +207,57 @@ static void *kicker_thread(void *arg) {
  * `report` receives what happened: which file failed, or that the machine is up and for how many
  * CPUs. A refusal is a line of text, never a crash — a missing IPSW is the normal case here.
  */
+/*
+ * A host fault in translated code: say where, without changing the timeline. host/vm.c has had
+ * this since the start (on_ill); this entry point had none, so a SIGSEGV here only produced
+ * "Segmentation fault" from the shell and no address at all. Installing a handler costs nothing
+ * until a signal arrives, which is why it does not hide the crash the way a log line in the hot
+ * path does.
+ */
+static struct sigaction prior_segv, prior_bus, prior_ill;
+
+static void on_host_fault(int sig, siginfo_t *info, void *ctx) {
+    ucontext_t *uc = ctx;
+    uint64_t pc = (uint64_t)uc->uc_mcontext.pc;
+    uint64_t lr = (uint64_t)uc->uc_mcontext.regs[30];
+    uint64_t sp = (uint64_t)uc->uc_mcontext.sp;
+    uint64_t rx = (uint64_t)(uintptr_t)g_machine.jit.base;
+    uint64_t size = (uint64_t)g_machine.jit.capacity * 4;
+    uint64_t used = (uint64_t)g_machine.jit.used * 4;
+    int in_rx = rx && pc >= rx && pc < rx + size;
+    fprintf(stderr, "hengevm: host signal %d: pc %#llx lr %#llx sp %#llx addr %p (in jit %d, rx%+lld)\n",
+            sig, (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)sp,
+            info->si_addr, in_rx, (long long)(pc - rx));
+    fprintf(stderr, "hengevm:   jit rx %#llx..%#llx used %#llx of %#llx words\n",
+            (unsigned long long)rx, (unsigned long long)(rx + size), (unsigned long long)used,
+            (unsigned long long)((uint64_t)g_machine.jit.capacity * 4));
+    for (int i = 0; i < g_board.ncpus; i++)
+        fprintf(stderr, "hengevm:   cpu %d guest pc %#llx el%u halted %d\n", i,
+                (unsigned long long)g_cpus[i].pc, g_cpus[i].el, g_cpus[i].halted);
+    /* The words around the faulting pc, which is what says whether it landed in a translation
+       or in the engine's own code. */
+    if (in_rx) {
+        uint64_t from = pc - 0x40 < rx ? rx : pc - 0x40;
+        fprintf(stderr, "hengevm:   words at rx+%#llx:", (unsigned long long)(from - rx));
+        for (uint64_t at = from; at < pc + 0x40 && at < rx + size; at += 4)
+            fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)at);
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+    struct sigaction *prior = sig == SIGILL ? &prior_ill : sig == SIGBUS ? &prior_bus : &prior_segv;
+    sigaction(sig, prior, NULL);
+}
+
+static void install_host_fault_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sa.sa_sigaction = on_host_fault;
+    sigaction(SIGSEGV, &sa, &prior_segv);
+    sigaction(SIGBUS, &sa, &prior_bus);
+    sigaction(SIGILL, &sa, &prior_ill);
+}
+
 int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int ram_mb, int ncpus,
                        const char *cache_dir, char *report, size_t cap) {
     char *cursor = report + strlen(report);
@@ -221,6 +272,7 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
     if (cache_dir && *cache_dir) setenv("XDG_CACHE_HOME", cache_dir, 1);
 
     if (hap_disks_open(&cursor, end, disk, aux) != 0) return -1;
+    install_host_fault_handlers();
 
     memset(&g_machine, 0, sizeof g_machine);
     memset(&g_board, 0, sizeof g_board);
@@ -345,6 +397,20 @@ int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_
         return 0;
     }
     return -1;
+}
+
+/*
+ * Hands the host's ANativeWindow to the running machine's GPU device, and the same call again
+ * whenever the surface comes back. This is what the app's display has been missing: the
+ * SurfaceView exists, but nothing ever gave reims-vgpu a window, so frames had nowhere to go.
+ */
+void hv_android_attach_window(void *window) {
+#ifdef HENGE_HAVE_REIMS
+    if (!g_up || !g_board.pvg || !window) return;
+    hv_reims_pvg_attach_window(g_board.pvg, window);
+#else
+    (void)window;
+#endif
 }
 
 void hv_android_vm_stop(void) {

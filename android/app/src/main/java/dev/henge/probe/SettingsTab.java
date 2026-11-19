@@ -153,6 +153,8 @@ final class SettingsTab {
         LinearLayout about = Lists.group(a, content, "关于");
         Lists.row(a, about, "设备",
                 android.os.Build.MODEL + " / API " + android.os.Build.VERSION.SDK_INT, null, false, null);
+        Lists.row(a, about, "开源组件与许可证", "本应用基于的开源项目及其许可证", "查看", true,
+                () -> a.startActivity(new android.content.Intent(a, LicensesActivity.class)));
 
         return root;
     }

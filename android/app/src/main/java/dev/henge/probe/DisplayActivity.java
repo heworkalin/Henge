@@ -137,6 +137,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        attachSurface(holder);
         surfaceReady = true;
         AppLog.i("显示页: surfaceCreated " + holder.getSurface().isValid());
         // The surface is the machine's display; without it the engine has nowhere to draw, so a
@@ -146,7 +147,23 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        attachSurface(holder);
         AppLog.i("显示页: surfaceChanged " + width + "x" + height);
+    }
+
+    /* The engine draws through this window; a surface that was recreated must be handed over
+       again, or frames go wherever the previous one was. */
+    private void attachSurface(SurfaceHolder holder) {
+        try {
+            android.view.Surface s = holder.getSurface();
+            if (s != null && s.isValid()) {
+                android.graphics.Rect r = holder.getSurfaceFrame();
+                Native.nativeAttachWindow(s);
+                AppLog.i("显示页: surface 已交给引擎 " + r.width() + "x" + r.height());
+            }
+        } catch (Throwable t) {
+            AppLog.w("显示页: 交出 surface 失败", t);
+        }
     }
 
     @Override
