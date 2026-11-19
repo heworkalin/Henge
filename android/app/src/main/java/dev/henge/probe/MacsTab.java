@@ -61,13 +61,15 @@ final class MacsTab {
         hero.addView(summary);
 
         TextView state = new TextView(a);
-        state.setText("未运行");
+        // The machine outlives its screen, so its state cannot be guessed from "did I open the
+        // display page"; it is asked of the process.
+        state.setText(VmHost.isRunning() ? "运行中" : "未运行");
         Theme.rowSubtitle(a, state);
         state.setPadding(0, Ui.dp(a, 8), 0, Ui.dp(a, 12));
         hero.addView(state);
 
         // The one filled button in the app: this is what the app is for.
-        android.widget.Button start = Ui.primaryButton(a, "启动",
+        android.widget.Button start = Ui.primaryButton(a, VmHost.isRunning() ? "显示" : "启动",
                 () -> a.startActivity(new Intent(a, DisplayActivity.class)));
         hero.addView(start, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));

@@ -245,3 +245,25 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | 判断 USB 走到哪一步 | `HV_VIRTIO_CFG_LOG=1`（guest 侧） + `HV_LIBUSB_LOG=1`（宿主侧） |
 | 判断系统调用/返回值 | gdb 读 `hv_svc_*`（按时间序）；注意 `hv_svc_ret` 只有在本轮代码（`hv_el0_note` 无条件记录）之后才可信 |
 | 判断有没有崩溃 | gdb 读 `hv_uexc_*` 与 `hv_el0_flt_*`，**看 ESR 的 EC/ISS**：`0x20/0x24 + ISS 0x07` 是正常缺页，`0x0d..0x0f` 才是权限错误 |
+
+### 只用于调试的二进制产物（默认全关，不要随正式版发出）
+
+这些开关写的是几 MB 到几 GB 的文件，只在**复现一个问题**时打开；日常运行、产品构建、交付版本都不要开。
+它们的内容是一次性的取证材料，不是日志的补充：日志可以长期保留，这些不行。
+
+| 开关 | 产物 | 大小量级 | 什么时候值得开 |
+|---|---|---|---|
+| `HV_TRACE_PC=<file>` | 每块 run VA（u64） | 4M 块 = 32 MB | 只判"某段代码到底跑没跑"，必 `HV_PCHK` 零命中时用 |
+| `HV_BLOCK_DUMP=<file>` | 翻译后的宿主指令 | 百 MB 起 | 怀疑某个 JIT 块译错 |
+| `HV_DT_DUMP=<file>` | 设备树 | 几百 KB | 判 guest 拿到的硬件描述 |
+| `HV_DUMP_KC=1` / `HV_DUMP_RAMDISK=1` | 内核 / ramdisk | 十 MB～百 MB | 判镜像是否被正确解出 |
+| `HV_DUMP_DC=1` | `__DATA_CONST` 段 | 十 MB 级 | 判 rebase 结果（默认不补，见 §7） |
+| `HV_DUMP_RAM=<file>` | 整块 guest RAM | 2 GB 起（2048 MB 配置） | 只在现场必须整体冻结时用 |
+| `HV_PTW_LOG` / `HV_PTW_SNAP` | 页表写历史 | 数十 MB | 页表问题；可配合 `HV_SLOW_MEM=1` |
+| `HV_BLOCKTIME=1` | 每块耗时采样 | 只是日志 | JIT 慢在哪；每块两次读计数器会扰动时序 |
+
+**规则**：这些产物的用途是"回答一个问题然后删掉"。用完就 `rm`，不要留在 work 目录里等下次
+（`workN/` 里一个 `dc-*.bin` 6 MB、`fb-*.bmp` 每张 3 MB，累积起来会占满设备）。
+
+**正式版**：`android/` 的发行构建不应包含这些开关的默认开启，也不应把产物目录导出到外部存储；
+用户要提交问题时，只需要 `henge.log` + `henge-serial.log` 两份文本（见 §5 日志架构）。

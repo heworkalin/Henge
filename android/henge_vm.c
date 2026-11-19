@@ -404,6 +404,8 @@ int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_
  * whenever the surface comes back. This is what the app's display has been missing: the
  * SurfaceView exists, but nothing ever gave reims-vgpu a window, so frames had nowhere to go.
  */
+int hv_android_is_up(void) { return g_up && g_running; }
+
 void hv_android_attach_window(void *window) {
 #ifdef HENGE_HAVE_REIMS
     if (!g_up || !g_board.pvg || !window) return;

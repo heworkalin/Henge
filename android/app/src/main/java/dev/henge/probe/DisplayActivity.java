@@ -107,12 +107,20 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         handle.setVisibility(View.GONE);
         root.addView(handle, handleLp);
 
-        surface.setOnClickListener(v -> showControls());
-
+        // The guest's screen is not a tap target: a tap on it belongs to the guest (once pointer
+        // input is wired up, it will). Only the pill at the bottom edge brings the controls back,
+        // which is also why the pill is always there while they are hidden.
         setContentView(root);
         setStatus("等待 Surface");
     }
 
+    /**
+     * The bar, built for the machine's current state.
+     *
+     * Two buttons, not three: 启动 only exists when there is nothing running, 停止 only when there
+     * is. A bar that always shows both leaves one of them permanently dead, which reads as a bug
+     * rather than as a state. 返回 is "put this away", not "end the machine".
+     */
     private View buildControls() {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
@@ -120,10 +128,22 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         int pad = Ui.dp(this, 6);
         bar.setPadding(pad, pad, pad, pad);
 
-        Ui.rowButton(this, bar, "启动", this::boot);
-        Ui.rowButton(this, bar, "停止", this::stop);
-        Ui.rowButton(this, bar, "返回", this::finish);
+        if (booted) Ui.rowButton(this, bar, "停止", this::stop);
+        else Ui.rowButton(this, bar, "启动", this::boot);
+        Ui.rowButton(this, bar, "返回", () -> moveTaskToBack(true));
         return bar;
+    }
+
+    /** Swaps the bar for one that matches the state, without leaving the screen. */
+    private void rebuildControls() {
+        if (controls instanceof LinearLayout && ((LinearLayout) controls).getParent() instanceof FrameLayout) {
+            FrameLayout parent = (FrameLayout) ((LinearLayout) controls).getParent();
+            int index = parent.indexOfChild(controls);
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) controls.getLayoutParams();
+            parent.removeView(controls);
+            controls = buildControls();
+            parent.addView(controls, index, lp);
+        }
     }
 
     /** Shows the controls, and starts the timer that takes them away again. */
@@ -140,6 +160,13 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         attachSurface(holder);
         surfaceReady = true;
         AppLog.i("显示页: surfaceCreated " + holder.getSurface().isValid());
+        // A machine started before this screen existed shows up through this window as it is; it
+        // must not be booted a second time just because the activity was recreated.
+        if (!booted && VmHost.canReopen()) {
+            booted = true;
+            setStatus("运行中");
+            rebuildControls();
+        }
         // The surface is the machine's display; without it the engine has nowhere to draw, so a
         // boot started before this point is started now.
         showControls();
@@ -224,6 +251,16 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             showControls();
             return;
         }
+        // The machine may have been started earlier by this process; a second boot would build a
+        // second machine over the same disk image.
+        if (VmHost.canReopen()) {
+            booted = true;
+            VmHost.setRunning(true);
+            setStatus("运行中（画面已接回）");
+            rebuildControls();
+            showControls();
+            return;
+        }
         File dir = new File(getExternalFilesDir(null), "vm");
         File rom = new File(dir, ROM_NAME);
         File disk = new File(dir, DISK_NAME);
@@ -252,7 +289,9 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         AppLog.i("显示页: boot → " + result.replace('\n', ' '));
         setStatus(result);
         booted = true;
+        VmHost.setRunning(true);
         immerse(true);
+        rebuildControls();
         showControls();
     }
 
@@ -267,20 +306,34 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             AppLog.w("显示页: 停止异常", t);
         }
         booted = false;
+        VmHost.setRunning(false);
         setStatus("已停止。");
+        rebuildControls();
         ui.removeCallbacks(hideControls);
         showControls();
     }
 
+    /**
+     * Back leaves the machine running.
+     *
+     * A window onto a Mac is not the Mac: closing it used to join every CPU thread on the way out,
+     * which left the process with nothing to keep it alive, so Android reclaimed it and a back
+     * press looked like the app dying. The machine now outlives the screen; the 停止 button is the
+     * only thing that powers it off.
+     */
+    @Override
+    public void onBackPressed() {
+        AppLog.i("显示页: 返回（guest 继续运行）");
+        moveTaskToBack(true);
+    }
+
     @Override
     protected void onDestroy() {
-        // The guest's threads belong to this screen: leaving it ends them, rather than leaving a
-        // machine running with nowhere to draw.
-        if (booted) {
-            try {
-                Native.nativeStop();
-            } catch (Throwable ignored) {
-            }
+        // The surface is going away with this activity, and the engine must not present into a dead
+        // window. Stop only if the machine cannot survive without one -- i.e. only when this screen
+        // is closing for good with a machine that is still up.
+        if (booted && VmHost.isRunning()) {
+            AppLog.w("显示页: 画面销毁但 guest 仍在运行（引擎按进程存活）", null);
         }
         ui.removeCallbacksAndMessages(null);
         super.onDestroy();

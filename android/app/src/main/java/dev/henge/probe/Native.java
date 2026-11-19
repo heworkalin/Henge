@@ -33,6 +33,9 @@ final class Native {
      * Returns a report whatever happens: a missing file is the ordinary answer, and it comes back
      * as a sentence rather than as an exception or a crash.
      */
+    /** Whether a machine is running in this process. */
+    static native boolean nativeIsUp();
+
     /** Hands the display surface to the running machine's GPU device; call on every surface change. */
     static native void nativeAttachWindow(android.view.Surface surface);
 

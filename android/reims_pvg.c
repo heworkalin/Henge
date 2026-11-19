@@ -330,12 +330,22 @@ int hv_reims_pvg_have_display(HvReimsPvg *p) { return p && p->display != NULL; }
 
 int hv_reims_pvg_have_mapper(HvReimsPvg *p) { return p && p->iosurface != NULL; }
 
+/** True once the guest has a mode and has presented: the point where the GPU owns the screen. */
+int hv_reims_pvg_ready(HvReimsPvg *p) {
+    if (!p || !p->display) return 0;
+    uint64_t guest = 0, host = 0;
+    rvg_display_present_counts(p->display, &guest, &host);
+    return p->have_mode && guest > 0;
+}
+
 void hv_reims_pvg_poll(HvReimsPvg *p) {
     if (!p || !p->display) return;
-    /* A frame the guest presented since the last poll: let the display encode the current one into
-     * a target of the guest's mode and present it. The encode is what the guest's own present
-     * became on Metal; here it is a Vulkan command buffer, committed and waited for so the frame
-     * is on screen before the next one is encoded. */
+    /* Nothing to do here on purpose: a window's frames are presented by reims-vgpu's own render
+     * thread through the swapchain over the attached VkSurfaceKHR (see reims-vgpu-vulkan's
+     * swapchain.rs), not by the host. `frame_pending` only feeds the off-screen grab used by the
+     * command-line tool and by `hv_reims_pvg_grab`. An earlier comment here claimed this branch
+     * encoded and committed a frame; it never did, and reading it as "the host presents" led to a
+     * wrong conclusion that the guest was not drawing at all. */
     if (p->frame_pending && p->have_mode) {
         p->frame_pending = 0;
         if (p->log) fprintf(stderr, "reims: frame %ux%u\n", p->mode_width, p->mode_height);

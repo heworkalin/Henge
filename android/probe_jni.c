@@ -218,6 +218,14 @@ Java_dev_henge_probe_Native_nativeSetLogFile(JNIEnv *env, jclass clazz, jstring 
     if (p) { hv_log_set_file(p); (*env)->ReleaseStringUTFChars(env, path, p); }
 }
 
+/** Whether a machine is running in this process, so the UI can reopen it instead of booting. */
+JNIEXPORT jboolean JNICALL
+Java_dev_henge_probe_Native_nativeIsUp(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    extern int hv_android_is_up(void);
+    return hv_android_is_up() ? JNI_TRUE : JNI_FALSE;
+}
+
 /*
  * The display surface. ANativeWindow_fromSurface() gives the window the engine's GPU device draws
  * into; it takes its own reference, so the caller may drop the Surface afterwards.
