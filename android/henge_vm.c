@@ -212,6 +212,23 @@ static void *cpu_thread(void *arg) {
     return NULL;
 }
 
+/* Which handler owns SIGSEGV right now, and when that changes. A driver that installs its own
+   after ours leaves a crash with no marker at all, which is indistinguishable from a handler that
+   was never installed unless the installation can be watched. */
+static void on_host_fault(int sig, siginfo_t *info, void *ctx);
+void hv_install_host_fault_handlers(void);
+
+static void watch_fault_handler(void) {
+    struct sigaction cur;
+    if (sigaction(SIGSEGV, NULL, &cur) != 0) return;
+    void (*now)(int, siginfo_t *, void *) = cur.sa_sigaction;
+    if ((void *) now == (void *) on_host_fault) return;
+    fprintf(stderr, "watch: SIGSEGV handler was %p (ours %p); reclaiming\n",
+            (void *) (uintptr_t) now, (void *) (uintptr_t) on_host_fault);
+    fflush(stderr);
+    hv_install_host_fault_handlers();
+}
+
 static void *kicker_thread(void *arg) {
     (void)arg;
     /* Every ten seconds, which interrupt lines have been used. A guest that stopped is waiting for
@@ -221,7 +238,8 @@ static void *kicker_thread(void *arg) {
     while (!g_stop) {
         usleep(1000);
         hv_machine_kick_all(&g_machine);
-        if (++seconds % 10000 == 0) hv_gicv3_irq_report(g_board.gic, "boot");
+        if (++seconds % 100 == 0) watch_fault_handler();
+        if (seconds % 10000 == 0) hv_gicv3_irq_report(g_board.gic, "boot");
     }
     return NULL;
 }
@@ -242,6 +260,14 @@ static void *kicker_thread(void *arg) {
 static struct sigaction prior_segv, prior_bus, prior_ill;
 
 static void on_host_fault(int sig, siginfo_t *info, void *ctx) {
+    /* First thing, with write() rather than stdio: this handler may run on a thread that was
+       holding the stdio lock, and a handler that deadlocks on its first fprintf leaves exactly the
+       trace of a handler that never ran. This marker costs one write and settles which it is. */
+    {
+        static const char mark[] = "HENGE-FAULT\n";
+        ssize_t ignored = write(STDERR_FILENO, mark, sizeof mark - 1);
+        (void)ignored;
+    }
     ucontext_t *uc = ctx;
     uint64_t pc = (uint64_t)uc->uc_mcontext.pc;
     uint64_t lr = (uint64_t)uc->uc_mcontext.regs[30];
@@ -253,6 +279,33 @@ static void on_host_fault(int sig, siginfo_t *info, void *ctx) {
     fprintf(stderr, "hengevm: host signal %d: pc %#llx lr %#llx sp %#llx addr %p (in jit %d, rx%+lld)\n",
             sig, (unsigned long long)pc, (unsigned long long)lr, (unsigned long long)sp,
             info->si_addr, in_rx, (long long)(pc - rx));
+    /* Where the pc lives, in terms that survive the process: the executable's load bias turns it
+       into a file offset that addr2line can resolve, and /proc/self/maps names the region for both
+       addresses. Without these two lines a crash report is a number. */
+    {
+        extern unsigned long getauxval(unsigned long);
+#ifdef AT_PHDR
+        unsigned long ph = getauxval(AT_PHDR);
+        if (ph > 0x40) {
+            unsigned long bias = ph - 0x40;
+            fprintf(stderr, "hengevm:   exec bias %#lx  pc off %#lx  lr off %#lx\n",
+                    bias, (unsigned long) pc - bias, (unsigned long) lr - bias);
+        }
+#endif
+        FILE *mf = fopen("/proc/self/maps", "r");
+        if (mf) {
+            char line[512];
+            while (fgets(line, sizeof line, mf)) {
+                unsigned long lo = 0, hi = 0;
+                if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+                if (pc >= lo && pc < hi) fprintf(stderr, "hengevm:   pc  in %s", line);
+                if ((uint64_t)(uintptr_t) info->si_addr >= lo &&
+                    (uint64_t)(uintptr_t) info->si_addr < hi)
+                    fprintf(stderr, "hengevm:   fa  in %s", line);
+            }
+            fclose(mf);
+        }
+    }
     fprintf(stderr, "hengevm:   jit rx %#llx..%#llx used %#llx of %#llx words\n",
             (unsigned long long)rx, (unsigned long long)(rx + size), (unsigned long long)used,
             (unsigned long long)((uint64_t)g_machine.jit.capacity * 4));
@@ -284,16 +337,20 @@ void hv_install_host_fault_handlers(void) {
      * that had died in host code therefore looked alive (2766 faults in one log, guest never
      * advancing, GPU never getting a frame).
      */
-    static int installed;
-    if (installed) return;
-    installed = 1;
+    /* Re-installable on purpose. reims-vgpu is Rust, and Rust's standard library installs its own
+       SIGSEGV handler (for stack-overflow detection) for every thread it starts, which lands after
+       ours and replaces it: the crash then reaches Rust's handler, which decides the fault is not a
+       stack overflow, restores the default and re-raises -- so only "Segmentation fault" is ever
+       seen. `prior` is captured once, so repeated calls do not chain handlers. */
+    static int saved_prior;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sa.sa_sigaction = on_host_fault;
-    sigaction(SIGSEGV, &sa, &prior_segv);
-    sigaction(SIGBUS, &sa, &prior_bus);
-    sigaction(SIGILL, &sa, &prior_ill);
+    sigaction(SIGSEGV, &sa, saved_prior ? NULL : &prior_segv);
+    sigaction(SIGBUS, &sa, saved_prior ? NULL : &prior_bus);
+    sigaction(SIGILL, &sa, saved_prior ? NULL : &prior_ill);
+    saved_prior = 1;
 }
 
 int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int ram_mb, int ncpus,
@@ -321,7 +378,6 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
         unlock_root_disk();
         return -1;
     }
-    hv_install_host_fault_handlers();
 
     memset(&g_machine, 0, sizeof g_machine);
     memset(&g_board, 0, sizeof g_board);
@@ -344,6 +400,12 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
         say(&cursor, end, "  machine        : FAILED\n");
         return -1;
     }
+    /* After the machine, not before: creating it brings up reims-vgpu and the Vulkan driver, and
+       a driver that installs its own SIGSEGV handler (Adreno's does) overwrote ours when this ran
+       first -- a crash then printed "Segmentation fault" from the shell and no marker from a
+       handler that was never called. Measured: the marker appeared 0 times before this move. */
+    hv_install_host_fault_handlers();
+
     if (hv_vmapple_load_rom(&g_board, rom) != 0) {
         say(&cursor, end, "  ROM            : FAILED to read %s\n", rom);
         return -1;
