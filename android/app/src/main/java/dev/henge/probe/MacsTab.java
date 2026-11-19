@@ -69,8 +69,14 @@ final class MacsTab {
         hero.addView(state);
 
         // The one filled button in the app: this is what the app is for.
-        android.widget.Button start = Ui.primaryButton(a, VmHost.isRunning() ? "显示" : "启动",
-                () -> a.startActivity(new Intent(a, DisplayActivity.class)));
+        // 启动 means start it: opening the screen and then having to press a second 启动 inside it
+        // is the same action asked for twice. 显示 just shows a machine that is already running.
+        boolean running = VmHost.isRunning();
+        android.widget.Button start = Ui.primaryButton(a, running ? "显示" : "启动", () -> {
+            Intent it = new Intent(a, DisplayActivity.class);
+            if (!running) it.putExtra(DisplayActivity.EXTRA_BOOT, true);
+            a.startActivity(it);
+        });
         hero.addView(start, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 

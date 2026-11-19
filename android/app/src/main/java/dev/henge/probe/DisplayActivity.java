@@ -40,6 +40,9 @@ import java.io.File;
  */
 public class DisplayActivity extends Activity implements SurfaceHolder.Callback {
 
+    /** Set when the caller already asked for the machine to start (the Macs page's 启动). */
+    public static final String EXTRA_BOOT = "boot";
+
     private static final String ROM_NAME = "AVPBooter.vmapple2.bin";
     private static final String DISK_NAME = "disk.img";
     private static final String AUX_NAME = "aux.img";
@@ -65,6 +68,8 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     private boolean booted;
     /* A boot takes seconds; without this, a second tap started a second machine. */
     private boolean booting;
+    /** A boot requested before the surface existed; started as soon as there is one. */
+    private boolean bootWhenReady;
     private boolean surfaceReady;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Runnable hideControls = () -> controls.animate().alpha(0f).setDuration(200)
@@ -130,6 +135,8 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         handleLp.bottomMargin = Ui.dp(this, 10);
         handle.setVisibility(View.GONE);
         root.addView(handle, handleLp);
+
+        bootWhenReady = getIntent() != null && getIntent().getBooleanExtra(EXTRA_BOOT, false);
 
         // The guest's screen is not a tap target: a tap on it belongs to the guest (once pointer
         // input is wired up, it will). Only the pill at the bottom edge brings the controls back,
@@ -247,6 +254,11 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             booted = true;
             setStatus("运行中");
             rebuildControls();
+            bootWhenReady = false;
+        }
+        if (bootWhenReady && !booted && !booting) {
+            bootWhenReady = false;
+            boot();
         }
         // The surface is the machine's display; without it the engine has nowhere to draw, so a
         // boot started before this point is started now.
