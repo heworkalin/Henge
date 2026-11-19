@@ -54,6 +54,10 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     private int[] fbPixels;
     private final int[] fbMeta = new int[3];
     private boolean fbLastOk;
+    /* The surface outlives the moment the machine starts: the window arrives when the activity is
+       created, which is before 启动 is pressed, so it must be handed over again once there is a
+       machine to hand it to. */
+    private SurfaceHolder pendingHolder;
     private TextView status;
     private View controls;
     /** The sliver left behind when the controls hide: a way back that costs no screen. */
@@ -173,10 +177,24 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
      * RAM and nowhere else; nothing arrives at the window. Reading that buffer is what makes the
      * first half of a boot visible at all.
      */
+    private final int[] renderStats = new int[3];
+    private int ticks;
+
     private final Runnable pollBoot = new Runnable() {
         @Override
         public void run() {
             if (!booted) return;
+            /* Every four polls (a second), one line saying where the render path is. Without it a
+               screen with no pixels reports nothing at all, and "no logs" was being read as "the
+               code did not run" when it meant "the code ran and had nothing to say". */
+            if (++ticks % 4 == 0) {
+                Native.nativeRenderStats(renderStats);
+                AppLog.i("显示页: 状态"
+                        + " | 帧缓冲=" + (fbLastOk ? fbMeta[0] + "x" + fbMeta[1] : "无")
+                        + " | 模式=" + renderStats[0]
+                        + " | guest 呈现=" + renderStats[1]
+                        + " | host 呈现=" + renderStats[2]);
+            }
             if (Native.nativeDisplayReady()) {
                 // The GPU owns the screen now: drop the copy, let the surface show through.
                 AppLog.i("显示页: GPU 接管画面");
@@ -221,6 +239,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     public void surfaceCreated(SurfaceHolder holder) {
         attachSurface(holder);
         surfaceReady = true;
+        pendingHolder = holder;
         AppLog.i("显示页: surfaceCreated " + holder.getSurface().isValid());
         // A machine started before this screen existed shows up through this window as it is; it
         // must not be booted a second time just because the activity was recreated.
@@ -258,6 +277,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
+        pendingHolder = null;
         AppLog.i("显示页: surfaceDestroyed");
     }
 
@@ -366,6 +386,8 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             if (Native.nativeIsUp()) {
                 booted = true;
                 VmHost.setRunning(true);
+                // The earlier attach had no machine to give the window to (see pendingHolder).
+                if (pendingHolder != null) attachSurface(pendingHolder);
                 setStatus("运行中");
                 immerse(true);
                 rebuildControls();

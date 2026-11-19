@@ -495,6 +495,16 @@ int hv_android_is_up(void) { return g_up && g_running; }
  * True once the guest has programmed a display mode and presented at least once: the point where
  * the app should stop showing the firmware's boot framebuffer and let the window show the GPU.
  */
+/** Render state for the app: {has mode, guest presents, host presents}. */
+void hv_android_render_stats(int out[3]) {
+    out[0] = out[1] = out[2] = 0;
+#ifdef HENGE_HAVE_REIMS
+    if (!g_up || !g_board.pvg) return;
+    extern void hv_reims_pvg_stats(HvReimsPvg *p, int out[3]);
+    hv_reims_pvg_stats(g_board.pvg, out);
+#endif
+}
+
 int hv_android_display_ready(void) {
 #ifdef HENGE_HAVE_REIMS
     if (!g_up || !g_board.pvg) return 0;
@@ -507,7 +517,16 @@ int hv_android_display_ready(void) {
 
 void hv_android_attach_window(void *window) {
 #ifdef HENGE_HAVE_REIMS
-    if (!g_up || !g_board.pvg || !window) return;
+    if (!g_up || !g_board.pvg || !window) {
+        /* Said out loud because it is silent and fatal to the picture: the window arrives when the
+           activity is created, which is before 启动 is pressed, so there is no machine to hand it to
+           yet. The activity attaches again once the machine is up; if this line is the last thing
+           about the window, that second attach never happened. */
+        fprintf(stderr, "reims: window not attached (%s%s%s)\n",
+                !window ? "no window" : "", !g_up ? (window ? "no machine yet" : ", no machine yet") : "",
+                (!window && !g_up) ? ", no machine yet" : "");
+        return;
+    }
     hv_reims_pvg_attach_window(g_board.pvg, window);
 #else
     (void)window;

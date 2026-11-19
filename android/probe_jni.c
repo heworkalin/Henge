@@ -255,6 +255,16 @@ Java_dev_henge_probe_Native_nativeBootFramebuffer(JNIEnv *env, jclass clazz,
     return JNI_TRUE;
 }
 
+/** Render state for the app: {has mode, guest presents, host presents}. */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeRenderStats(JNIEnv *env, jclass clazz, jintArray out) {
+    (void)clazz;
+    extern void hv_android_render_stats(int out[3]);
+    jint v[3] = {0, 0, 0};
+    hv_android_render_stats(v);
+    if ((*env)->GetArrayLength(env, out) >= 3) (*env)->SetIntArrayRegion(env, out, 0, 3, v);
+}
+
 /** Whether the GPU has taken the screen over, so the boot framebuffer can be dropped. */
 JNIEXPORT jboolean JNICALL
 Java_dev_henge_probe_Native_nativeDisplayReady(JNIEnv *env, jclass clazz) {

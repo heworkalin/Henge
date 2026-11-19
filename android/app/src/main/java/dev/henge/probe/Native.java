@@ -36,6 +36,9 @@ final class Native {
     /** The firmware's boot framebuffer as ARGB ints; false when there is not one yet. */
     static native boolean nativeBootFramebuffer(int[] pixels, int[] meta);
 
+    /** Render state: {has mode, guest presents, host presents}. */
+    static native void nativeRenderStats(int[] out);
+
     /** Whether the GPU has taken the screen over (a mode is set and a frame was presented). */
     static native boolean nativeDisplayReady();
 

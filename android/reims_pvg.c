@@ -121,10 +121,9 @@ static void on_mode_change(void *ctx, uint16_t width, uint16_t height, uint32_t 
     p->mode_width = width;
     p->mode_height = height;
     p->mode_format = pixel_format;
-    if (p->log) {
-        fprintf(stderr, "reims: guest mode %ux%u, IOSurface format 0x%08x\n", width, height,
-                pixel_format);
-    }
+    /* Once per mode change: the moment there is something to present at all. */
+    fprintf(stderr, "reims: guest mode %ux%u, IOSurface format 0x%08x\n", width, height,
+            pixel_format);
 }
 
 static void on_new_frame(void *ctx) {
@@ -337,7 +336,21 @@ void hv_reims_pvg_attach_window(HvReimsPvg *p, void *native_window) {
         fail("rvg_display_attach_android_window", st);
         return;
     }
-    if (p->log) fprintf(stderr, "reims: display attached to the host's window\n");
+    /* Always, and with the size: this line is the answer to "did the GPU ever get a window", and
+       without it a black screen and a working-but-empty screen look identical in the log. */
+    fprintf(stderr, "reims: display attached to the host's window (%dx%d)\n",
+            p->mode_width, p->mode_height);
+}
+
+/** What the display is doing: {has a mode, guest presents, host presents}. For the app's status. */
+void hv_reims_pvg_stats(HvReimsPvg *p, int out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!p || !p->display) return;
+    uint64_t guest = 0, host = 0;
+    rvg_display_present_counts(p->display, &guest, &host);
+    out[0] = p->have_mode ? 1 : 0;
+    out[1] = guest > 0x7fffffff ? 0x7fffffff : (int)guest;
+    out[2] = host > 0x7fffffff ? 0x7fffffff : (int)host;
 }
 
 int hv_reims_pvg_have_display(HvReimsPvg *p) { return p && p->display != NULL; }
