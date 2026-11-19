@@ -260,7 +260,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         // must not be booted a second time just because the activity was recreated.
         if (!booted && VmHost.canReopen()) {
             booted = true;
-            setStatus("运行中");
+            setStatus("");
             rebuildControls();
             bootWhenReady = false;
         }
@@ -336,8 +336,17 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         }
     }
 
+    /**
+     * A line of state, or nothing at all.
+     *
+     * Once the machine is up there is no state to report and the guest's screen is the content: a
+     * "运行中" left in the corner is a label on a picture that explains itself. It stays for the
+     * two moments it is worth something -- while starting, and when something went wrong.
+     */
     private void setStatus(String text) {
+        boolean show = text != null && !text.isEmpty();
         status.setText(text);
+        status.setVisibility(show ? View.VISIBLE : View.GONE);
     }
 
     /**
@@ -363,7 +372,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         if (VmHost.canReopen()) {
             booted = true;
             VmHost.setRunning(true);
-            setStatus("运行中（画面已接回）");
+            setStatus("");
             rebuildControls();
             showControls();
             return;
@@ -408,7 +417,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
                 VmHost.setRunning(true);
                 // The earlier attach had no machine to give the window to (see pendingHolder).
                 if (pendingHolder != null) attachSurface(pendingHolder);
-                setStatus("运行中");
+                setStatus("");
                 immerse(true);
                 rebuildControls();
                 showControls();
