@@ -58,6 +58,8 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     /** The sliver left behind when the controls hide: a way back that costs no screen. */
     private View handle;
     private boolean booted;
+    /* A boot takes seconds; without this, a second tap started a second machine. */
+    private boolean booting;
     private boolean surfaceReady;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Runnable hideControls = () -> controls.animate().alpha(0f).setDuration(200)
@@ -296,6 +298,11 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
      * is more useful than a spinner.
      */
     private void boot() {
+        if (booting) {
+            setStatus("正在启动，请稍候…");
+            showControls();
+            return;
+        }
         if (booted) {
             setStatus("已经在运行。");
             showControls();
@@ -330,6 +337,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         // The boot report is a log line, not a screen: it names files, RAM size and CPU count,
         // which is what an engineer wants and what a person starting a Mac should never see. The
         // screen says whether it started; the report goes to the log.
+        booting = true;
         setStatus("正在启动…");
         ui.post(() -> {
             String result;
@@ -344,6 +352,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             for (String line : result.split("\n")) {
                 if (!line.trim().isEmpty()) AppLog.i("显示页: boot | " + line.trim());
             }
+            booting = false;
             if (Native.nativeIsUp()) {
                 booted = true;
                 VmHost.setRunning(true);

@@ -24,7 +24,9 @@
 #define _GNU_SOURCE
 #endif
 
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/file.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -41,6 +43,10 @@
 #ifdef HENGE_HAVE_REIMS
 #include "reims_pvg.h"
 #endif
+
+/* Defined below hap_disks_open() but used by the boot entry above it. */
+static int lock_root_disk(const char *path, char **cursor, char *end);
+static void unlock_root_disk(void);
 
 /* Declared here as well, because the smoke entry tears down a previous attempt before it builds
  * the next one. */
@@ -285,7 +291,11 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
     }
     if (cache_dir && *cache_dir) setenv("XDG_CACHE_HOME", cache_dir, 1);
 
-    if (hap_disks_open(&cursor, end, disk, aux) != 0) return -1;
+    if (lock_root_disk(disk, &cursor, end) != 0) return -1;
+    if (hap_disks_open(&cursor, end, disk, aux) != 0) {
+        unlock_root_disk();
+        return -1;
+    }
     install_host_fault_handlers();
 
     memset(&g_machine, 0, sizeof g_machine);
@@ -343,6 +353,39 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
     g_up = 1;
     say(&cursor, end, "  running        : %d cpu thread(s) + 1 ms kicker\n", g_cpu_thread_count);
     return 0;
+}
+
+/*
+ * One machine per disk image.
+ *
+ * Two processes can be alive at once -- the package reinstall leaves the old process running while
+ * the new one starts -- and both would then boot a guest over the same root disk, each writing
+ * wherever the other's filesystem happens to point. Nothing about that is detectable from inside
+ * either guest, and the damage is the installed macOS. A non-blocking lock on the disk file is
+ * what makes the second one fail immediately and visibly instead.
+ */
+static int g_disk_lock_fd = -1;
+
+static int lock_root_disk(const char *path, char **cursor, char *end) {
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        say(cursor, end, "  root disk      : cannot open %s\n", path);
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        say(cursor, end, "  root disk      : in use by another instance (%s)\n", path);
+        close(fd);
+        return -1;
+    }
+    g_disk_lock_fd = fd;
+    return 0;
+}
+
+static void unlock_root_disk(void) {
+    if (g_disk_lock_fd >= 0) {
+        close(g_disk_lock_fd);
+        g_disk_lock_fd = -1;
+    }
 }
 
 /* Opens the two disk images. Split out so the caller can report which one failed. */
@@ -465,4 +508,5 @@ void hv_android_vm_teardown(void) {
     hv_vmapple_destroy(&g_board);
     hv_machine_free(&g_machine);
     g_up = 0;
+    unlock_root_disk();
 }
