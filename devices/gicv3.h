@@ -28,6 +28,10 @@ typedef struct HvGicCpu {
 
 typedef struct HvGic {
     HvMachine *m;
+    /* How many times each INTID was pended. The engine counts interrupts in total, which cannot
+       say *which* source stopped arriving: a guest waiting on a display interrupt and a guest
+       waiting on a timer both show up as "irq 0/s". */
+    uint32_t pend_count[HV_GIC_NUM_IRQS];
     pthread_mutex_t mu;            /* the GIC's own lock (see gicv3.c) */
     uint32_t ctlr;                 /* GICD_CTLR */
     /* SPIs (INTIDs 32 and up; entries below 32 are unused: see HvGicCpu) */
@@ -51,6 +55,9 @@ void hv_gicv3_set_irq(HvGic *g, int intid, int level);
 void hv_gicv3_set_ppi(HvGic *g, int cpu, int intid, int level);
 /* Make an SPI pending, as an MSI write does. */
 void hv_gicv3_pend(HvGic *g, int intid);
+
+/* Which INTIDs were pended and how often, for a guest that stopped: the absent ones matter. */
+void hv_gicv3_irq_report(HvGic *g, const char *tag);
 /* Recompute every CPU's IRQ and FIQ inputs (waking any that just got one). */
 void hv_gicv3_update(HvGic *g);
 

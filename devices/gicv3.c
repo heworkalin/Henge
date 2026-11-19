@@ -107,8 +107,32 @@ static void hv_gicv3_set_ppi_body(HvGic *g, int c, int intid, int level) {
 
 static void hv_gicv3_pend_body(HvGic *g, int intid) {
     if (intid < 32 || intid >= HV_GIC_NUM_IRQS) return;
+    /* Relaxed: this runs on interrupt paths and the value is diagnostic only. */
+    __atomic_fetch_add(&g->pend_count[intid], 1, __ATOMIC_RELAXED);
     g->latch[intid] = 1;
     hv_gicv3_update(g);
+}
+
+/*
+ * Which interrupt lines were ever used, and how often. Printed on the engine's own clock.
+ *
+ * The point of the per-INTID count is the lines that are *absent*: when a guest stops, the question
+ * is which source it is waiting for, and a source that was never pended once is a different fault
+ * from one that stopped after N times.
+ */
+void hv_gicv3_irq_report(HvGic *g, const char *tag) {
+    if (!g) return;
+    fprintf(stderr, "irq report (%s):", tag ? tag : "");
+    int shown = 0;
+    for (int i = 32; i < HV_GIC_NUM_IRQS; i++) {
+        uint32_t n = __atomic_load_n(&g->pend_count[i], __ATOMIC_RELAXED);
+        if (!n) continue;
+        fprintf(stderr, " %d:%u", i, n);
+        if (++shown >= 32) break;
+    }
+    if (!shown) fprintf(stderr, " (no SPI was ever pended)");
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 /* ---- the CPU interface ---- */

@@ -117,6 +117,13 @@ int hv_android_vm_smoke(char *report, size_t cap, const char *cache_dir) {
     }
     say(&cursor, end, "  JIT region     : %zu MB\n", SMOKE_JIT_BYTES >> 20);
 
+    /* The engine's own statistics: blocks/s, irq/s, wfi/s with the idle share, and the pc of the
+       CPU that printed. They are free when off and were off everywhere -- nothing set this -- so a
+       guest sitting in WFI and a guest working through an interrupt storm produced the same log.
+       On by default now, one line every ~65536 blocks (seconds apart); HV_STATS=0 turns it off. */
+    const char *stats = getenv("HV_STATS");
+    g_machine.stats_interval = (stats && atoi(stats) == 0) ? 0 : 1;
+
     HvCfgParams cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.nr_cpus = 1;
@@ -207,9 +214,14 @@ static void *cpu_thread(void *arg) {
 
 static void *kicker_thread(void *arg) {
     (void)arg;
+    /* Every ten seconds, which interrupt lines have been used. A guest that stopped is waiting for
+       something; the lines that were never pended say what never arrived, which the engine's
+       aggregate irq counter cannot. */
+    static int seconds;
     while (!g_stop) {
         usleep(1000);
         hv_machine_kick_all(&g_machine);
+        if (++seconds % 10000 == 0) hv_gicv3_irq_report(g_board.gic, "boot");
     }
     return NULL;
 }
