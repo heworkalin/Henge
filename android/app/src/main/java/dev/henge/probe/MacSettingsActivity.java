@@ -67,7 +67,22 @@ public class MacSettingsActivity extends Activity {
         Lists.row(this, storage, "辅助存储", "NVRAM 一类的引导状态",
                 fileText(new File(dir, "aux.img")), false, null);
         Lists.divider(this, storage);
-        Lists.row(this, storage, "IPSW", "安装时使用的镜像", fileText(new File(dir, "macOS.ipsw")), false, null);
+        // The image is wherever it was downloaded or imported to -- "macOS.ipsw" was a name nothing
+        // ever created, so this row always said 无 while the real file sat next to the disk.
+        File image = installImage(dir);
+        Lists.row(this, storage, "IPSW", image == null ? "还没有可用的安装镜像" : image.getName(),
+                image == null ? "无" : fileText(image), false, null);
+    }
+
+    /** The IPSW an install would use: the imported one if it still exists, else the first in vm. */
+    private File installImage(File dir) {
+        String imported = Prefs.localIpsw(this);
+        if (imported != null) {
+            File f = new File(imported);
+            if (f.isFile()) return f;
+        }
+        File[] found = dir.listFiles((d, n) -> n.endsWith(".ipsw"));
+        return found == null || found.length == 0 ? null : found[0];
     }
 
     private static String diskText(File disk) {

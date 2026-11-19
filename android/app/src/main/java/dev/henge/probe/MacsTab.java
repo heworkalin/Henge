@@ -88,11 +88,10 @@ final class MacsTab {
 
         // ---- the machine, and adding one ----
         LinearLayout group = Lists.group(a, root, "这台 Mac");
-        Lists.row(a, group, name, "名称、内存、CPU", null, true,
+        // One way in. "显示" used to sit here as well, duplicating the hero's 启动 button: two rows
+        // that did the same thing, so whichever you used, the other looked broken.
+        Lists.row(a, group, "设置", "名称、内存、CPU、存储", null, true,
                 () -> a.startActivity(new Intent(a, MacSettingsActivity.class)));
-        Lists.divider(a, group);
-        Lists.row(a, group, "显示", "进入 guest 画面", null, true,
-                () -> a.startActivity(new Intent(a, DisplayActivity.class)));
 
         LinearLayout add = Lists.group(a, root, "添加");
         // A tab, not a screen: installing is a subject of its own, and the tab bar is where it

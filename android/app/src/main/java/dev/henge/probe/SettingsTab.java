@@ -101,16 +101,6 @@ final class SettingsTab {
                     .show();
         });
 
-        // ---- defaults for a new machine ----
-        LinearLayout defs = Lists.group(a, content, "默认配置");
-        Lists.row(a, defs, "内存", "新机器默认给的物理内存", Prefs.ramMb(a) + " MB", true,
-                () -> choose(a, "内存", new String[]{"1024", "2048", "3072", "4096", "6144", "8192"},
-                        String.valueOf(Prefs.ramMb(a)), v -> Prefs.setRamMb(a, Integer.parseInt(v))));
-        Lists.divider(a, defs);
-        Lists.row(a, defs, "CPU", "新机器默认的核数", Prefs.cpus(a) + " 核", true,
-                () -> choose(a, "CPU 核数", new String[]{"1", "2", "3", "4", "5", "6", "7", "8"},
-                        String.valueOf(Prefs.cpus(a)), v -> Prefs.setCpus(a, Integer.parseInt(v))));
-
         // ---- display ----
         LinearLayout display = Lists.group(a, content, "显示");
         Lists.row(a, display, "控制条自动隐藏", "运行中 3 秒后淡出，点画面唤回",
@@ -122,9 +112,8 @@ final class SettingsTab {
         // ---- storage ----
         LinearLayout storage = Lists.group(a, content, "存储");
         File vm = new File(a.getExternalFilesDir(null), "vm");
-        Lists.row(a, storage, "macOS 磁盘", "guest 实际写入的部分", sizeOf(new File(vm, "disk.img")),
-                false, null);
-        Lists.divider(a, storage);
+        // The disk itself, and how much of it is used, is shown on 这台 Mac → 设置; here is only the
+        // part that is global: the images shared by every install.
         String images = imagesSummary(vm);
         Lists.row(a, storage, "安装映像", "已下载或导入的 IPSW 与未完成的下载", images, true,
                 () -> cleanImages(a, vm));
@@ -162,12 +151,6 @@ final class SettingsTab {
     private static int indexOf(String[] values, String value) {
         for (int i = 0; i < values.length; i++) if (values[i].equals(value)) return i;
         return 0;
-    }
-
-    /** The size of a file, or that it is not there. */
-    private static String sizeOf(File f) {
-        if (!f.exists()) return "无";
-        return AppLog.bytes(f.length());
     }
 
     /** How many images are on disk and how much room they take. */
@@ -223,17 +206,4 @@ final class SettingsTab {
                 .show();
     }
 
-    private static void choose(Activity a, String title, String[] options, String current,
-                               java.util.function.Consumer<String> sink) {
-        int checked = 0;
-        for (int i = 0; i < options.length; i++) if (options[i].equals(current)) checked = i;
-        new AlertDialog.Builder(a)
-                .setTitle(title)
-                .setSingleChoiceItems(options, checked, (dialog, which) -> {
-                    sink.accept(options[which]);
-                    dialog.dismiss();
-                })
-                .setNegativeButton("取消", null)
-                .show();
-    }
 }

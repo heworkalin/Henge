@@ -52,8 +52,11 @@ public class DiagnosticsActivity extends Activity {
 
         LinearLayout group = Lists.group(this, root, "来源");
         driverValue = new TextView(this);
-        Lists.row(this, group, "驱动", "引擎打开的 Vulkan 库",
-                chosen == null ? "无" : chosen.label, true, this::chooseDriver);
+        // Read-only: the driver is chosen in 设置 → 渲染, and a second place to change it meant the
+        // two could disagree. Choosing one here used to affect only this probe, which looked like
+        // the setting not sticking.
+        Lists.row(this, group, "驱动", "当前引擎会打开的 Vulkan 库（在 设置 → 渲染 中切换）",
+                chosen == null ? "无" : chosen.label, false, null);
         Lists.divider(this, group);
         Lists.row(this, group, "重新测量", "重新跑一遍全部检查", null, true, this::run);
         Lists.divider(this, group);
@@ -74,25 +77,6 @@ public class DiagnosticsActivity extends Activity {
 
         setContentView(root);
         run();
-    }
-
-    private void chooseDriver() {
-        String[] labels = new String[drivers.size()];
-        int at = 0;
-        for (int i = 0; i < drivers.size(); i++) {
-            labels[i] = drivers.get(i).label;
-            if (drivers.get(i) == chosen) at = i;
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("驱动")
-                .setSingleChoiceItems(labels, at, (dialog, which) -> {
-                    chosen = drivers.get(which);
-                    driverValue.setText(chosen.label);
-                    dialog.dismiss();
-                    run();
-                })
-                .setNegativeButton("取消", null)
-                .show();
     }
 
     private void run() {
