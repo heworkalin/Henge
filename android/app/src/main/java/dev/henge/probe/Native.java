@@ -36,6 +36,9 @@ final class Native {
     /** The firmware's boot framebuffer as ARGB ints; false when there is not one yet. */
     static native boolean nativeBootFramebuffer(int[] pixels, int[] meta);
 
+    /** Puts an app log line into the engine's stream, and so into its log file. */
+    static native void nativeLog(String line);
+
     /** Render state: {has mode, guest presents, host presents}. */
     static native void nativeRenderStats(int[] out);
 

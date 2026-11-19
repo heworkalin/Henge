@@ -255,6 +255,26 @@ Java_dev_henge_probe_Native_nativeBootFramebuffer(JNIEnv *env, jclass clazz,
     return JNI_TRUE;
 }
 
+/**
+ * A line from the app's own log, into the engine's stream so it lands in the same file.
+ *
+ * logcat cannot be relied on: its main buffer is 256 KiB and the system's own services fill it in
+ * seconds, so every HENGE line written a few seconds ago is already gone. The app's log mirrored
+ * only there meant the Java half of a run left no trace at all -- which is exactly the half that
+ * says whether a surface was handed over and what the screen was told.
+ */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeLog(JNIEnv *env, jclass clazz, jstring line) {
+    (void)clazz;
+    if (!line) return;
+    const char *s = (*env)->GetStringUTFChars(env, line, NULL);
+    if (s) {
+        fprintf(stderr, "app: %s\n", s);
+        fflush(stderr);
+        (*env)->ReleaseStringUTFChars(env, line, s);
+    }
+}
+
 /** Render state for the app: {has mode, guest presents, host presents}. */
 JNIEXPORT void JNICALL
 Java_dev_henge_probe_Native_nativeRenderStats(JNIEnv *env, jclass clazz, jintArray out) {

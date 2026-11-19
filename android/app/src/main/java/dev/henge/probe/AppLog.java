@@ -80,6 +80,15 @@ public final class AppLog {
             if (LINES.size() >= CAPACITY) LINES.removeFirst();
             LINES.addLast(entry);
         }
+        // Into the engine's log file as well. logcat's main buffer is 256 KiB and the system's own
+        // services fill it within seconds, so a line mirrored only there is gone before anyone can
+        // read it; the file is the only record that survives.
+        try {
+            Native.nativeLog(message);
+        } catch (Throwable ignored) {
+            // Logging must never be a reason for the app to fail.
+        }
+
         // Mirror to logcat so `adb logcat -s HENGE` shows the same thing the screen does.
         switch (level) {
             case Log.ERROR: Log.e(TAG, message); break;
