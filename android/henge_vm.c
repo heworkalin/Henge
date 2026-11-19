@@ -413,6 +413,20 @@ int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width, uint32_
  */
 int hv_android_is_up(void) { return g_up && g_running; }
 
+/**
+ * True once the guest has programmed a display mode and presented at least once: the point where
+ * the app should stop showing the firmware's boot framebuffer and let the window show the GPU.
+ */
+int hv_android_display_ready(void) {
+#ifdef HENGE_HAVE_REIMS
+    if (!g_up || !g_board.pvg) return 0;
+    extern int hv_reims_pvg_ready(HvReimsPvg *p);
+    return hv_reims_pvg_ready(g_board.pvg);
+#else
+    return 0;
+#endif
+}
+
 void hv_android_attach_window(void *window) {
 #ifdef HENGE_HAVE_REIMS
     if (!g_up || !g_board.pvg || !window) return;

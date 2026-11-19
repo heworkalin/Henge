@@ -218,6 +218,51 @@ Java_dev_henge_probe_Native_nativeSetLogFile(JNIEnv *env, jclass clazz, jstring 
     if (p) { hv_log_set_file(p); (*env)->ReleaseStringUTFChars(env, path, p); }
 }
 
+/**
+ * Copies the firmware's boot framebuffer into `pixels` (ARGB_8888, one int per pixel) and writes
+ * {width, height, stride} into `meta`. False when the guest has not published one yet.
+ *
+ * The guest's buffer holds BGRA bytes; on a little-endian host that is already 0xAARRGGBB as an
+ * int, only with a zero alpha, which is forced opaque here.
+ */
+JNIEXPORT jboolean JNICALL
+Java_dev_henge_probe_Native_nativeBootFramebuffer(JNIEnv *env, jclass clazz,
+                                                  jintArray pixels, jintArray meta) {
+    (void)clazz;
+    extern int hv_android_boot_framebuffer(const uint8_t **pixels, uint32_t *width,
+                                           uint32_t *height, uint32_t *stride);
+    const uint8_t *px = NULL;
+    uint32_t w = 0, h = 0, st = 0;
+    if (hv_android_boot_framebuffer(&px, &w, &h, &st) != 0 || !px || !w || !h) return JNI_FALSE;
+    if ((*env)->GetArrayLength(env, meta) < 3) return JNI_FALSE;
+    jsize need = (jsize)(w * h);
+    if ((*env)->GetArrayLength(env, pixels) < need) return JNI_FALSE;
+    jint bits[3] = {(jint) w, (jint) h, (jint) st};
+    (*env)->SetIntArrayRegion(env, meta, 0, 3, bits);
+    /* One row at a time: the guest's stride need not be width * 4. */
+    jint *row = malloc(sizeof(jint) * w);
+    if (!row) return JNI_FALSE;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *src = px + (size_t) y * st;
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t v = (uint32_t) src[x * 4] | (uint32_t) src[x * 4 + 1] << 8 |
+                         (uint32_t) src[x * 4 + 2] << 16;
+            row[x] = (jint) (v | 0xff000000u);
+        }
+        (*env)->SetIntArrayRegion(env, pixels, (jsize) (y * w), (jsize) w, row);
+    }
+    free(row);
+    return JNI_TRUE;
+}
+
+/** Whether the GPU has taken the screen over, so the boot framebuffer can be dropped. */
+JNIEXPORT jboolean JNICALL
+Java_dev_henge_probe_Native_nativeDisplayReady(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    extern int hv_android_display_ready(void);
+    return hv_android_display_ready() ? JNI_TRUE : JNI_FALSE;
+}
+
 /** Whether a machine is running in this process, so the UI can reopen it instead of booting. */
 JNIEXPORT jboolean JNICALL
 Java_dev_henge_probe_Native_nativeIsUp(JNIEnv *env, jclass clazz) {

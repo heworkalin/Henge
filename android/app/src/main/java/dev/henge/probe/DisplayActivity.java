@@ -1,6 +1,7 @@
 package dev.henge.probe;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -15,6 +16,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ImageView;
 import android.widget.TextView;
 
 import java.io.File;
@@ -43,6 +45,14 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
     private static final String AUX_NAME = "aux.img";
 
     private SurfaceView surface;
+    /* The firmware's own framebuffer, which is the only thing there is to look at before macOS
+       programs the GPU. A SurfaceView's surface sits *behind* the window's content, so an opaque
+       ImageView covers it; when the GPU takes over, the ImageView goes away and the surface shows
+       through. That is the whole "first display buffer" the app was missing. */
+    private ImageView fbView;
+    private Bitmap fbBitmap;
+    private int[] fbPixels;
+    private final int[] fbMeta = new int[3];
     private TextView status;
     private View controls;
     /** The sliver left behind when the controls hide: a way back that costs no screen. */
@@ -69,6 +79,13 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         FrameLayout root = new FrameLayout(this);
         Ui.inset(root);
         root.setBackgroundColor(0xFF000000);   // the guest's own black, not the page colour
+
+        fbView = new ImageView(this);
+        fbView.setBackgroundColor(0xff000000);
+        fbView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        fbView.setVisibility(View.GONE);
+        root.addView(fbView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         surface = new SurfaceView(this);
         surface.getHolder().addCallback(this);
@@ -145,6 +162,39 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
             parent.addView(controls, index, lp);
         }
     }
+
+    /**
+     * The firmware's screen, until the GPU has one.
+     *
+     * Before macOS programs the display, the guest draws its progress bar into a framebuffer in
+     * RAM and nowhere else; nothing arrives at the window. Reading that buffer is what makes the
+     * first half of a boot visible at all.
+     */
+    private final Runnable pollBoot = new Runnable() {
+        @Override
+        public void run() {
+            if (!booted) return;
+            if (Native.nativeDisplayReady()) {
+                // The GPU owns the screen now: drop the copy, let the surface show through.
+                AppLog.i("显示页: GPU 接管画面");
+                fbView.setVisibility(View.GONE);
+                fbBitmap = null;
+                return;
+            }
+            if (fbPixels == null) fbPixels = new int[2048 * 1280];
+            if (Native.nativeBootFramebuffer(fbPixels, fbMeta)) {
+                int w = fbMeta[0], h = fbMeta[1];
+                if (w > 0 && h > 0) {
+                    if (fbBitmap == null || fbBitmap.getWidth() != w || fbBitmap.getHeight() != h)
+                        fbBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                    fbBitmap.setPixels(fbPixels, 0, w, 0, 0, w, h);
+                    fbView.setImageBitmap(fbBitmap);
+                    fbView.setVisibility(View.VISIBLE);
+                }
+            }
+            ui.postDelayed(this, 250);
+        }
+    };
 
     /** Shows the controls, and starts the timer that takes them away again. */
     private void showControls() {
@@ -293,6 +343,8 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         immerse(true);
         rebuildControls();
         showControls();
+        ui.removeCallbacks(pollBoot);
+        ui.post(pollBoot);
     }
 
     private void stop() {
@@ -307,6 +359,9 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         }
         booted = false;
         VmHost.setRunning(false);
+        ui.removeCallbacks(pollBoot);
+        fbView.setVisibility(View.GONE);
+        fbBitmap = null;
         setStatus("已停止。");
         rebuildControls();
         ui.removeCallbacks(hideControls);
@@ -335,6 +390,7 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
         if (booted && VmHost.isRunning()) {
             AppLog.w("显示页: 画面销毁但 guest 仍在运行（引擎按进程存活）", null);
         }
+        ui.removeCallbacks(pollBoot);
         ui.removeCallbacksAndMessages(null);
         super.onDestroy();
     }

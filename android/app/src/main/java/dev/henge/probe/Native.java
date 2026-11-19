@@ -33,6 +33,12 @@ final class Native {
      * Returns a report whatever happens: a missing file is the ordinary answer, and it comes back
      * as a sentence rather than as an exception or a crash.
      */
+    /** The firmware's boot framebuffer as ARGB ints; false when there is not one yet. */
+    static native boolean nativeBootFramebuffer(int[] pixels, int[] meta);
+
+    /** Whether the GPU has taken the screen over (a mode is set and a frame was presented). */
+    static native boolean nativeDisplayReady();
+
     /** Whether a machine is running in this process. */
     static native boolean nativeIsUp();
 
