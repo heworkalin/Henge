@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <android/log.h>
@@ -88,6 +89,19 @@ struct HvReimsPvg {
 static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t target_length,
                    const char *message, size_t message_length) {
     (void)ctx;
+    /*
+     * The fifo thread polls the command ring and reports an empty one as "command 0 of length 0,
+     * outside 12..=49152; skipped" -- every poll, several times a millisecond. That is the ring
+     * being empty, which is the normal state before the guest submits anything, and it filled a
+     * 182 MB log while saying nothing. Once every five seconds is enough to see it is happening.
+     */
+    static const char *const noise = "command 0 of length 0";
+    static time_t last;
+    if (message_length >= 22 && memmem(message, message_length, noise, 22)) {
+        time_t now = time(NULL);
+        if (now - last < 5) return;
+        last = now;
+    }
     int priority = ANDROID_LOG_INFO;
     switch (level) {
     case RVG_LOG_ERROR: priority = ANDROID_LOG_ERROR; break;

@@ -262,6 +262,19 @@ static void on_host_fault(int sig, siginfo_t *info, void *ctx) {
 }
 
 static void install_host_fault_handlers(void) {
+    /*
+     * Once per process, and never again.
+     *
+     * The handler restores whatever handler it replaced before returning, because the fault is not
+     * recoverable and the next one must terminate the process. Installing it a second time made the
+     * "previous" handler our own, so restoring it restored the handler that had just run: the
+     * faulting instruction was retried, faulted again, and the thread span there forever. A boot
+     * that had died in host code therefore looked alive (2766 faults in one log, guest never
+     * advancing, GPU never getting a frame).
+     */
+    static int installed;
+    if (installed) return;
+    installed = 1;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
