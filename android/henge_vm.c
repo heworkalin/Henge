@@ -261,7 +261,7 @@ static void on_host_fault(int sig, siginfo_t *info, void *ctx) {
     sigaction(sig, prior, NULL);
 }
 
-static void install_host_fault_handlers(void) {
+void hv_install_host_fault_handlers(void) {
     /*
      * Once per process, and never again.
      *
@@ -309,7 +309,7 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
         unlock_root_disk();
         return -1;
     }
-    install_host_fault_handlers();
+    hv_install_host_fault_handlers();
 
     memset(&g_machine, 0, sizeof g_machine);
     memset(&g_board, 0, sizeof g_board);

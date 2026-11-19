@@ -162,10 +162,27 @@ static void on_iosurface_interrupt(void *ctx, uint32_t vector) {
 
 /* The two MMIO windows. The engine hands a byte offset into the window and a width; reims-vgpu's
  * register file is 32-bit, and its windows are the same offsets the guest uses. */
+/*
+ * The guest reads these back to learn what the device made of its writes (a status word, a ring's
+ * slot count). That half of the conversation had no logging at all, so a guest polling a register
+ * for an answer that never came looked exactly like a guest that had stopped asking.
+ */
 static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
     HvReimsPvg *p = opaque;
     (void)size;
-    return rvg_device_mmio_read(p->device, off);
+    uint64_t v = rvg_device_mmio_read(p->device, off);
+    if (p->log) {
+        static unsigned long n;
+        if (n < 300) {
+            n++;
+            fprintf(stderr, "reims: gfx read  +%#llx = %#llx\n", (unsigned long long) off,
+                    (unsigned long long) v);
+        } else if (n == 300) {
+            n++;
+            fprintf(stderr, "reims: gfx read  (300 shown, further reads not logged)\n");
+        }
+    }
+    return v;
 }
 
 static void gfx_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
