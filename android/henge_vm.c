@@ -374,6 +374,10 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
         return -1;
     }
     if (cache_dir && *cache_dir) setenv("XDG_CACHE_HOME", cache_dir, 1);
+    /* The activity hands the display its SurfaceView's Surface later, and the library only keeps a
+       window link where the display was created with one (android/reims_pvg.c), so the app asks
+       for it here. The command-line tool never sets this and stays off-screen. */
+    setenv("HV_REIMS_WINDOW", "1", 0);
 
     if (lock_root_disk(disk, &cursor, end) != 0) return -1;
     if (hap_disks_open(&cursor, end, disk, aux) != 0) {

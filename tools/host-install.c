@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <stdint.h>
 
@@ -147,6 +148,26 @@ int main(int argc, char **argv) {
            the same handlers the install loop below uses, because the guest's own log is in
            msgbuf (the normal boot, like upstream's, has no serial console; only the restore boot
            gets one from idevicerestore's boot-args). */
+        {
+            /* HV_SCAN_PROC=<seconds>: ask the guest's own memory which processes it has, now and
+               then. The normal boot has no serial console (its boot-args are iBEC's, and the engine
+               does not rewrite them), so this is the only way to tell "macOS reached its window
+               server" from "the guest stopped early" -- and a black screen is exactly the case
+               where the two look alike. */
+            extern void hv_android_scan_procs(void);
+            static int every = -1;
+            static time_t last;
+            if (every < 0) {
+                const char *e = getenv("HV_SCAN_PROC");
+                every = (e && *e) ? atoi(e) : 0;
+                if (every <= 0) every = 1;
+            }
+            if (getenv("HV_SCAN_PROC") && time(NULL) - last >= every) {
+                last = time(NULL);
+                fprintf(stderr, "henge: scanning the guest's processes\n");
+                hv_android_scan_procs();
+            }
+        }
         for (;;) {
             /* HV_FAKE_ESC=<seconds>: inject one Escape after the guest has had that long to come
                up. Reuses the engine's own injection (hv_xhci_key through hv_android_key), which is
@@ -256,6 +277,20 @@ int main(int argc, char **argv) {
                                 fwrite(px + (size_t)y * st, 1, (size_t)w * 4, f);
                             fclose(f);
                             fprintf(stderr, "henge: %s (progress bar sample)\n", bmp);
+                        }
+                    }
+                    /* The same sample from the GPU's side: the frame reims-vgpu drew, not the
+                       firmware's boot framebuffer. Both are wanted -- the progress bar lives in
+                       the latter until the guest's own compositor runs, and a black GPU frame
+                       beside a drawn progress bar says the grab path is the one to look at. */
+                    {
+                        extern int hv_android_grab_frame(const char *path);
+                        const char *name = getenv("HV_GRAB_GPU");
+                        if (name && *name) {
+                            char pic[672];
+                            snprintf(pic, sizeof pic, "%s/gpu-%03d.bmp", work, seq);
+                            int got = hv_android_grab_frame(pic);
+                            fprintf(stderr, "henge: %s (gpu frame %d)\n", pic, got);
                         }
                     }
                 }

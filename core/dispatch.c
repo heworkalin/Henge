@@ -1790,9 +1790,35 @@ dt_probe_done:;
                  HV_DT_LEN_PATCH=1        rewrite boot_args' device tree length to 16 MB
                  HV_BOOT_ARGS_VERBOSE=1   append -v
                  HV_EXTRA_BOOT_ARGS=...   append arbitrary arguments */
+            static uint64_t live_boot_args_pa;
             if (!boot_args_fixed) {
                 boot_args_fixed = 1;
-                uint64_t *q = hv_phys_ptr(m, 0x837f0000ull, 0x1000);
+                /* The structure the kernel is handed, not the 0x837f0000 page this used to
+                   patch: measured, that page stays at revision 0 and device tree length 0, so
+                   HV_EXTRA_BOOT_ARGS wrote " serial=3" into a page nothing reads ("boot-args
+                   " serial=3" (dt length 0)"). Found the way upstream's host/vm.c finds the boot
+                   framebuffer: iBoot puts boot_args lower in RAM (near 0x78ed0000), and its
+                   address moves, so scan for it. */
+                {
+                    HvRam *ram = m->main_ram;
+                    uint64_t limit = (ram && ram->size < (1ull << 30)) ? ram->size : (1ull << 30);
+                    if (ram && ram->host)
+                        for (uint64_t off = 0; off + 0x1000 <= limit; off += 0x4000) {
+                            const uint16_t *h = (const uint16_t *)(ram->host + off);
+                            const uint64_t *c = (const uint64_t *)(ram->host + off);
+                            if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue;
+                            if ((c[1] >> 40) != 0xfffffe) continue;                  /* virtBase */
+                            if (c[2] < ram->pa || c[2] >= ram->pa + ram->size) continue; /* physBase */
+                            if (c[3] == 0 || c[3] > ram->size) continue;             /* memSize */
+                            uint64_t dt = c[12];
+                            uint32_t dtlen = (uint32_t)c[13];
+                            if (dt < ram->pa || dt >= ram->pa + ram->size) continue;
+                            if (dtlen < 0x1000 || dtlen > 0x1000000) continue;
+                            live_boot_args_pa = ram->pa + off;
+                            break;
+                        }
+                }
+                uint64_t *q = live_boot_args_pa ? hv_phys_ptr(m, live_boot_args_pa, 0x1000) : NULL;
                 if (q) {
                     uint32_t *len = (uint32_t *)(uintptr_t)(q + 13);
                     if (getenv("HV_DT_LEN_PATCH") && *len && *len < (16u << 20)) {
@@ -1803,18 +1829,30 @@ dt_probe_done:;
                     }
                     char *cmd = (char *) q + 0x6c;
                     size_t n = strnlen(cmd, 1000);
-                    if (getenv("HV_BOOT_ARGS_VERBOSE") && !strstr(cmd, "-v") && n + 3 < 1024) {
-                        memcpy(cmd + n, " -v", 4);
-                        n += 3;
+                    /* No leading space into an empty command line: the kernel parses what is
+                       there, and " serial=3" was what the wrong page made of it. */
+                    if (getenv("HV_BOOT_ARGS_VERBOSE") && !strstr(cmd, "-v") && n + 4 < 1024) {
+                        const char *sep = n ? " " : "";
+                        size_t sl = strlen(sep);
+                        memcpy(cmd + n, sep, sl);
+                        memcpy(cmd + n + sl, "-v", 3);
+                        n += sl + 2;
                     }
                     const char *extra = getenv("HV_EXTRA_BOOT_ARGS");
                     if (extra && *extra) {
-                        size_t en = strlen(extra);
-                        if (n + en + 2 < 1024) { cmd[n] = ' '; memcpy(cmd + n + 1, extra, en + 1); n += en + 1; }
+                        const char *sep = n ? " " : "";
+                        size_t sl = strlen(sep), en = strlen(extra);
+                        if (n + sl + en + 1 < 1024) {
+                            memcpy(cmd + n, sep, sl);
+                            memcpy(cmd + n + sl, extra, en + 1);
+                            n += sl + en;
+                        }
                     }
-                    fprintf(stderr, "hengevm: boot-args \"%s\" (dt length %u)\n", cmd, *len);
+                    fprintf(stderr, "hengevm: boot-args \"%s\" (at pa %#llx, dt length %u)\n", cmd,
+                            (unsigned long long) live_boot_args_pa, *len);
                 } else {
-                    fprintf(stderr, "hengevm: boot_args page 837f0000 is not RAM here\n");
+                    fprintf(stderr, "hengevm: no live boot_args found in the first GB of RAM "
+                                    "(HV_EXTRA_BOOT_ARGS not applied)\n");
                 }
             }
             /* The layout lives in the device tree, and the device tree pointer is in boot_args:

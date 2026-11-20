@@ -231,6 +231,11 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | `HENGE_DUMP_RAM_AT` | 秒 | 关 | 到点 dump RAM（`android/install.c:561`） |
 | `HV_AGENT` | `1` | 关 | 宿主侧 agent 通道（`host/main.c:1145`） |
 | `HV_HOOK_*` / `HV_SHARE_LOG` / `HV_INPUT_LOG` / `HV_CFG_POKE` | 见代码 | 关 | 宿主共享目录 / 输入 / 配置调试 |
+| `HV_VK_DRIVER` | 目录 | 关（app 用 `nativeLibraryDir`） | 用 **libadrenotools 的 linker namespace** 打开该目录里的 `libvulkan_freedreno.so`（Turnip）；目录里必须同时有 `libmain_hook.so` / `libhook_impl.so`。**不能改成直接 dlopen**：驱动的 `NEEDED` 厂商库只在系统 namespace 里。`android/vk_loader.c` |
+| `HV_REIMS_WINDOW` | `1` | app 自动设；CLI 不设 | display 创建时带 window link，否则 `rvg_display_attach_android_window` 恒失败（`RVG_ERR_UNSUPPORTED`，消息是 "unsupported struct size"）。`android/reims_pvg.c` / `android/henge_vm.c` |
+| `REIMS_DISPLAY_SAMPLE` | `1` | 关 | 在 reims 的 `present_frame` 里**直接采样 guest 交上来的 IOSurface 字节**，打印 `sampled / non-black / max channel`：判"guest 送的是空 surface"还是"我们把它搬丢了"。`display/guest_display/present.rs` |
+| `HV_GRAB_GPU` | `1` | 关 | 配合 `HV_GRAB_EVERY=<秒>`，每次采样同时写 `gpu-NNN.bmp`（GPU 显示帧），与 `fb-NNN.bmp`（固件帧缓冲）同一时刻对照。`tools/host-install.c` |
+| `HV_SCAN_PROC` | 秒 | 关 | `HV_BOOT_ONLY` 下也生效：周期性扫 guest 进程名（正常启动没有串口，这是唯一入口）。`tools/host-install.c` |
 
 ---
 
@@ -245,6 +250,8 @@ HV_PCHK = (link_va + slide) & 0xffffffff
 | 判断 USB 走到哪一步 | `HV_VIRTIO_CFG_LOG=1`（guest 侧） + `HV_LIBUSB_LOG=1`（宿主侧） |
 | 判断系统调用/返回值 | gdb 读 `hv_svc_*`（按时间序）；注意 `hv_svc_ret` 只有在本轮代码（`hv_el0_note` 无条件记录）之后才可信 |
 | 判断有没有崩溃 | gdb 读 `hv_uexc_*` 与 `hv_el0_flt_*`，**看 ESR 的 EC/ISS**：`0x20/0x24 + ISS 0x07` 是正常缺页，`0x0d..0x0f` 才是权限错误 |
+| **GPU 接管了但画面全黑** | 先看 `reims: status` 的 `guest presents`/`host presents`；再 `REIMS_DISPLAY_SAMPLE=1` 判 guest 送的 surface 是否为空；再 `HV_GRAB_GPU=1 HV_GRAB_EVERY=60` 抓 GPU 帧。管线被拒会打 `pipeline refused: unsupported ...` 与 `exec faulted: render pipeline lookup failed` |
+| **GPU 到底有没有被访问** | `reims: bus` 每秒一行（gfx writes/reads、iosfc writes、new frames 的增量）；再看 `reims: efi reg` 是否出现（EFI display 是否被编程） |
 
 ### 只用于调试的二进制产物（默认全关，不要随正式版发出）
 

@@ -303,6 +303,7 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 | `docs/upstream-restore-semantics-2026-11-19.md` | **恢复模式的苹果语义（VZMacOSInstaller）+ 我们相对上游的差异清单**（T/V/H 三类，E/X/D/U 分级） |
 | `docs/jit-core-diff-2026-11-19.md` | **JIT 与核心模块的上游写法 + 逐文件差异**。判"上游错"需过两关：机制是架构级的，且能解释上游产品为什么能正常运行；否则记 U（"我们的环境需要"） |
 | `docs/exclusions-current-stall-2026-11-19.md` | **当前卡点的排除清单**（43 项已排除），排障前先看这张表，避免重走 |
+| **`docs/gpu-render-bringup-2026-11-21.md`** | **GPU 渲染链路打通记录**：IOSurface mapper、process isolation、Android 窗口/swapchain、Turnip 命名空间加载、framebuffer fetch 卡点、新增的可观测性开关 |
 | `docs/retrospective-2026-11-19.md` | **复盘**：走对的、走过的 11 条偏路、8 个错判、6 个错误介入、Apple 时间洁癖的实测证据、下一步 GPU |
 | `docs/android-install-debug.md` | Android 安装链路调试（设备端） |
 | `docs/android-install-status.md` | 安装现状 |
@@ -324,7 +325,47 @@ HV_PCHK = (link_va + slide) & 0xffffffff      # 低 32 位，不是 link VA
 **只有安装流程走完之后才会碰 UI**。届时若需要用 `gdb` 推送 / `run-as` 之类手段调试，
 那**只适用于调试**；真正控制 `.so` 的行为要走别的方案（不要在 UI 里依赖调试通道）。
 
-### 10.2 当前状态（2026-11-19 更新）
+### 10.2 当前状态（2026-11-21 更新：GPU 渲染）
+
+**主目标没变：把已安装的 macOS 启动到"能渲染出画面"。**
+
+已经打通的部分（全部有实测证据，见 `docs/gpu-render-bringup-2026-11-21.md`）：
+
+| 环节 | 状态 |
+|---|---|
+| 驱动 | 走 **libadrenotools 命名空间**加载 **Turnip 1.3.296**（`HV_VK_DRIVER=<dir>` / app 自动取 `nativeLibraryDir`），实测链路生效 |
+| IOSurface 查找 | ✅ `use_iosurface_mapper=true`，`no IOSurface` 88 → 0 |
+| writable cursor | ✅ `process_isolation=true`，`tasks.unsupported.writable_cursor` 不再出现 |
+| Android 窗口 | ✅ display 创建时带 window link，`display attached to the host's window` |
+| swapchain | ✅ 实例加 `VK_KHR_android_surface`；图像格式按候选表选（Turnip 只给 `R8G8B8A8_UNORM`） |
+| 呈现 | ✅ `host presents` 0 → 109（此前恒 0） |
+
+**当前卡点（2026-11-21 03:00 定位）：framebuffer fetch 的渲染管线被 m2v 拒绝。**
+
+```
+pipeline refused: Unsupported { feature: FramebufferFetch, needs: AnyOf([[
+  RasterizationOrderColorAttachmentAccess], [FragmentShaderPixelInterlock]]) }
+→ exec faulted: render pipeline lookup failed   （一轮 boot 655 次）
+```
+
+含义：guest **有**在给 GPU 派任务，但用到该特性的 draw 无法执行，所以 present 出去的是空 surface
+（`guest presents≈1.6/s` 全黑）。厂商标定驱动两种形式都没有；Turnip 有
+`VK_EXT_rasterization_order_attachment_access` 且
+`rasterizationOrderColorAttachmentAccess=1`，但 **reims 没在 device options 里命名该扩展**，
+m2v 的 profile 就一直认为设备没有它。
+
+修法已写、**未验证**：`reims-vgpu-vulkan/src/os/wsi.rs::add_raster_order_extension`（在
+`device_options()` 里按物理设备扩展表添加），验证判据见文档 §7。
+
+两条纠正过的错误（别再犯）：
+
+- **进度条冻结在 40~50% 是 GPU 接管的正常现象**，不是卡死；`fb-NNN.bmp` 里条在 **y≈131..142**
+  （距顶 11%），不要按底部去找。
+- **boot-args 注入点不对**：`0x837f0000` 那一页 `dt length` 恒 0，不是内核真正拿到的 boot_args；
+  上游根本不写 `CommandLine`，它只扫描 RAM 读 framebuffer。现在 `HV_EXTRA_BOOT_ARGS` 会打印
+  "no live boot_args found … (not applied)"，**正常启动目前没有串口**，别拿"没有串口输出"当结论。
+
+### 10.2.1 旧状态（2026-11-19，安装/恢复阶段，保留作参考）
 
 **旧的"整机死锁"卡点已经解决，根因是时间机制错误，不是死锁本身。**
 

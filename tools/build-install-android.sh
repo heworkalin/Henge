@@ -98,6 +98,8 @@ build third_party/mbedtls/library/aes.c third_party/mbedtls/library/sha256.c \
 build android/install.c
 # The app's normal-boot entry (HV_BOOT_ONLY path in host-install.c): same engine, no restore OS.
 build android/henge_vm.c
+# HV_VK_DRIVER: libadrenotools' linker namespace, so the engine can open Turnip (see the file).
+build android/vk_loader.c
 [ -n "$REIMS_ARG" ] && build android/reims_pvg.c
 if stale "$OUT/obj/host_enter.o" host/enter.S; then
     $CC -D_GNU_SOURCE -D__ANDROID__ -Ihost -Icore --target=aarch64-linux-android$API \
@@ -107,9 +109,26 @@ fi
 # shim the glibc host build needs has no place here.
 rm -f "$OUT/obj/tidshim.o" "$OUT/obj/tidshim.c"
 
-objs=$(ls "$OUT"/obj/*.o)
-$CC $CFLAGS tools/host-install.c $objs "$RESTORE" \
+objs=$(ls "$OUT"/obj/*.o | grep -v '/tools_host_install\.o$')
+# libadrenotools is C++: its static library needs libc++ and libc++abi, which this link takes
+# statically (the CLI ships as one file). Only the HV_VK_DRIVER path calls into it.
+ADR=${ADRENOTOOLS_LIB:-build/android-arm64-v8a/third_party/adrenotools}
+ADR_LIBS=""
+if [ -f "$ADR/libadrenotools.a" ]; then
+    ADR_LIBS="$ADR/libadrenotools.a $ADR/lib/linkernsbypass/liblinkernsbypass.a"
+    echo "adrenotools: linking $ADR/libadrenotools.a"
+else
+    echo "adrenotools: not built (HV_VK_DRIVER will report no driver)"
+fi
+# libadrenotools is C++ and needs its runtime: clang++ is what adds libc++/libc++abi to the link
+# (clang does not for a C source, and the archive's `__gxx_personality_v0` stays undefined).
+LINK=${CXX:-${CC}++}
+LINK_FLAGS=$(echo "$CFLAGS" | sed 's/-std=gnu11//')
+# main() as C: a clang++ compile would mangle the engine's C symbols it calls.
+$CC $CFLAGS -c tools/host-install.c -o "$OUT/obj/tools_host_install.o"
+objs="$objs $OUT/obj/tools_host_install.o"
+$LINK $LINK_FLAGS $objs "$RESTORE" \
     "$CURL/lib/libcurl.a" "$OSSL/lib/libssl.a" "$OSSL/lib/libcrypto.a" \
-    ${LIBZIP:+$LIBZIP} $REIMS_ARG -o "$OUT/host-install" \
-    -lm -ldl -llog -landroid ${ZLIB:+-lz} 2>&1 | tail -25
+    ${LIBZIP:+$LIBZIP} $REIMS_ARG $ADR_LIBS -o "$OUT/host-install" \
+    -static-libstdc++ -lm -ldl -llog -landroid ${ZLIB:+-lz} 2>&1 | tail -25
 ls -lh "$OUT/host-install"

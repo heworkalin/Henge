@@ -58,6 +58,7 @@ set(COMPAT_SRC
     ${HENGE_COMPAT}/pvg_metal_stub.c         # the Metal replay Android does not have
     ${CMAKE_CURRENT_SOURCE_DIR}/probe_jni.c  # JNI entry point for the probe APK
     ${CMAKE_CURRENT_SOURCE_DIR}/probe_vk.c   # what this device's Vulkan offers
+    ${CMAKE_CURRENT_SOURCE_DIR}/vk_loader.c   # HV_VK_DRIVER: libadrenotools' namespace
     ${CMAKE_CURRENT_SOURCE_DIR}/probe_ns.c   # why the driver namespace load fails
     ${CMAKE_CURRENT_SOURCE_DIR}/henge_vm.c   # builds a machine from inside the app (bring-up)
     ${CMAKE_CURRENT_SOURCE_DIR}/install.c    # installing macOS from an IPSW

@@ -86,6 +86,8 @@ struct HvReimsPvg {
     /* Whether the guest has set a mode, and to what: until it has, there is nothing to present
      * and the window stays as it is. */
     int have_mode;
+    unsigned long long gfx_writes, iosfc_writes, gfx_reads;
+    unsigned long long new_frames;
     uint16_t mode_width, mode_height;
     uint32_t mode_format;
     int log;
@@ -121,7 +123,10 @@ static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t targ
     /* logcat *and* stderr: a command-line run has no logcat reader, and a warning from inside the
      * library (a refused command, a fifo fault) was invisible there -- the one place it matters
      * most, because the CLI is where the guest is brought up. */
-    if (getenv("HV_REIMS_LOG")) {
+    /* Into the log file too, not only logcat: a warning from the library is the only thing that
+     * explains a black window, and the app's log file is the one place a run can be read after the
+     * fact. Everything with HV_REIMS_LOG; the warnings and errors always. */
+    if (getenv("HV_REIMS_LOG") || level == RVG_LOG_ERROR || level == RVG_LOG_WARN) {
         fprintf(stderr, "reims[%.*s]: %.*s\n", (int)target_length, target, (int)message_length,
                 message);
     }
@@ -144,6 +149,7 @@ static void on_mode_change(void *ctx, uint16_t width, uint16_t height, uint32_t 
 static void on_new_frame(void *ctx) {
     HvReimsPvg *p = ctx;
     p->frame_pending = 1;
+    p->new_frames++;
 }
 
 /* The guest's cursor. Henge draws the guest's cursor itself, and an Android window has no cursor
@@ -204,6 +210,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
     HvReimsPvg *p = opaque;
     (void)size;
     uint64_t v = rvg_device_mmio_read(p->device, off);
+    p->gfx_reads++;
     if (p->log) {
         static unsigned long n;
         if (n < 300) {
@@ -221,9 +228,26 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
 static void gfx_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
     HvReimsPvg *p = opaque;
     (void)size;
+    p->gfx_writes++;
     /* Bring-up: which register the guest programs on the GPU device. */
     if (p->log >= 1) fprintf(stderr, "reims: gfx write +%#llx = %#llx\n",
                              (unsigned long long) off, (unsigned long long) val);
+    /* The EFI display's own registers (start page, length, depth, mode, stride, and the
+     * stride-alignment read at 0x1224): the firmware's progress bar reaches the host as presents
+     * this display makes, so whether the guest programs it decides whether a black GPU frame is
+     * "the guest has not drawn yet" or "the firmware's bar never got a display". Bounded: the
+     * guest programs these a handful of times. */
+    if (off >= 0x1200 && off <= 0x1300) {
+        static unsigned long efi_writes;
+        if (efi_writes < 120) {
+            efi_writes++;
+            fprintf(stderr, "reims: efi reg +%#llx = %#llx\n", (unsigned long long) off,
+                    (unsigned long long) val);
+        } else if (efi_writes == 120) {
+            efi_writes++;
+            fprintf(stderr, "reims: efi reg (120 writes shown, further ones not logged)\n");
+        }
+    }
     rvg_device_mmio_write(p->device, off, (uint32_t)val);
 }
 
@@ -237,6 +261,7 @@ static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
 static void iosfc_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
     HvReimsPvg *p = opaque;
     (void)size;
+    p->iosfc_writes++;
     if (!p->iosurface) return;
     /* Bring-up: the guest's writes to the mapper's registers, so a refusal from inside reims can
        be tied to the value that caused it. The register meanings are reims's (REG_RING_SIZE at
@@ -292,6 +317,18 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
     memset(&config, 0, sizeof config);
     config.struct_size = sizeof config;
     config.display_port_count = 1;
+    /* The guest's textures and buffers name the IOSurface mapping ids it made through the mapper
+     * MMIO device below (`rvg_iosurface_device_create`). Without this flag the device looks them
+     * up through no mapper service at all, and every such resource raised "no IOSurface for
+     * mapping N" (measured: surfaces 1..5 mapped, then eight exec faults). "The process's latest
+     * RvgIOSurfaceDevice" is resolved at each lookup, so the device made after this one is the
+     * one it finds. */
+    config.use_iosurface_mapper = true;
+    /* The guest asks for a writable cursor while it decodes an indirect command buffer; a local
+     * task answers that by ending the process ("tasks.unsupported.writable_cursor", measured).
+     * Isolated tasks are served by the task service on threads of this process, which implements
+     * it, so user tasks (1 and up; task 0 stays local) run isolated. */
+    config.process_isolation = true;
     config.memory_map = (ram && ram_size) ? &p->map : NULL;
     config.memory_files = (ram && ram_size) ? &p->file : NULL;
     config.callbacks = &p->host;
@@ -334,19 +371,31 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
     display_callbacks.cursor_show = on_cursor_show;
     display_callbacks.cursor_move = on_cursor_move;
 
-    /* No window at creation: "NULL is no window. Otherwise the library opens a window for the
-     * display", and on Android the only way to open one is an ANativeWindow, which arrives later
-     * through rvg_display_attach_android_window (that call switches the display to it). Passing an
-     * empty-window config here asked the library to open a window it could not, and the display was
-     * left holding a present target that never became valid -- which is where the CLI's
-     * use-after-free inside EfiDisplay::rebuild_mode came from. */
+    /* Whether a window exists is decided at creation, not at attach: the library's display keeps
+     * a window link only where the config names one, and `rvg_display_attach_android_window`
+     * answers RVG_ERR_UNSUPPORTED (measured in the app: "window refused, display stays offscreen")
+     * for a display made without one. On Android the host's ANativeWindow arrives later and is
+     * installed into that link, so the app asks for the link up front (`HV_REIMS_WINDOW=1`, set
+     * by android/henge_vm.c) while the command-line tool, which never has a window, does not.
+     *
+     * The config carries no flags and no callbacks: "NULL is a table with every callback absent",
+     * and without RVG_WINDOW_MATCH_HOST_SCREEN the display offers 1920x1080 at 1x until the guest
+     * sets its own mode. */
+    int want_window = 0;
+    {
+        const char *w = getenv("HV_REIMS_WINDOW");
+        want_window = w && *w && *w != '0';
+    }
+    RvgWindowConfig window_config;
+    memset(&window_config, 0, sizeof window_config);
+    window_config.struct_size = sizeof window_config;
     RvgDisplayConfig display_config;
     memset(&display_config, 0, sizeof display_config);
     display_config.struct_size = sizeof display_config;
     display_config.port = 0;
     display_config.serial_number = 1;
     display_config.callbacks = &display_callbacks;
-    display_config.window = NULL;
+    display_config.window = want_window ? &window_config : NULL;
 
     st = rvg_display_create(p->device, &display_config, &p->display);
     if (st != RVG_OK) {
@@ -356,10 +405,34 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
     /* The display starts off-screen, because a window arrives late (`hv_reims_pvg_attach_window`)
      * and a command-line process never has one. Said once, so a run's log states the display
      * decision instead of leaving it to be inferred from whether a picture appeared. */
+    /* Once, unconditionally: whether the host has a window (the app) or not (the command line) is
+     * the first thing a black screen has to be told apart by, and the app's log is the only one
+     * available there. */
+    {
+        static int said;
+        if (!said) {
+            said = 1;
+            if (!p->display) {
+                fprintf(stderr, "reims: display kind = NONE (rvg_display_create refused it)\n");
+            } else if (want_window) {
+                fprintf(stderr, "reims: display kind = window (created with a window link; the host "
+                                "installs its ANativeWindow when the surface exists)\n");
+            } else {
+                fprintf(stderr, "reims: display kind = offscreen (no window: frames can be encoded "
+                                "and read back)\n");
+            }
+        }
+    }
     if (p->log) {
-        fprintf(stderr, "reims: display kind = %s\n",
-                p->display ? "offscreen (no window: frames can be encoded and read back)"
-                           : "NONE (rvg_display_create refused the display)");
+        if (!p->display) {
+            fprintf(stderr, "reims: display kind = NONE (rvg_display_create refused it)\n");
+        } else if (want_window) {
+            fprintf(stderr, "reims: display kind = window (created with a window link; the host "
+                            "installs its ANativeWindow when the surface exists)\n");
+        } else {
+            fprintf(stderr, "reims: display kind = offscreen (no window: frames can be encoded "
+                            "and read back)\n");
+        }
     }
 
     /* The modes the guest is offered. rvg_display_set_modes is what connects a display to the
@@ -447,6 +520,48 @@ int hv_reims_pvg_ready(HvReimsPvg *p) {
 
 void hv_reims_pvg_poll(HvReimsPvg *p) {
     if (!p || !p->display) return;
+    /* Every 20 s, what the display is doing, in one line: a black window has three very different
+     * causes and only these numbers tell them apart -- no mode (the guest never set one), a mode
+     * and the guest never presents, or the guest presenting with the host never showing it. */
+    {
+        /* Once a second, what the guest asked of the GPU device since the last line: the guest
+         * talks to the device by doorbells (writes at +0x1020) and reads back its answers, so a
+         * boot that has handed the screen to the GPU shows both moving, and one that has not
+         * shows them still. Cheap enough to leave on: the counters are increments. */
+        static time_t last_bus;
+        static unsigned long long gfx0, iosfc0, reads0, frames0;
+        time_t now = time(NULL);
+        if (now != last_bus) {
+            last_bus = now;
+            fprintf(stderr, "reims: bus | gfx writes=%llu (+%llu/s) reads=%llu (+%llu/s) iosfc "
+                            "writes=%llu (+%llu/s) new frames=%llu (+%llu/s)\n",
+                    p->gfx_writes, p->gfx_writes - gfx0, p->gfx_reads, p->gfx_reads - reads0,
+                    p->iosfc_writes, p->iosfc_writes - iosfc0, p->new_frames,
+                    p->new_frames - frames0);
+            gfx0 = p->gfx_writes;
+            reads0 = p->gfx_reads;
+            iosfc0 = p->iosfc_writes;
+            frames0 = p->new_frames;
+        }
+    }
+    {
+        static time_t last;
+        time_t now = time(NULL);
+        if (now - last >= 15) {
+            last = now;
+            uint64_t guest = 0, host = 0;
+            rvg_display_present_counts(p->display, &guest, &host);
+            /* Unconditional on purpose: this line is the answer to "why is the window black", and
+             * a run whose log inside the app is the only one available does not set HV_REIMS_LOG. */
+            fprintf(stderr,
+                    "reims: status | window=%d mode=%s%ux%u | new frames=%llu | guest presents=%llu "
+                    "| host presents=%llu\n",
+                    p->window_attached, p->have_mode ? "" : "(none) ",
+                    (unsigned)(p->have_mode ? p->mode_width : 0),
+                    (unsigned)(p->have_mode ? p->mode_height : 0), p->new_frames,
+                    (unsigned long long)guest, (unsigned long long)host);
+        }
+    }
     /* Nothing to do here on purpose: a window's frames are presented by reims-vgpu's own render
      * thread through the swapchain over the attached VkSurfaceKHR (see reims-vgpu-vulkan's
      * swapchain.rs), not by the host. `frame_pending` only feeds the off-screen grab used by the
