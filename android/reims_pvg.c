@@ -75,6 +75,14 @@ struct HvReimsPvg {
     /* Frames the host asked for and that have not been presented: `hv_reims_pvg_poll` encodes
      * one and commits it. */
     int frame_pending;
+    /* Whether the host's window is attached. Until it is, the display is off-screen: the guest
+     * can still set a mode and present, and the frames can be encoded and read back. */
+    int window_attached;
+    /* Off-screen frames reported so far, so the first one and every sixtieth answer "is the
+     * guest drawing" without filling the log. */
+    uint64_t offscreen_frames;
+    /* Whether each device's first raise has been named in the log (see on_raise_interrupt). */
+    int raises_logged, iosfc_raises_logged;
     /* Whether the guest has set a mode, and to what: until it has, there is nothing to present
      * and the window stays as it is. */
     int have_mode;
@@ -109,6 +117,13 @@ static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t targ
     case RVG_LOG_DEBUG: priority = ANDROID_LOG_DEBUG; break;
     case RVG_LOG_TRACE: priority = ANDROID_LOG_VERBOSE; break;
     default: priority = ANDROID_LOG_INFO; break;
+    }
+    /* logcat *and* stderr: a command-line run has no logcat reader, and a warning from inside the
+     * library (a refused command, a fifo fault) was invisible there -- the one place it matters
+     * most, because the CLI is where the guest is brought up. */
+    if (getenv("HV_REIMS_LOG")) {
+        fprintf(stderr, "reims[%.*s]: %.*s\n", (int)target_length, target, (int)message_length,
+                message);
     }
     __android_log_print(priority, "HENGEREIMS", "%.*s: %.*s", (int)target_length, target,
                         (int)message_length, message);
@@ -148,16 +163,34 @@ static void on_cursor_show(void *ctx, uint8_t show) { (void)ctx, (void)show; }
  * callback has nothing to carry. */
 static void on_cursor_move(void *ctx) { (void)ctx; }
 
-/* The device raises a guest interrupt. The device's signal lock is held here: pend and return. */
+/*
+ * A raised guest interrupt. The device's signal lock is held here: pend and return.
+ *
+ * `vector` is the library's own numbering, not the guest's INTID: both devices raise 0
+ * ("raiseInterrupt(0)"), one line each, and the guest's line is the one the device tree gives the
+ * device. Pending the vector itself therefore pended INTID 0, which the GIC drops silently
+ * (`hv_gicv3_pend_body` ignores anything below 32): the guest's GPU driver waited for an
+ * interrupt that could never arrive, while the engine's report said "no SPI was ever pended".
+ */
 static void on_raise_interrupt(void *ctx, uint32_t vector) {
     HvReimsPvg *p = ctx;
-    hv_gicv3_pend(p->gic, (int)vector);
+    (void)vector;
+    if (p->raises_logged < 1) {
+        p->raises_logged++;
+        fprintf(stderr, "reims: raise (vector %u) -> SPI %d\n", vector, p->gfx_irq);
+    }
+    hv_gicv3_pend(p->gic, p->gfx_irq);
 }
 
 /* The IOSurface device raises one: the guest reads its mapper's page for the rest. */
 static void on_iosurface_interrupt(void *ctx, uint32_t vector) {
     HvReimsPvg *p = ctx;
-    hv_gicv3_pend(p->gic, (int)vector);
+    (void)vector;
+    if (p->iosfc_raises_logged < 1) {
+        p->iosfc_raises_logged++;
+        fprintf(stderr, "reims: iosfc raise (vector %u) -> SPI %d\n", vector, p->iosfc_irq);
+    }
+    hv_gicv3_pend(p->gic, p->iosfc_irq);
 }
 
 /* The two MMIO windows. The engine hands a byte offset into the window and a width; reims-vgpu's
@@ -320,6 +353,14 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
         fail("rvg_display_create", st);
         p->display = NULL;
     }
+    /* The display starts off-screen, because a window arrives late (`hv_reims_pvg_attach_window`)
+     * and a command-line process never has one. Said once, so a run's log states the display
+     * decision instead of leaving it to be inferred from whether a picture appeared. */
+    if (p->log) {
+        fprintf(stderr, "reims: display kind = %s\n",
+                p->display ? "offscreen (no window: frames can be encoded and read back)"
+                           : "NONE (rvg_display_create refused the display)");
+    }
 
     /* The modes the guest is offered. rvg_display_set_modes is what connects a display to the
      * guest at all: "The guest's display page for the port takes the first 128: the first list it
@@ -348,12 +389,20 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
 }
 
 void hv_reims_pvg_attach_window(HvReimsPvg *p, void *native_window) {
-    if (!p || !p->display || !native_window) return;
+    if (!p || !p->display || !native_window) {
+        if (p && p->display && !native_window)
+            fprintf(stderr, "reims: display stays offscreen (no window given)\n");
+        return;
+    }
     RvgStatus st = rvg_display_attach_android_window(p->display, native_window);
     if (st != RVG_OK) {
         fail("rvg_display_attach_android_window", st);
+        /* The refusal is not fatal to the machine: the display keeps working off-screen, and a
+         * grab can still say whether frames exist. */
+        fprintf(stderr, "reims: window refused, display stays offscreen\n");
         return;
     }
+    p->window_attached = 1;
     /* Always, and with the window's size: this line is the answer to "did the GPU ever get a
        window", and without it a black screen and a working-but-empty screen look identical in the
        log. The guest's mode is reported separately when it sets one. */
@@ -372,6 +421,19 @@ void hv_reims_pvg_stats(HvReimsPvg *p, int out[3]) {
 }
 
 int hv_reims_pvg_have_display(HvReimsPvg *p) { return p && p->display != NULL; }
+
+HvReimsDisplayKind hv_reims_pvg_display_kind(HvReimsPvg *p) {
+    if (!p || !p->display) return HV_REIMS_DISPLAY_NONE;
+    return p->window_attached ? HV_REIMS_DISPLAY_WINDOW : HV_REIMS_DISPLAY_OFFSCREEN;
+}
+
+const char *hv_reims_pvg_display_name(HvReimsPvg *p) {
+    switch (hv_reims_pvg_display_kind(p)) {
+    case HV_REIMS_DISPLAY_WINDOW: return "window";
+    case HV_REIMS_DISPLAY_OFFSCREEN: return "offscreen";
+    default: return "none";
+    }
+}
 
 int hv_reims_pvg_have_mapper(HvReimsPvg *p) { return p && p->iosurface != NULL; }
 
@@ -393,6 +455,17 @@ void hv_reims_pvg_poll(HvReimsPvg *p) {
      * wrong conclusion that the guest was not drawing at all. */
     if (p->frame_pending && p->have_mode) {
         p->frame_pending = 0;
+        /* Off-screen, a frame is not shown anywhere until someone encodes it; one line here is
+         * what distinguishes "the guest draws and nobody looks" from "the guest never sets a
+         * mode", which is the question the stall raised. */
+        if (!p->window_attached) {
+            if (p->offscreen_frames == 0 || p->offscreen_frames % 60 == 0)
+                fprintf(stderr, "reims: offscreen frame %llu (%ux%u)%s\n",
+                        (unsigned long long)p->offscreen_frames + 1,
+                        p->mode_width, p->mode_height,
+                        p->offscreen_frames == 0 ? " — grab it with HV_GRAB_FRAME/HV_GRAB_EVERY" : "");
+            p->offscreen_frames++;
+        }
         if (p->log) fprintf(stderr, "reims: frame %ux%u\n", p->mode_width, p->mode_height);
     }
 }

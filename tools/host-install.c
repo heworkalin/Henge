@@ -135,6 +135,14 @@ int main(int argc, char **argv) {
         }
         printf("%s", boot_report);
         fflush(stdout);
+        /* The display decision, in one line at the start of the run: a command-line process has
+           no window, so the display is off-screen and a grab is the only way to see anything. The
+           point is that "no picture on a screen" and "the guest is not drawing" stop looking the
+           same in the log. */
+        {
+            extern const char *hv_android_display_name(void);
+            fprintf(stderr, "henge: display = %s\n", hv_android_display_name());
+        }
         /* The guest runs on its own threads; this one waits for SIGUSR1 and dumps on demand --
            the same handlers the install loop below uses, because the guest's own log is in
            msgbuf (the normal boot, like upstream's, has no serial console; only the restore boot
@@ -157,6 +165,59 @@ int main(int argc, char **argv) {
                         hv_android_key(0x29, 0);
                         sent = 1;
                         fprintf(stderr, "henge: injected Escape\n");
+                    }
+                }
+            }
+            /* One line per 30 s with every CPU's guest pc, el and halted flag: a pc that changes is
+               a guest at work, a fixed one is exactly where it stopped. The engine has the same
+               snapshot for the app (`hv_android_cpu_snapshot`); a command-line run needs it too
+               because "the log stopped" and "the guest stopped" are different answers. */
+            {
+                static time_t last_cpu_line, last_stall_report;
+                if (time(NULL) - last_cpu_line >= 30) {
+                    extern int hv_android_cpu_snapshot(uint64_t *out, int max_cpus);
+                    extern void hv_android_stall_report(void);
+                    static uint64_t prev[64 * 3];
+                    static int prev_n, same;
+                    uint64_t snap[64 * 3];
+                    last_cpu_line = time(NULL);
+                    int n = hv_android_cpu_snapshot(snap, 64);
+                    fprintf(stderr, "henge: cpus");
+                    for (int i = 0; i < n; i++)
+                        fprintf(stderr, " [%d] pc=%016llx el=%llu halted=%llu", i,
+                                (unsigned long long)snap[i * 3 + 0],
+                                (unsigned long long)snap[i * 3 + 1],
+                                (unsigned long long)snap[i * 3 + 2]);
+                    fprintf(stderr, "\n");
+                    /* Every pc the same as the sample before: 30 s of no guest progress. Three of
+                       those (90 s) and the report says why -- once, then at most every 5 min. The
+                       question it answers is the one the old logs could not: which CPU state and
+                       which interrupt line the guest is actually stopped on. */
+                    same = (n == prev_n && memcmp(snap, prev, (size_t)n * 3 * sizeof snap[0]) == 0)
+                               ? same + 1 : 0;
+                    memcpy(prev, snap, sizeof prev);
+                    prev_n = n;
+                    /* HV_STALL_EVERY=<seconds>: the report on a clock instead of on a detected
+                       stall. A guest whose two CPUs take turns between idle and kernel work never
+                       gives three identical samples, yet may still be going nowhere; this is how
+                       its threads get named. */
+                    {
+                        static int every;
+                        static int every_read;
+                        if (!every_read) {
+                            const char *e = getenv("HV_STALL_EVERY");
+                            every = e ? atoi(e) : 0;
+                            every_read = 1;
+                        }
+                        if (every > 0 && time(NULL) - last_stall_report >= every) {
+                            last_stall_report = time(NULL);
+                            hv_android_stall_report();
+                        }
+                    }
+                    if (same >= 2 && time(NULL) - last_stall_report >= 300) {
+                        last_stall_report = time(NULL);
+                        fprintf(stderr, "henge: no guest progress for %d s\n", (same + 1) * 30);
+                        hv_android_stall_report();
                     }
                 }
             }
@@ -211,6 +272,13 @@ int main(int argc, char **argv) {
                         snprintf(pic, sizeof pic, "%s/frame.bmp", work);
                         grabbed = 1;
                         int got = hv_android_grab_frame(pic);
+                        {
+                            extern const char *hv_android_display_name(void);
+                            fprintf(stderr, "henge: display = %s, grab = %s\n",
+                                    hv_android_display_name(),
+                                    got == 0 ? "content written (the guest draws)"
+                                             : "no content (no mode yet, or no frame)");
+                        }
                         if (got != 0) {
                             /* No GPU frame yet: fall back to the firmware's boot framebuffer, the
                                same two-step host/vm.c's hv_vm_boot_display does. */

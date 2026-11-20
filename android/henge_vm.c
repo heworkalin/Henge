@@ -52,6 +52,9 @@ static void unlock_root_disk(void);
  * the next one. */
 void hv_android_vm_teardown(void);
 
+/* Where the display's frames can go now: "window", "offscreen" or "none" (reims_pvg.h). */
+const char *hv_android_display_name(void);
+
 /* One machine at a time: the engine holds this much state, and a probe that leaves two behind
  * would exhaust the device long before it reported anything. */
 static HvMachine g_machine;
@@ -155,8 +158,7 @@ int hv_android_vm_smoke(char *report, size_t cap, const char *cache_dir) {
         say(&cursor, end, "  reading        : the refusal is on stderr (reims: ... failed: ...)\n");
     } else {
         say(&cursor, end, "  GPU (reims)    : device up\n");
-        say(&cursor, end, "  display        : %s\n",
-            hv_reims_pvg_have_display(g_board.pvg) ? "yes" : "NO (frames have nowhere to go)");
+        say(&cursor, end, "  display        : %s\n", hv_android_display_name());
         say(&cursor, end, "  IOSurface map  : %s\n",
             hv_reims_pvg_have_mapper(g_board.pvg) ? "yes" : "NO");
         /* One tick: proves the device survives being driven, without a guest behind it. */
@@ -415,6 +417,10 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
     say(&cursor, end, "  auxiliary      : %s\n", aux);
     say(&cursor, end, "  guest RAM      : %llu MB (%s)\n", (unsigned long long)(ram >> 20),
         g_board.ram_fd >= 0 ? "memfd" : "anonymous — the GPU gets no views");
+    /* Where frames can go, decided by whether a window has been attached: a command-line
+     * process has none, so it is off-screen and the answer to "is the guest drawing" comes
+     * from a grab, not from a screen. */
+    say(&cursor, end, "  display kind  : %s\n", hv_android_display_name());
 
     hv_vmapple_reset_cpu(&g_board);
 
@@ -607,6 +613,27 @@ int hv_android_display_ready(void) {
 #endif
 }
 
+/*
+ * "window", "offscreen" or "none", for the boot report and the per-run verdict.
+ *
+ * Off-screen is not a failure: the guest can still set a mode and present, and
+ * hv_android_grab_frame reads the frame back. It is only "cannot show a picture on a screen",
+ * which is always true of a command-line process (no surface, no display permission).
+ */
+const char *hv_android_display_name(void) {
+#ifdef HENGE_HAVE_REIMS
+    if (!g_board.pvg) return "none (no GPU display)";
+    switch (hv_reims_pvg_display_kind(g_board.pvg)) {
+    case HV_REIMS_DISPLAY_WINDOW: return "window (frames go to the host's screen)";
+    case HV_REIMS_DISPLAY_OFFSCREEN:
+        return "offscreen (no window: frames can be encoded and read back)";
+    default: return "none (the display was refused)";
+    }
+#else
+    return "none (reims_pvg.c was left out)";
+#endif
+}
+
 void hv_android_attach_window(void *window) {
 #ifdef HENGE_HAVE_REIMS
     if (!g_up || !g_board.pvg || !window) {
@@ -623,6 +650,46 @@ void hv_android_attach_window(void *window) {
 #else
     (void)window;
 #endif
+}
+
+/*
+ * One report for a guest that stopped: every CPU's architectural state (why it is not taking an
+ * interrupt: PSTATE.DAIF, ELR, ESR/FAR of the last exception), every interrupt line's live GIC
+ * state, and, on request, the guest's threads and what each waits on.
+ *
+ * This is deliberately one function and one report: "the log stopped" is answered by the CPU
+ * state, "the event never came" by the GIC state, and "who is waiting" by the thread scan.
+ * HV_STALL_THREADS=1 adds the scan (it walks guest RAM, so it is opt-in: a running guest can move
+ * the structures under it).
+ */
+void hv_android_stall_report(void) {
+    extern void hv_threads_dump(void);
+    fprintf(stderr, "hengevm: stall report: %d cpu(s)\n", g_board.ncpus);
+    for (int i = 0; i < g_board.ncpus; i++) {
+        HvCpu *c = &g_cpus[i];
+        fprintf(stderr,
+                "hengevm: stall cpu %d pc %016llx el%u daif %03llx halted %d elr %016llx"
+                " esr %016llx far %016llx sp0 %016llx tpidr %016llx\n",
+                i, (unsigned long long)c->pc, c->el, (unsigned long long)c->daif,
+                (int)c->halted,
+                (unsigned long long)c->elr_el1, (unsigned long long)c->esr_el1,
+                (unsigned long long)c->far_el1, (unsigned long long)c->sp_el0,
+                (unsigned long long)c->tpidr_el1);
+    }
+    hv_gicv3_irq_report(g_board.gic, "stall");
+    hv_gicv3_state_report(g_board.gic, "stall");
+    /* Only once the guest has left the reset vector: at 0x100000 there is no address space yet and
+       the scan answers "0 processes". At most twice per process, because the scan walks guest RAM
+       and says the same thing about a guest that has not moved. */
+    static int dumps;
+    const char *threads = getenv("HV_STALL_THREADS");
+    int up = 0;
+    for (int i = 0; i < g_board.ncpus; i++)
+        if (g_cpus[i].pc != 0x100000ull) up = 1;
+    if (threads && *threads && strcmp(threads, "0") != 0 && up && dumps < 2) {
+        dumps++;
+        hv_threads_dump();
+    }
 }
 
 void hv_android_vm_stop(void) {

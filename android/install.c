@@ -999,7 +999,15 @@ static int g_pe_n;
 static void th_scan_all(void) {
     g_pe_n = 0;
     uint64_t img_lo = g_machine.kimage_pa ? g_machine.kimage_pa : 0x73b18000ull;
-    for (uint64_t pa = 0x70000000ull; pa < 0x90000000ull && g_pe_n < 64; pa += 0x1000) {
+    /* The whole of guest RAM, not the first 512 MB: with 2 GB of it, process structures land
+       anywhere, and a fixed window answered "0 processes" for a guest that was clearly running
+       user code. */
+    uint64_t lo = 0x70000000ull, hi = 0x90000000ull;
+    if (g_machine.main_ram && g_machine.main_ram->size) {
+        lo = g_machine.main_ram->pa;
+        hi = lo + g_machine.main_ram->size;
+    }
+    for (uint64_t pa = lo; pa < hi && g_pe_n < 64; pa += 0x1000) {
         if (pa + 0x1000 > img_lo && pa < img_lo + 0x4000000ull) continue;
         uint8_t pg[4096];
         if (hv_phys_read(&g_machine, pa, pg, sizeof pg) != 0) continue;

@@ -135,6 +135,48 @@ void hv_gicv3_irq_report(HvGic *g, const char *tag) {
     fflush(stderr);
 }
 
+/*
+ * The distributor's and each CPU interface's state, not just the counts: a line that is pending and
+ * enabled but never acknowledged looks the same in `irq_report` as a line the guest is not waiting
+ * on, and the difference is what tells "the event arrived and was ignored" from "the event never
+ * came". PMR/IGRPEN say why an acknowledged-looking line is stuck.
+ */
+void hv_gicv3_state_report(HvGic *g, const char *tag) {
+    if (!g) return;
+    pthread_mutex_lock(&g->mu);
+    fprintf(stderr, "gic state (%s): ctlr %#x\n", tag ? tag : "", g->ctlr);
+    for (int c = 0; c < ncpus(g); c++) {
+        HvGicCpu *k = &g->cpu[c];
+        fprintf(stderr, "gic state: cpu %d pmr %#llx igrpen0 %llu igrpen1 %llu depth %d runprio %#x"
+                        " rpr %#llx\n",
+                c, (unsigned long long)k->pmr, (unsigned long long)k->igrpen0,
+                (unsigned long long)k->igrpen1, k->depth, running_priority(g, c),
+                (unsigned long long)k->ap0r);
+        for (int i = 0; i < 32; i++) {
+            if (!k->enabled[i]) continue;
+            fprintf(stderr, "gic state: cpu %d intid %d en %d pend %d act %d lvl %d latch %d"
+                            " prio %#x grp %d\n",
+                    c, i, k->enabled[i], pending(g, c, i), k->active[i], k->level[i], k->latch[i],
+                    k->priority[i], k->group[i]);
+        }
+    }
+    int shown = 0;
+    for (int i = 32; i < HV_GIC_NUM_IRQS; i++) {
+        if (!(g->pend_count[i] || g->latch[i] || g->level[i] || g->active[i] || g->enabled[i]))
+            continue;
+        fprintf(stderr, "gic state: intid %d en %d pend %d act %d lvl %d latch %d prio %#x grp %d"
+                        " route_cpu %d pended %u\n",
+                i, g->enabled[i], pending(g, 0, i), g->active[i], g->level[i], g->latch[i],
+                g->priority[i], g->group[i], target_of(g, i), g->pend_count[i]);
+        if (++shown >= 48) {
+            fprintf(stderr, "gic state: (more lines suppressed)\n");
+            break;
+        }
+    }
+    if (!shown) fprintf(stderr, "gic state: no SPI has any state at all\n");
+    pthread_mutex_unlock(&g->mu);
+}
+
 /* ---- the CPU interface ---- */
 
 static uint64_t acknowledge(HvGic *g, int c, int grp) {

@@ -34,6 +34,26 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
  */
 void hv_reims_pvg_attach_window(HvReimsPvg *p, void *native_window);
 
+/*
+ * Where the display's frames can go now, decided by whether a host window was attached:
+ *
+ *   NONE       no display object: nothing can be shown at all
+ *   OFFSCREEN  a display without a window (a command-line process, or an app whose surface has
+ *              not arrived): frames can still be encoded into a CPU-readable target and grabbed
+ *   WINDOW     the host's window is attached: frames go to the screen
+ *
+ * This is the answer to "is there anything to look at": OFFSCREEN with a set mode and a
+ * successful grab means the guest is drawing; NONE means it is not.
+ */
+typedef enum {
+    HV_REIMS_DISPLAY_NONE = 0,
+    HV_REIMS_DISPLAY_OFFSCREEN = 1,
+    HV_REIMS_DISPLAY_WINDOW = 2
+} HvReimsDisplayKind;
+
+HvReimsDisplayKind hv_reims_pvg_display_kind(HvReimsPvg *p);
+const char *hv_reims_pvg_display_name(HvReimsPvg *p);
+
 /* Whether the device got its display and its IOSurface mapper. For bring-up: a device whose
  * display was refused still runs, it just has nowhere to show a frame. */
 int hv_reims_pvg_have_display(HvReimsPvg *p);

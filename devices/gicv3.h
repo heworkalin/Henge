@@ -58,6 +58,8 @@ void hv_gicv3_pend(HvGic *g, int intid);
 
 /* Which INTIDs were pended and how often, for a guest that stopped: the absent ones matter. */
 void hv_gicv3_irq_report(HvGic *g, const char *tag);
+/* The distributor's and interfaces' live state: pending/active/enabled, PMR and IGRPEN. */
+void hv_gicv3_state_report(HvGic *g, const char *tag);
 /* Recompute every CPU's IRQ and FIQ inputs (waking any that just got one). */
 void hv_gicv3_update(HvGic *g);
 

@@ -281,6 +281,33 @@ NVRAM 会话（mach body 里有 `ramrod-nvram-session`）与显示。详见
 
 ---
 
+## 9.1 2026-11-20 更新：GPU 停住的两个真因（已修）
+
+> 详细记录见 `docs/gpu-irq-page-size-2026-11-20.md`。这一节只放结论与索引。
+
+§9 的"累积死锁"叙述被两项**具体**缺陷取代；11-19 记的"reims 视图/脏页生命周期不一致"
+和"`CPU1 pc=0x100000` 是垃圾值"都要按下面更正。
+
+| # | 缺陷 | 机制 | 证据 |
+|---|---|---|---|
+| 1 | **宿主页大小被当成 guest 页大小** | reims 的 `HostVm::page_size()` 同时用于宿主 `mmap`/`mprotect`/`munmap` 的取整和 guest 结构的大小。Android 宿主 4 KiB / guest 16 KiB，谎报 16 KiB 让 `deallocate`/`allocate_fixed_overwrite` 越过分配边界，unmap 或覆盖相邻宿主映射（含 Rust 堆） | 改回 4 KiB 会死在 `memory.map.mapping_length_unaligned`（证明 guest 侧确实要 16 KiB）；把 guest 粒度挪到 core 的 `APV_PAGE_SIZE` 后，1039 次 gfx 写无崩溃 |
+| 2 | **中断 `vector` 被当成 INTID** | reims 两个设备都只 `raise(0)`；GIC 对 `INTID<32` 静默丢弃，于是 GPU 中断一次都没送达 | 修前 `irq report: (no SPI was ever pended)`；修后 `48:21 49:6500+`，guest 进入 EL0 用户态、fifo 线程 0% CPU |
+
+**被更正的历史结论**：
+
+- "崩溃点漂移 = reims 生命周期不一致" → **是对现象的归纳，原因见 #1**；
+  `EfiDisplay::rebuild_mode`/`DirtyLog::new`/`GuestDisplay::sync_settings` 都是受害者。
+- "`cpu 1 guest pc = 0x100000` 是垃圾值" → **推翻**：那是 arm64 复位向量；
+  CPU1 拉起后就是内核/用户态地址。复位后没起来之前看到它，是正常现象。
+- "`reims-vgpu.fifo` 100% 空转、ring 全 0" → 中断没送达导致驱动等不到完成，见 #2；
+  修后 fifo 线程 0% CPU。
+
+**当前状态（19:20）**：无崩溃，guest 在 EL0 用户态与 idle 之间切换，仍在 boot framebuffer
+阶段（尚未写 `+0x1210/+0x121c/+0x1228`，即还没设 GPU 显示模式）。
+
+**新增工具行**：`reims: raise (vector 0) -> SPI 49`、
+`reims: display kind = window|offscreen|NONE`、`henge: cpus [i] pc=… el=… halted=…`（CLI 每 30 s）。
+
 ## 10. 方法论铁律（血泪换来的）
 
 1. **计算用 Python，不心算**（手算错过 `0x837ef780−0x9EF760`）
