@@ -112,6 +112,7 @@ use std::ops::Range;
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use crate::diag::diag;
 
 /// The next core's [`EncoderCore::id`]: from 1, so none is `retained::HeldBy`'s 0.
 static CORES: AtomicU64 = AtomicU64::new(1);
@@ -4120,7 +4121,7 @@ impl EncoderCore {
             None => {}
         }
         if let Some(error) = faults {
-            eprintln!("DIAG fault: encoder {error:?}");
+            diag!("DIAG fault: encoder {error:?}");
             state.fault(encoder, error, open.command_buffer.device())?;
         }
         let base = state.executions.len();

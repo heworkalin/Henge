@@ -372,6 +372,7 @@ mod gpu_route;
 mod kept;
 
 use kept::Keeps;
+use crate::diag::diag;
 
 /// The call an execution's refusals name.
 const CALL: &str = "execute_commands_in_buffer";
@@ -449,11 +450,11 @@ impl RenderLowering {
         if let Some(nine) = icb.nine_among(range.clone())? {
             match nine {
                 NineDraw::Hangs => {
-                    eprintln!("DIAG fault: an indirect draw of primitive type 9 hangs");
+                    diag!("DIAG fault: an indirect draw of primitive type 9 hangs");
                     self.core.hang()
                 }
                 NineDraw::Faults => {
-                    eprintln!("DIAG fault: an indirect draw of primitive type 9 faults");
+                    diag!("DIAG fault: an indirect draw of primitive type 9 faults");
                     self.core.fault(CommandBufferError::PageFault)
                 }
             }
@@ -540,7 +541,7 @@ impl RenderLowering {
             (_, false) => Ok(Inherited::Commands),
             (None, true) => Err(invalid(call, Problem::NoPipelineState)),
             (Some(state), true) if !state.support_indirect_command_buffers() => {
-                eprintln!("DIAG fault: an indirect command buffer under a state without supportIndirectCommandBuffers");
+                diag!("DIAG fault: an indirect command buffer under a state without supportIndirectCommandBuffers");
                 self.core.fault(CommandBufferError::PageFault);
                 Ok(Inherited::Faults)
             }

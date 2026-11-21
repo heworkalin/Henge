@@ -29,6 +29,7 @@
 #![recursion_limit = "256"]
 
 mod address;
+mod diag;
 mod address_map;
 mod address_pool;
 mod alias_split;

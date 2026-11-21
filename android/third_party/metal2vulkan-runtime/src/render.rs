@@ -473,6 +473,7 @@ use replay::{
     DrawIndexed, DrawIndexedIndirect, DrawIndexedPatches, DrawIndexedPatchesIndirect, DrawPatches,
     DrawPatchesIndirect, Samplers,
 };
+use crate::diag::diag;
 pub(crate) use replay::{RenderCall, RenderLog, RenderRoom, Table};
 #[cfg(test)]
 pub(crate) use snapshot::snapshot_within;
@@ -4839,7 +4840,7 @@ impl RenderLowering {
         // Metal's GPU faults the command buffer there, from the pass on (`store_out.rs`).
         if super::store_out::faults(core.device().shared(), &layout) {
             // TEMP DIAG (Android bring-up): which fault site raised the PageFault.
-            eprintln!("DIAG fault: store_out into memory whose GPU writes are dropped");
+            diag!("DIAG fault: store_out into memory whose GPU writes are dropped");
             core.fault(CommandBufferError::PageFault);
         }
         // A pass that changes no texel records nothing, but holds its attachments until its

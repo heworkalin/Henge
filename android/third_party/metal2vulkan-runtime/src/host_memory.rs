@@ -135,6 +135,7 @@ use std::ffi::c_void;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
+use crate::diag::diag;
 
 /// Host memory a buffer or heap wraps without a copy: a pointer whose bytes the caller vouches for
 /// (the `pointer` of `newBufferWithBytesNoCopy:length:options:deallocator:`), and, as runtime
@@ -789,7 +790,7 @@ pub(super) fn host_page() -> Option<u64> {
 #[track_caller]
 pub(super) fn not_importable() -> Error {
     // TEMP DIAG (Android bring-up): where the refusal came from.
-    eprintln!(
+    diag!(
         "DIAG not_importable at {}",
         std::panic::Location::caller()
     );
@@ -848,7 +849,7 @@ pub(super) fn refuse_unwritable(window: &ImportWindow, counts: &Counters) -> Res
         &mut asked,
     );
     counts.host_mappings_queried(asked);
-    eprintln!(
+    diag!(
         "DIAG refuse_unwritable: window {:#x}+{:#x} asked {asked} answer {answer:?}",
         window.start, window.size
     );
@@ -923,7 +924,7 @@ pub(super) fn mapped_readable(_start: u64, _end: u64) -> bool {
 pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
     let answer = mappings_permitted(start, end, Access::Write, &mut 0);
     // TEMP DIAG (Android bring-up): whether the pages' write permission was answered, and how.
-    eprintln!("DIAG mapped_writable {start:#x}..{end:#x} -> {answer:?}");
+    diag!("DIAG mapped_writable {start:#x}..{end:#x} -> {answer:?}");
     answer == Some(true)
 }
 
@@ -1329,7 +1330,7 @@ pub(super) fn permitted(
         *asked += 1;
         if from > covered || !allowed || !access.pinned(covered) {
             // TEMP DIAG (Android bring-up): the line the window's coverage stopped at.
-            eprintln!(
+            diag!(
                 "DIAG permitted false: window {start:#x}..{end:#x} covered {covered:#x} line \
                  {from:#x}..{to:#x} allowed={allowed} pinned={}",
                 access.pinned(covered)

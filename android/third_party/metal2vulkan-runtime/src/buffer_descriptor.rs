@@ -43,6 +43,7 @@ use ash::vk;
 use metal2vulkan::error::RuntimeDriverDefect;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use crate::diag::diag;
 
 /// What a new buffer holds.
 #[non_exhaustive]
@@ -1160,7 +1161,7 @@ impl Device {
                     }
                     Err((failed, by_device)) => {
                         // TEMP DIAG (Android bring-up): why the copy fallback was not taken.
-                        eprintln!(
+                        diag!(
                             "DIAG no copy: copyable={copyable} dma_bufs_alone={dma_bufs_alone} \
                              by_device={by_device} drops_writes={drops_writes} error={:?}",
                             failed.error
@@ -2449,7 +2450,7 @@ impl Device {
     ) -> Result<Buffer, Error> {
         let read_only = matches!(why, CopiedFor::ReadOnly);
         // TEMP DIAG (Android bring-up): who makes a copy, and whether its writes are dropped.
-        eprintln!(
+        diag!(
             "DIAG copied_buffer: why={:?} read_only={read_only} naming={:?}",
             match &why {
                 CopiedFor::Refused => "Refused",

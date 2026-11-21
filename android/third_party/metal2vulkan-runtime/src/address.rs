@@ -89,6 +89,7 @@ use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use crate::diag::diag;
 
 /// A Metal GPU address: what `gpuAddress` answers and what a kernel's pointers hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -536,14 +537,14 @@ impl AddressSpace {
         }
         let taken = self.ranges.allocate_at(start, requested.length);
         // TEMP DIAG (Android bring-up): who pins what, and who already held it.
-        eprintln!(
+        diag!(
             "DIAG pin at={start:#x} len={:#x} ok={} shares={:?}",
             requested.length,
             taken.is_ok(),
             self.shares.get(&start)
         );
         taken.map_err(|(from, length)| {
-            eprintln!(
+            diag!(
                 "DIAG pin CONFLICT held={from:#x}+{length:#x} backtrace:\n{}",
                 std::backtrace::Backtrace::force_capture()
             );
@@ -640,7 +641,7 @@ impl AddressSpace {
     /// ID back ([`give_records_id`](Self::give_records_id)).
     pub(super) fn free(&mut self, held: Held) {
         // TEMP DIAG (Android bring-up): every release, with the granule it gives back.
-        eprintln!(
+        diag!(
             "DIAG free at={:#x} len={:#x} pool={:?} shares={:?}",
             held.start,
             held.size,
@@ -708,7 +709,7 @@ impl AddressSpace {
         // The span holds the pool's bytes: `pin` and `picked` hold at least `length` bytes from
         // the address.
         // TEMP DIAG (Android bring-up): a pool reserved, and what the space holds at its address.
-        eprintln!(
+        diag!(
             "DIAG reserve_pool at={:#x} len={:#x} pools_at={:?}",
             address.0,
             length,
@@ -729,10 +730,10 @@ impl AddressSpace {
     /// is held, else once the last is.
     pub(super) fn release_pool(&mut self, address: GpuAddress) {
         let Some(pool) = self.pools.get_mut(&address.0) else {
-            eprintln!("DIAG release_pool at={:#x} no-pool", address.0);
+            diag!("DIAG release_pool at={:#x} no-pool", address.0);
             return;
         };
-        eprintln!(
+        diag!(
             "DIAG release_pool at={:#x} used={} len={:#x}",
             address.0,
             pool.slots.used(),
@@ -747,7 +748,7 @@ impl AddressSpace {
     /// The pool at `address` gone, its span free.
     fn drop_pool(&mut self, address: u64) {
         if let Some(pool) = self.pools.remove(&address) {
-            eprintln!("DIAG drop_pool at={address:#x} span={:#x}", pool.span.size);
+            diag!("DIAG drop_pool at={address:#x} span={:#x}", pool.span.size);
             self.give_back_range(pool.span);
         }
     }

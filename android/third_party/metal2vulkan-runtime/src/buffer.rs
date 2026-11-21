@@ -65,6 +65,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Instant;
+use crate::diag::diag;
 
 /// A Metal buffer (`MTLBuffer`). Cheap to clone (a retain); `Send + Sync`. Two handles are equal
 /// when they are the same buffer.
@@ -5183,7 +5184,7 @@ impl Buffer {
         let answer = cell_says || import.is_some_and(|(a, b)| a || b);
         // TEMP DIAG (Android bring-up): which term says the GPU's writes are dropped.
         if answer {
-            eprintln!(
+            diag!(
                 "DIAG drops_writes: options-bit24={cell_says} import={import:?}"
             );
         }
