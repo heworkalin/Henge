@@ -145,7 +145,7 @@ static const uint8_t tab_report_desc[] = {
 
 static const uint8_t tab_device_desc[18] = {
     18, 1, 0x00, 0x02, 0, 0, 0, 64, 8,
-    0x1b, 0x36, 0x01, 0x00,         /* vendor QEMU, product 0x0001 */
+    0xac, 0x05, 0x06, 0x81,         /* vendor Apple, product 0x8106: VZ's "Virtual USB Tablet" */
     0x00, 0x01, 1, 2, 3, 1,
 };
 
@@ -156,7 +156,8 @@ static const uint8_t tab_config_desc[34] = {
     7, 5, 0x81, 3, 8, 0, 10,
 };
 
-static const char *const tab_strings[] = {NULL, "QEMU", "QEMU USB Tablet", "1"};
+static const char *const tab_strings[] = {
+    NULL, "Apple Inc.", "Virtual USB Tablet", "HengeVM"};
 
 static int tab_clamp(int v) { return v > 127 ? 127 : (v < -127 ? -127 : v); }
 
@@ -190,7 +191,7 @@ static const uint8_t mou_report_desc[] = {
 
 static const uint8_t mou_device_desc[18] = {
     18, 1, 0x00, 0x02, 0, 0, 0, 64,
-    0x27, 0x06, 0x01, 0x00,         /* vendor QEMU (0x0627), product 0x0001 */
+    0xac, 0x05, 0x04, 0x03,         /* vendor Apple, product 0x0304: an Apple USB mouse */
     0x00, 0x01, 1, 2, 3, 1,
 };
 
@@ -201,7 +202,7 @@ static const uint8_t mou_config_desc[34] = {
     7, 5, 0x81, 3, 4, 0, 10,
 };
 
-static const char *const mou_strings[] = {NULL, "QEMU", "QEMU USB Mouse", "1"};
+static const char *const mou_strings[] = {NULL, "Apple Inc.", "Apple Optical USB Mouse", "HengeVM"};
 
 static void mou_queue(HvXhci *x, int dx, int dy, int wheel) {
     if (x->mou_rtail - x->mou_rhead >= HV_XHCI_REPORTS) x->mou_rhead++;
@@ -458,6 +459,16 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
     const struct HvXhciDev *d = &devs[x->slots[slot].dev];
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
+    {
+        static int shown;
+        if (shown < 60) {
+            shown++;
+            fprintf(stderr, "hengevm: xhci: ctl dev %d slot %d %02x %02x value %04x index %04x "
+                            "len %u\n",
+                    x->slots[slot].dev, slot, type, req, value,
+                    (unsigned)(setup[4] | setup[5] << 8), (unsigned)(setup[6] | setup[7] << 8));
+        }
+    }
     if (xlog()) fprintf(stderr, "xhci: request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
     /* Every request the trackpad gets goes to the log, unconditionally: the guest's
        driver handshake is exactly what we are trying to watch. Capped so a polling
