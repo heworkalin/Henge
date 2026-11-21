@@ -57,8 +57,55 @@ final class Native {
     static native String nativeBoot(String rom, String disk, String aux, int ramMb, int ncpus,
                                     String cacheDir);
 
+    /**
+     * Takes the display surface back from the running machine: its frame presents stop, and its
+     * window reference is released. Call it when the surface goes away (the activity is put
+     * away), and {@link #nativeAttachWindow} again when a new one exists.
+     */
+    static native void nativeDetachWindow();
+
     /** Stops the guest and joins its threads. Safe when nothing is running. */
     static native void nativeStop();
+
+    /** One HID usage-page-7 key, as a key table produces it (0xe0..0xe7 are the modifiers). */
+    static native void nativeKey(int usage, boolean down);
+
+    /** The same by Linux input key code, for a key a hardware keyboard reported. */
+    static native void nativeKeyLinux(int code, boolean down);
+
+    /**
+     * One finger on the guest's Magic Trackpad 2.
+     *
+     * @param id    a stable 1..15 for this finger
+     * @param phase 0 down, 1 move, 2 up
+     * @param x     the pad's sensor units, 0..8134
+     * @param y     the pad's sensor units, 0..5206
+     * @param tsMs  the touch sample's own clock
+     */
+    static native void nativeTouch(int id, int phase, int x, int y, long tsMs);
+
+    /** Ends a batch of finger moves: one report for everything that moved since the last. */
+    static native void nativeTouchFrame(long tsMs);
+
+    /**
+     * The absolute tablet: x and y in its own 0..32767 range, buttons 1..5, wheel in notches.
+     *
+     * A touch lands exactly where it is — no acceleration, no integration — which is what a touch
+     * screen means, and what the 触控 mode needed all along.
+     */
+    static native void nativeTablet(int x16, int y16, int buttons, int wheel);
+
+    /** A real mouse: relative movement in counted pixels the guest applies its own acceleration to. */
+    static native void nativeMouseMove(int dx, int dy);
+
+    /** Its buttons: 1 left, 2 right, 3 middle, as HID numbers. */
+    static native void nativeMouseButton(int button, boolean down);
+
+    /** Its wheel: whole notches, positive away from the user. */
+    static native void nativeMouseWheel(int notches);
+
+    /** The pad's click: down then up without movement is a click, held it is a drag. */
+    static native void nativeTouchButton(boolean down);
 
     /** Everything the engine prints goes to this file; logcat only gets a rate-limited sample. */
     static native void nativeSetLogFile(String path);

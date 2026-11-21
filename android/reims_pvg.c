@@ -482,6 +482,20 @@ void hv_reims_pvg_attach_window(HvReimsPvg *p, void *native_window) {
     fprintf(stderr, "reims: display attached to the host's window\n");
 }
 
+void hv_reims_pvg_detach_window(HvReimsPvg *p) {
+    if (!p || !p->display) return;
+    if (!p->window_attached) return;
+    RvgStatus st = rvg_display_detach_android_window(p->display);
+    if (st != RVG_OK) {
+        fail("rvg_display_detach_android_window", st);
+        return;
+    }
+    p->window_attached = 0;
+    /* The frame this line ends is the last one the window gets: after it the display keeps the
+       guest's frames in its own memory until a window is attached again. */
+    fprintf(stderr, "reims: display detached from the host's window\n");
+}
+
 /** What the display is doing: {has a mode, guest presents, host presents}. For the app's status. */
 void hv_reims_pvg_stats(HvReimsPvg *p, int out[3]) {
     out[0] = out[1] = out[2] = 0;

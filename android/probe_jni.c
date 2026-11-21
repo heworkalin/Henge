@@ -331,8 +331,98 @@ Java_dev_henge_probe_Native_nativeAttachWindow(JNIEnv *env, jclass clazz, jobjec
         fprintf(stderr, "henge: ANativeWindow_fromSurface returned NULL\n");
         return;
     }
+    /* The reference goes to the engine, not back: reims' render thread holds this window as a
+       raw pointer and only lets go when the display is detached, so releasing here left it
+       dangling as soon as the activity's surface died. The engine releases it in
+       hv_android_detach_window. */
     hv_android_attach_window(window);
-    ANativeWindow_release(window);   /* the engine keeps its own reference */
+}
+
+/*
+ * The activity's surface went away: the engine stops presenting into it, and releases the window
+ * reference it took in nativeAttachWindow.
+ */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeDetachWindow(JNIEnv *env, jclass clazz) {
+    (void)env, (void)clazz;
+    extern void hv_android_detach_window(void);
+    hv_android_detach_window();
+}
+
+/*
+ * Input. The guest sees a real USB keyboard and a real Magic Trackpad 2 (devices/xhci.c), so the
+ * app's job is only to say what the person did: a finger on the pad, the pad's click, a key.
+ * Coordinates are the pad's sensor units, so the app maps its own view onto HV_TP_SENSOR_X/Y.
+ */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeTouch(JNIEnv *env, jclass clazz, jint id, jint phase, jint x,
+                                       jint y, jlong tsMs) {
+    (void)env, (void)clazz;
+    extern void hv_android_touch(int id, int phase, int x, int y, uint32_t ts_ms);
+    hv_android_touch(id, phase, x, y, (uint32_t)tsMs);
+}
+
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeTouchFrame(JNIEnv *env, jclass clazz, jlong tsMs) {
+    (void)env, (void)clazz;
+    extern void hv_android_touch_frame(uint32_t ts_ms);
+    hv_android_touch_frame((uint32_t)tsMs);
+}
+
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeTouchButton(JNIEnv *env, jclass clazz, jboolean down) {
+    (void)env, (void)clazz;
+    extern void hv_android_touch_button(int down);
+    hv_android_touch_button(down ? 1 : 0);
+}
+
+/* One HID usage-page-7 key (0xe0..0xe7 are the modifiers), the form a key table produces. */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeKey(JNIEnv *env, jclass clazz, jint usage, jboolean down) {
+    (void)env, (void)clazz;
+    extern void hv_android_key(uint8_t usage, int down);
+    hv_android_key((uint8_t)usage, down ? 1 : 0);
+}
+
+/* The absolute tablet: x/y in the device's 0..32767 range, buttons 1..5, wheel in notches. A touch
+   lands exactly where it is, which is what "tap where you touch" needs. */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeTablet(JNIEnv *env, jclass clazz, jint x16, jint y16, jint buttons,
+                                         jint wheel) {
+    (void)env, (void)clazz;
+    extern void hv_android_tablet(int x16, int y16, int buttons, int wheel);
+    hv_android_tablet(x16, y16, buttons, wheel);
+}
+
+/* A real mouse: relative movement in counted pixels, its buttons, and its wheel. */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeMouseMove(JNIEnv *env, jclass clazz, jint dx, jint dy) {
+    (void)env, (void)clazz;
+    extern void hv_android_mouse_move(int dx, int dy);
+    hv_android_mouse_move(dx, dy);
+}
+
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeMouseButton(JNIEnv *env, jclass clazz, jint button,
+                                             jboolean down) {
+    (void)env, (void)clazz;
+    extern void hv_android_mouse_button(int button, int down);
+    hv_android_mouse_button(button, down ? 1 : 0);
+}
+
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeMouseWheel(JNIEnv *env, jclass clazz, jint notches) {
+    (void)env, (void)clazz;
+    extern void hv_android_mouse_wheel(int notches);
+    hv_android_mouse_wheel(notches);
+}
+
+/* The same by Linux input key code, for a key that came from a real keyboard (getScanCode). */
+JNIEXPORT void JNICALL
+Java_dev_henge_probe_Native_nativeKeyLinux(JNIEnv *env, jclass clazz, jint code, jboolean down) {
+    (void)env, (void)clazz;
+    extern void hv_android_key_linux(uint16_t code, int down);
+    hv_android_key_linux((uint16_t)code, down ? 1 : 0);
 }
 
 JNIEXPORT void JNICALL

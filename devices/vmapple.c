@@ -424,16 +424,18 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
      * punching, which takes a file descriptor.
      */
     if (!getenv("HV_RAM_ANON")) {
-        /* A dma-buf first, where the kernel has one: the GPU then maps the guest's own pages
-         * instead of a copy of them. A `memfd` is file-backed, which is all the views need, but
-         * Vulkan can only import a file as a buffer through a dma-buf (`VK_EXT_external_memory_dma_buf`;
-         * no Android driver has `VK_EXT_external_memory_host`), and a device that cannot import
-         * the pages copies them, in which the runtime drops the GPU's writes and faults the
-         * command buffer that stores into them (measured: 7 faults, then the queue revoked and
-         * the guest waiting forever on a stamp — `docs/gpu-render-bringup-2026-11-21.md`).
-         * `/dev/dma_heap/system` answers a 2 GiB allocation to an unprivileged process here
-         * (tested: `work/dmatest`), and `HV_RAM_NO_DMABUF=1` keeps the memfd for comparison. */
-        if (!getenv("HV_RAM_NO_DMABUF")) {
+        /* A `memfd` by default: file-backed is all the device's views of the guest's pages need.
+         * A dma-buf is worth more in principle -- Vulkan can only import a file as a buffer
+         * through one (`VK_EXT_external_memory_dma_buf`; no Android driver has
+         * `VK_EXT_external_memory_host`) -- and `HV_RAM_DMABUF=<heap>` asks for one
+         * (`/dev/dma_heap/system` answers a 2 GiB allocation to an unprivileged process here,
+         * tested in `work/dmatest`). It is not the default because the guest's surfaces then
+         * break: an IOSurface's pages are scattered over the guest's RAM, so its window is a
+         * dozen 16 KiB chunks rather than one, and the runtime's import takes one
+         * (`docs/gpu-pixels-2026-11-21.md` §4: the device refuses that texture and the screen
+         * stays black). The pages are copied instead, and a copy's GPU writes are merged back
+         * into them, which is Metal's semantics for the guest's own writable pages. */
+        if (getenv("HV_RAM_DMABUF")) {
             const char *heap = getenv("HV_RAM_DMABUF");
             int fd = henge_dmabuf(heap && *heap ? heap : "/dev/dma_heap/system", ram_size);
             if (fd >= 0) b->ram_fd = fd;

@@ -35,6 +35,15 @@ HvReimsPvg *hv_reims_pvg_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint6
 void hv_reims_pvg_attach_window(HvReimsPvg *p, void *native_window);
 
 /*
+ * Takes the host's window back: the display's rendering into it ends, its swapchain and Vulkan
+ * surface are destroyed, and the guest's frames stay in its own memory until a window is attached
+ * again. Call it when the activity's surface goes away, and before stopping the machine: a render
+ * thread blocked in a present holds the presenting queue's lock, and the guest's submissions wait
+ * on it.
+ */
+void hv_reims_pvg_detach_window(HvReimsPvg *p);
+
+/*
  * Where the display's frames can go now, decided by whether a host window was attached:
  *
  *   NONE       no display object: nothing can be shown at all

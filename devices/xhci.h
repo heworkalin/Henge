@@ -13,8 +13,8 @@
    any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
    (hv_xhci_poll). */
 #define HV_XHCI_SLOTS 8
-#define HV_XHCI_PORTS 2
-#define HV_XHCI_DEVICES 2
+#define HV_XHCI_PORTS 4
+#define HV_XHCI_DEVICES 4
 #define HV_XHCI_INTRS 4
 #define HV_XHCI_EPS 32 /* device context index 1..31 */
 #define HV_XHCI_REPORTS 256
@@ -78,6 +78,16 @@ typedef struct HvXhci {
     uint32_t tp_rhead, tp_rtail;
     int tp_mt;         /* the guest switched us to multitouch mode (feature report 2) */
     uint64_t tp_delivered;
+    /* The tablet (QEMU's usb-tablet): buttons, absolute X and Y, wheel. */
+    uint8_t tab_reports[HV_XHCI_REPORTS][8];
+    uint32_t tab_rhead, tab_rtail;
+    uint8_t tab_buttons;
+    uint64_t tab_delivered;
+    /* The mouse (QEMU's usb-mouse): buttons, relative X and Y, wheel. */
+    uint8_t mou_reports[HV_XHCI_REPORTS][4];
+    uint32_t mou_rhead, mou_rtail;
+    uint8_t mou_buttons;
+    uint64_t mou_delivered;
     uint32_t tp_reqs;   /* control requests logged, capped */
     uint32_t tp_db;     /* doorbells logged, capped */
     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
@@ -102,6 +112,23 @@ void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms)
 void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms);
 /* Any thread: the pad's full press (a click), down or up. */
 void hv_xhci_touch_button(HvXhci *x, int down);
+/*
+ * A real mouse or an absolute tablet. Neither can be attached: the guest's device tree (Apple's, on
+ * a VMAPPLE machine) declares one keyboard and one trackpad, and a device it does not declare is not
+ * enumerated at all -- measured: a third root port, a hub-less second port with a tablet, and a third
+ * device each left the guest with no input whatsoever, while keyboard + trackpad works at once.
+ * The entry points stay so the app links; the trackpad is what a mouse drives.
+ */
+void hv_xhci_mouse_move(HvXhci *x, int dx, int dy);
+void hv_xhci_mouse_button(HvXhci *x, int button, int down);
+void hv_xhci_mouse_wheel(HvXhci *x, int notches);
+void hv_xhci_tablet(HvXhci *x, int x16, int y16, int buttons, int wheel);
+
+/* A relative mouse (QEMU's usb-mouse): counted pixels, buttons 1..5, wheel in notches. */
+void hv_xhci_mouse_move(HvXhci *x, int dx, int dy);
+void hv_xhci_mouse_button(HvXhci *x, int button, int down);
+void hv_xhci_mouse_wheel(HvXhci *x, int notches);
+
 /* CPU thread: hand waiting reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
 

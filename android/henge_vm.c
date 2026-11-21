@@ -35,6 +35,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef __ANDROID__
+#include <android/native_window.h>
+#endif
+
 #include "dispatch.h"
 #include "machine.h"
 #include "vmapple.h"
@@ -67,6 +71,10 @@ static HvVmapple g_board;
  */
 static HvCpu g_cpus[HV_MAX_CPUS];
 static int g_up;
+/* The activity's window, as the engine holds it: `ANativeWindow_fromSurface`'s reference, kept
+   until the display is detached. The render thread inside reims holds the pointer without a
+   reference of its own, so this is what keeps it alive. */
+static void *g_window;
 
 static void say(char **cursor, char *end, const char *fmt, ...) {
     if (*cursor >= end) return;
@@ -240,6 +248,14 @@ static void *kicker_thread(void *arg) {
     while (!g_stop) {
         usleep(1000);
         hv_machine_kick_all(&g_machine);
+        /*
+         * Input is delivered here, not only from the CPU thread's device tick: that tick also
+         * presents the GPU's frames, so a present that blocks for a moment held every key and every
+         * finger report behind it (measured: the pointer arrived in bursts, seconds late, while the
+         * guest was drawing). This thread runs every millisecond whatever the guest is doing; the
+         * device takes its lock, so the two callers cannot interleave a delivery.
+         */
+        if (g_up && g_board.usb) hv_xhci_poll(g_board.usb);
         if (++seconds % 100 == 0) watch_fault_handler();
         if (seconds % 10000 == 0) hv_gicv3_irq_report(g_board.gic, "boot");
     }
@@ -377,6 +393,12 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
     /* The activity hands the display its SurfaceView's Surface later, and the library only keeps a
        window link where the display was created with one (android/reims_pvg.c), so the app asks
        for it here. The command-line tool never sets this and stays off-screen. */
+    /* The CLI's working set, pinned here until the guest's display has a settings surface: the
+       guest's raster order groups hold no fragment interlock, which Mesa implements for no device
+       (Turnip has 145 extensions and not that one), so the translator's unordered lowering is
+       what lets those pipelines exist at all (46 were refused without it, and a refused pipeline
+       is a black layer). See reims-vgpu's os/linux.rs and tools/patches/m2v-rog-unordered.patch. */
+    setenv("REIMS_ROG_UNORDERED", "1", 0);
     setenv("HV_REIMS_WINDOW", "1", 0);
 
     if (lock_root_disk(disk, &cursor, end) != 0) return -1;
@@ -448,6 +470,8 @@ int hv_android_vm_boot(const char *rom, const char *disk, const char *aux, int r
        be set only by the smoke entry, so a real boot left attach_window returning immediately and
        the app concluded the boot had failed while the guest was already running. */
     g_up = 1;
+    /* The window the activity handed over before there was a machine to give it to. */
+    if (g_window) hv_reims_pvg_attach_window(g_board.pvg, g_window);
     say(&cursor, end, "  running        : %d cpu thread(s) + 1 ms kicker\n", g_cpu_thread_count);
     return 0;
 }
@@ -506,6 +530,53 @@ static int hap_disks_open(char **cursor, char *end, const char *disk, const char
  */
 void hv_android_key(uint8_t usage, int down) {
     if (g_up && g_board.usb) hv_xhci_key(g_board.usb, usage, down);
+}
+
+/* The same by Linux input key code, which is what Android's `KeyEvent.getScanCode()` reports for
+   a hardware keyboard (and what a host's own key table holds). */
+void hv_android_key_linux(uint16_t code, int down) {
+    if (g_up && g_board.usb) hv_xhci_key_linux(g_board.usb, code, down);
+}
+
+/*
+ * One finger on the guest's Magic Trackpad 2: the app's touch screen as the pad's surface.
+ *
+ * `x` and `y` are the pad's own sensor units (HV_TP_SENSOR_X by HV_TP_SENSOR_Y), `ts_ms` the touch
+ * sample's clock, `id` a stable 1..15 for one finger, and `phase` 0 down, 1 move, 2 up. Movement
+ * per sample is the finger's own: macOS turns it into cursor movement with its own acceleration,
+ * so the app must not add any.
+ */
+void hv_android_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
+    if (g_up && g_board.usb) hv_xhci_touch(g_board.usb, id, phase, x, y, ts_ms);
+}
+
+/* Ends a batch of moves: every finger that moved since the last frame goes in one report. */
+void hv_android_touch_frame(uint32_t ts_ms) {
+    if (g_up && g_board.usb) hv_xhci_touch_frame(g_board.usb, ts_ms);
+}
+
+/* The absolute tablet: a touch lands exactly where it is (0..32767 across and down). */
+void hv_android_tablet(int x16, int y16, int buttons, int wheel) {
+    if (g_up && g_board.usb) hv_xhci_tablet(g_board.usb, x16, y16, buttons, wheel);
+}
+
+/* A real mouse: relative movement, five buttons (1 = left, 2 = right, 3 = middle), and the wheel. */
+void hv_android_mouse_move(int dx, int dy) {
+    if (g_up && g_board.usb) hv_xhci_mouse_move(g_board.usb, dx, dy);
+}
+
+void hv_android_mouse_button(int button, int down) {
+    if (g_up && g_board.usb) hv_xhci_mouse_button(g_board.usb, button, down);
+}
+
+void hv_android_mouse_wheel(int notches) {
+    if (g_up && g_board.usb) hv_xhci_mouse_wheel(g_board.usb, notches);
+}
+
+/* The pad's click: down then up with no movement is a click where the pointer is; held, it is a
+   drag (`touchesMoved` while the button is down). */
+void hv_android_touch_button(int down) {
+    if (g_up && g_board.usb) hv_xhci_touch_button(g_board.usb, down);
 }
 
 /*
@@ -640,19 +711,42 @@ const char *hv_android_display_name(void) {
 
 void hv_android_attach_window(void *window) {
 #ifdef HENGE_HAVE_REIMS
-    if (!g_up || !g_board.pvg || !window) {
+    if (!window) return;
+    /* The activity's window, kept for as long as the machine lives: `ANativeWindow_fromSurface`
+       handed us a reference, and the render thread inside reims holds the raw pointer without
+       one, so this is the reference that keeps it alive until [`hv_android_detach_window`]. */
+    if (g_window && g_window != window) ANativeWindow_release(g_window);
+    g_window = window;
+    if (!g_up || !g_board.pvg) {
         /* Said out loud because it is silent and fatal to the picture: the window arrives when the
            activity is created, which is before 启动 is pressed, so there is no machine to hand it to
-           yet. The activity attaches again once the machine is up; if this line is the last thing
-           about the window, that second attach never happened. */
-        fprintf(stderr, "reims: window not attached (%s%s%s)\n",
-                !window ? "no window" : "", !g_up ? (window ? "no machine yet" : ", no machine yet") : "",
-                (!window && !g_up) ? ", no machine yet" : "");
+           yet. The machine takes it when it comes up (`hv_android_vm_boot`), and the activity
+           attaches again once it is up; if this line is the last thing about the window, neither
+           happened. */
+        fprintf(stderr, "reims: window kept for the next machine (none is up yet)\n");
         return;
     }
     hv_reims_pvg_attach_window(g_board.pvg, window);
 #else
     (void)window;
+#endif
+}
+
+/*
+ * The activity's surface went away (the screen was put away, or the activity was destroyed).
+ *
+ * Without this the engine keeps presenting into a window the compositor no longer consumes, and a
+ * FIFO present blocks under the presenting queue's lock: the guest's own submissions then wait on
+ * it, and the machine stops without saying so. Detaching first is also what makes the join in
+ * [`hv_android_vm_stop`] able to return.
+ */
+void hv_android_detach_window(void) {
+#ifdef HENGE_HAVE_REIMS
+    if (g_up && g_board.pvg) hv_reims_pvg_detach_window(g_board.pvg);
+    if (g_window) {
+        ANativeWindow_release((ANativeWindow *)g_window);
+        g_window = NULL;
+    }
 #endif
 }
 
@@ -698,6 +792,11 @@ void hv_android_stall_report(void) {
 
 void hv_android_vm_stop(void) {
     if (!g_running) return;
+    /* The display first: a render thread blocked in a present holds the presenting queue's lock,
+       and the guest's submissions (and so the joins below) wait on it. */
+#ifdef HENGE_HAVE_REIMS
+    if (g_up && g_board.pvg) hv_reims_pvg_detach_window(g_board.pvg);
+#endif
     g_stop = 1;
     pthread_join(g_kicker, NULL);
     for (int i = 0; i < g_cpu_thread_count; i++) pthread_join(g_cpu_threads[i], NULL);
