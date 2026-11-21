@@ -484,6 +484,14 @@ public class DisplayActivity extends Activity implements SurfaceHolder.Callback 
                                the view the mouse is actually over, and which one the system accepts
                                differs by build. The first that is granted wins; the rest are then
                                skipped by the hasPointerCapture check. */
+                            /* Android 13 splits pointer capture into modes, and only the *relative*
+                               one reports raw movement: in the absolute mode the values are the
+                               system cursor's position, which stops at every screen edge. Asking for
+                               relative is what makes a mouse unbounded -- the same answer remote
+                               desktop clients give this problem (pointer capture, relative mode). */
+                            /* (`View.requestPointerCapture(int)` — the API 33 capture *mode* — is
+                               not public in this SDK, so the capture is the plain one; the
+                               unbounded movement is what AXIS_RELATIVE_X/Y gives us instead.) */
                             decor.requestPointerCapture();
                             if (!decor.hasPointerCapture()) surface.requestPointerCapture();
                         }

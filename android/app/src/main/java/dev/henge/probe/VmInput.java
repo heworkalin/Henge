@@ -127,6 +127,14 @@ final class VmInput {
         return onTouch(null, e);
     }
 
+    /** Whether this event carries relative axes: a mouse worth driving without a capture. */
+    private static boolean hasRelativeAxes(MotionEvent e) {
+        return e.getAxisValue(MotionEvent.AXIS_RELATIVE_X) != 0f
+                || e.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) != 0f
+                || e.getAxisValue(MotionEvent.AXIS_RELATIVE_X) != e.getAxisValue(MotionEvent.AXIS_RELATIVE_X)
+                || false;
+    }
+
     /**
      * A mouse, as Android reports one.
      *
@@ -262,6 +270,17 @@ final class VmInput {
             dy = (y - lastY) * MOUSE_GAIN;
             padX += dx;
             padY += dy;
+            /* Wrap instead of clamping.
+             *
+             * A trackpad's finger has no edge: it can slide on for ever and the pointer keeps
+             * moving. Clamping at the pad's own bounds gave the finger an edge the guest never sees,
+             * and once the pointer reached the screen's edge nothing moved it back (measured: the
+             * pointer stopped at a border and stayed there). Wrapping costs one fast movement per
+             * wrap, which is what "keep going round" looks like. */
+            if (padX >= PAD_X) padX -= PAD_X;
+            if (padX < 0) padX += PAD_X;
+            if (padY >= PAD_Y) padY -= PAD_Y;
+            if (padY < 0) padY += PAD_Y;
         }
         lastX = x;
         lastY = y;
@@ -462,8 +481,22 @@ final class VmInput {
             // Captured pointer: the values are the mouse's own movement since the last one.
             dx = e.getX() * MOUSE_GAIN;
             dy = e.getY() * MOUSE_GAIN;
+        } else if (hasRelativeAxes(e)) {
+            /* A mouse that reports AXIS_RELATIVE_X/Y gives the movement itself, which -- unlike the
+               system cursor's position -- does not stop at a screen edge. This is the answer to "the
+               pointer sticks at the border": the axes are a delta, not a place. Batched like every
+               other relative value, so the history is summed first. */
+            dx = 0f;
+            dy = 0f;
+            for (int h = 0; h < e.getHistorySize(); h++) {
+                dx += e.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_X, h);
+                dy += e.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_Y, h);
+            }
+            dx += e.getAxisValue(MotionEvent.AXIS_RELATIVE_X);
+            dy += e.getAxisValue(MotionEvent.AXIS_RELATIVE_Y);
         } else {
-            // Hover: absolute coordinates, so the movement is the difference from the last hover.
+            // Hover without relative axes: the movement is the difference from the last hover, and it
+            // is bounded by the screen, because the values are the system cursor's position.
             float x = e.getX();
             float y = e.getY();
             if (mouseX < 0) {
