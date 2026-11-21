@@ -1,7 +1,10 @@
 //! Where a pipeline state's compiles look before compiling: the device's memo, then the creation's
 //! binary archives in order, then the device's shader cache on disk. What a compile makes is kept
-//! in the memo and on disk; what an archive or the disk gives, in the memo. A creation for a binary
-//! archive's add also notes every artifact it used.
+//! in the memo and on disk; what an archive or the disk gives, in the memo. A compute pipeline is
+//! linked from its function where neither the memo nor an archive holds it, and kept in the memo
+//! alone ([`Sources::kernel`]). A creation for a binary archive's add also notes every artifact it
+//! used. A function the compile layer refused `Unsupported` is refused again from the memo, which
+//! keeps that refusal under the function's key (`pipeline/memo.rs`), with no translation.
 
 use super::memo::Remembered;
 use super::render::RenderVariant;
@@ -14,7 +17,13 @@ use metal2vulkan::pipeline::{
     ComputePipeline, FunctionDescriptor, LoweringInputs, RenderPipeline, StageEntries,
 };
 use metal2vulkan::Budget;
+use std::cell::Cell;
 use std::sync::Arc;
+
+/// The translator's census name of a kernel emulated in place of the pin of its device's widest
+/// mode (`WorkCounts::widest_pin_kernels_emulated`, and the pipeline creation log's compute lines,
+/// `creation_log::compute_kernel`).
+pub(super) const WIDEST_PIN_STRATEGY: &str = "simd.emulated.widest-pin";
 
 /// The render pipeline artifacts this process encoded for the directory, which
 /// `tests::render_stage_digests`' count reads: a sweep whose stage functions the directory holds
@@ -29,6 +38,24 @@ pub(crate) fn render_artifacts_encoded() -> u64 {
     ARTIFACTS_ENCODED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The function translations the compile layer refused in this process, which
+/// `tests::declined_once` reads: a refusal the memo keeps is asked of the compile layer once.
+/// Carried only where that device test is compiled, since nothing else reads it.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+static FUNCTIONS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`FUNCTIONS_REFUSED`].
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) fn functions_refused() -> u64 {
+    FUNCTIONS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count a function translation the compile layer refused.
+fn note_function_refused() {
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    FUNCTIONS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Count a render pipeline artifact encoded for the directory.
 fn note_render_artifact_encoded() {
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -38,12 +65,20 @@ fn note_render_artifact_encoded() {
 /// Where one creation's (or one later variant's) compiles look, and its budget.
 pub(crate) struct Sources<'a> {
     device: &'a Device,
+    /// The compile device every compile and link of these sources takes: the device's as they
+    /// were made (`Device::compile_device`), so a view check answering meanwhile changes none of
+    /// one creation's or variant's compiles (`view_check.rs`).
+    compile: &'a metal2vulkan::device::Device,
     /// The creation's options: its archives and budget; `None` for a variant a dispatch or
     /// draw needs after creation, which no archive holds and which compiles under the standard
     /// budget.
     options: Option<&'a PipelineOptions>,
     /// What an add's creation used.
     used: Option<&'a Used>,
+    /// A refusal the memo kept answered an ask of a function ([`Sources::function`]): the
+    /// compile layer was not asked, so a dispatch's variant takes no line of the pipeline
+    /// creation log for it (`pipeline/creation_log.rs`).
+    refusal_kept: Cell<bool>,
 }
 
 impl<'a> Sources<'a> {
@@ -55,8 +90,10 @@ impl<'a> Sources<'a> {
     ) -> Sources<'a> {
         Sources {
             device,
+            compile: device.compile_device(),
             options: Some(options),
             used,
+            refusal_kept: Cell::new(false),
         }
     }
 
@@ -64,13 +101,26 @@ impl<'a> Sources<'a> {
     pub(crate) fn later(device: &'a Device) -> Sources<'a> {
         Sources {
             device,
+            compile: device.compile_device(),
             options: None,
             used: None,
+            refusal_kept: Cell::new(false),
         }
     }
 
     pub(crate) fn device(&self) -> &'a Device {
         self.device
+    }
+
+    /// The compile device of every compile and link of these sources.
+    pub(crate) fn compile(&self) -> &'a metal2vulkan::device::Device {
+        self.compile
+    }
+
+    /// Whether a refusal the memo kept answered one of its asks of a function
+    /// ([`function`](Self::function)), the compile layer not asked.
+    pub(crate) fn refusal_kept(&self) -> bool {
+        self.refusal_kept.get()
     }
 
     /// The budget of one compile attempt starting now.
@@ -95,7 +145,9 @@ impl<'a> Sources<'a> {
     /// `function` compiled under `inputs`, whose key is `key`: found, else compiled under
     /// `budget`, reading its specialized entry from `entries` where given (the device's, which a
     /// render creation's checks and key filled, and which a compute creation's kernel reads too).
-    /// A refusal is the compile layer's.
+    /// A refusal is the compile layer's: one the memo keeps for `key` (an `Unsupported` one,
+    /// `PipelineMemo::keep_refusal`) answers again with no translation, and
+    /// [`refusal_kept`](Self::refusal_kept) says so.
     ///
     /// Every ask for a stage's function the runtime makes -- a compute kernel's, a render
     /// variant's vertex and fragment -- comes here, so the two counts this bumps are the whole of
@@ -110,19 +162,34 @@ impl<'a> Sources<'a> {
         (key, entries): (&FunctionCompileKey, Option<&StageEntries>),
         budget: &Budget,
     ) -> Result<CompiledFunction, metal2vulkan::error::Error> {
-        let compile = self.device.compile_device();
+        let compile = self.compile;
         let shared = self.device.shared();
         let cache = &shared.shader_cache;
         let compiled = match self.found_function(key) {
             Some(compiled) => compiled,
             None => {
+                if let Some(refusal) = cache.memo.refusal(key) {
+                    self.refusal_kept.set(true);
+                    return Err(refusal);
+                }
                 let compiled = match entries {
                     Some(entries) => {
-                        compile.compile_function_from_entries(function, inputs, budget, entries)?
+                        compile.compile_function_from_entries(function, inputs, budget, entries)
                     }
-                    None => compile.compile_function(function, inputs, budget)?,
+                    None => compile.compile_function(function, inputs, budget),
                 };
+                let compiled = compiled.inspect_err(|refusal| {
+                    note_function_refused();
+                    cache.memo.keep_refusal(key, refusal);
+                })?;
                 shared.counts.function_translated();
+                if compiled
+                    .strategies()
+                    .entries
+                    .contains_key(WIDEST_PIN_STRATEGY)
+                {
+                    shared.counts.widest_pin_kernel_emulated();
+                }
                 let bytes = cache.store_function(compile, &compiled);
                 cache.memo.keep_function(&compiled, bytes);
                 self.note(Artifact::Function(compiled.clone()));
@@ -137,7 +204,7 @@ impl<'a> Sources<'a> {
     /// `None` where none holds it, translating nothing. A render creation that holds the keys a
     /// variant's record names links what this finds (`ShaderCache::variant_pipeline`).
     pub(crate) fn found_function(&self, key: &FunctionCompileKey) -> Option<CompiledFunction> {
-        let compile = self.device.compile_device();
+        let compile = self.compile;
         let shared = self.device.shared();
         let cache = &shared.shader_cache;
         let compiled = match cache.memo.function(key) {
@@ -158,15 +225,28 @@ impl<'a> Sources<'a> {
     }
 
     /// The compute pipeline of `descriptor`, a compute or tile descriptor whose kernel or tile
-    /// function is compiled: the variant of it the memo knows live, or the pipeline found or
-    /// linked now under `budget` (`compile_compute_pipeline` or `compile_tile_pipeline`, each
-    /// under its own key). A refusal is the compile layer's.
+    /// function is compiled: the variant of it the memo knows live, or the pipeline one of the
+    /// creation's archives holds, else the pipeline linked now from that function under `budget`
+    /// (`compile_compute_pipeline` or `compile_tile_pipeline`, each under its own key). A refusal
+    /// is the compile layer's.
+    ///
+    /// **Linked, never read from the directory.** A compute pipeline is its one function
+    /// relocated, with the layout and interface its link derives from that function: a link from
+    /// the function in hand translates nothing. So the directory keeps no compute pipeline, and
+    /// a creation that found its function links its pipeline rather than reading, checking and
+    /// decoding the pipeline's own artifact, which cost more than the link (measured by
+    /// `tests::compute_create_bench`'s parts: on lavapipe, a 16,348-word kernel's artifact read
+    /// and decoded in about 25 us, the link 6 us), and a creation that translated writes one
+    /// artifact, its function's, not two. The link relocates against the function's relocation
+    /// slot, so a sweep of states over one function relocates its module once. The memo keeps a
+    /// linked pipeline weighed by what it retains ([`ComputePipeline::footprint`]), an archive's
+    /// at its encoded length.
     pub(crate) fn kernel(
         &self,
         descriptor: &Kernel,
         budget: &Budget,
     ) -> Result<Remembered<ComputePipeline, Variant>, metal2vulkan::error::Error> {
-        let compile = self.device.compile_device();
+        let compile = self.compile;
         let cache = &self.device.shared().shader_cache;
         let key = match descriptor {
             Kernel::Compute(descriptor) => compile.compute_pipeline_key(descriptor),
@@ -178,25 +258,23 @@ impl<'a> Sources<'a> {
                 let found = self
                     .archives()
                     .iter()
-                    .find_map(|archive| archive.compute_pipeline(compile, &key))
-                    .or_else(|| cache.load_compute_pipeline(compile, &key));
-                let (pipeline, bytes) = match found {
-                    Some(found) => found,
+                    .find_map(|archive| archive.compute_pipeline(compile, &key));
+                let (pipeline, weight) = match found {
+                    Some((pipeline, bytes)) => (Arc::new(pipeline), bytes),
                     None => {
-                        let pipeline = match descriptor {
+                        let pipeline = Arc::new(match descriptor {
                             Kernel::Compute(descriptor) => {
                                 compile.compile_compute_pipeline(descriptor, budget)?
                             }
                             Kernel::Tile(descriptor) => {
                                 compile.compile_tile_pipeline(descriptor, budget)?
                             }
-                        };
-                        let bytes = cache.store_compute_pipeline(compile, &pipeline);
-                        (pipeline, bytes)
+                        });
+                        let weight = pipeline.footprint();
+                        (pipeline, weight)
                     }
                 };
-                let pipeline = Arc::new(pipeline);
-                cache.memo.keep_compute(&pipeline, bytes);
+                cache.memo.keep_compute(&pipeline, weight);
                 Remembered::Compiled(pipeline)
             }
         };
@@ -213,7 +291,7 @@ impl<'a> Sources<'a> {
         &self,
         key: &PipelineKey,
     ) -> Option<Remembered<RenderPipeline, RenderVariant>> {
-        let compile = self.device.compile_device();
+        let compile = self.compile;
         let cache = &self.device.shared().shader_cache;
         let found = match cache.memo.render(key) {
             Some(found) => found,
@@ -265,19 +343,24 @@ impl<'a> Sources<'a> {
         pipeline: RenderPipeline,
         stage_keys: &[FunctionCompileKey],
     ) -> Arc<RenderPipeline> {
-        let compile = self.device.compile_device();
+        let compile = self.compile;
         let cache = &self.device.shared().shader_cache;
         let pipeline = Arc::new(pipeline);
         let functions_held = !stage_keys.is_empty()
             && stage_keys
                 .iter()
                 .all(|key| cache.holds_function(compile, key));
-        let weight = match functions_held {
-            true => pipeline.footprint(),
-            false => {
+        let encoded = match functions_held {
+            true => None,
+            false => cache.store_render_pipeline(compile, &pipeline),
+        };
+        // Weighed at its encoding's length where the directory took it, else at what it retains.
+        let weight = match encoded {
+            Some(length) => {
                 note_render_artifact_encoded();
-                cache.store_render_pipeline(compile, &pipeline)
+                length
             }
+            None => pipeline.footprint(),
         };
         cache.memo.keep_render(&pipeline, weight);
         self.note(Artifact::Render(Arc::clone(&pipeline)));

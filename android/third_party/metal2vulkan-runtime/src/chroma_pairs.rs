@@ -28,11 +28,21 @@
 //!   (`ycbcr_device.rs`: a sampler Y′CbCr conversion of `G8B8G8R8_422_UNORM` or
 //!   `B8G8R8G8_422_UNORM` at the midpoint through a linear chroma filter, MoltenVK), the twin holds
 //!   the device's conversion of the pairs instead, every write's decode a GPU pass that samples
-//!   the pairs through it (`bind::chroma_sample_module`), announced `decoded-texel-precision`. A texel reads the pair beside it, so a write's decode is of whole rows
-//!   (a host write of part of a row decodes its rows as the texture then holds them). Refused: a
-//!   sparse heap's texture (`RuntimeGap::DecodedHeapTexture`). Without a twin (a heap's texture
-//!   over the caller's host pages or laid out apart from the heap's bytes) a command that binds
-//!   it for a read is refused.
+//!   the pairs through it (`bind::chroma_sample_module`), announced `decoded-texel-precision`
+//!   where a command first reads the twin. A texel reads the pair beside it, so a write's decode
+//!   is of whole rows (a host write of part of a row decodes its rows as the texture then holds
+//!   them). A heap's texture, a shadow of the heap's bytes in Metal's rows (`texture/heap.rs`),
+//!   keeps a twin decoded whole after each copy in that moves its rows, through the device's
+//!   conversion where it converts the pairs, else Metal's decode. Refused: a sparse heap's texture
+//!   (`RuntimeGap::DecodedHeapTexture`). Only a heap's texture over the caller's host pages has
+//!   no twin: a command that binds it for a read is refused (`NotImplemented(Format)`, naming the
+//!   format: `binding_view.rs`).
+//! - **Over a buffer's bytes** (an IOSurface plane's, `linear_plan.rs`): no carrier. The bytes
+//!   are the texture's truth, which its copies, blits and CPU calls move, and its reads and
+//!   samples present an `R8G8B8A8_UNORM` image of its texels alone, which each copy in writes from
+//!   the pairs where they lie, Metal's decode or the device's conversion as above
+//!   (`texture/surface_pairs.rs`), where they lie so; elsewhere it is held in the carrier, and a
+//!   read of it refused as a heap texture's without a twin is.
 //! - **Through handles.** A function that reads texture handles from memory reaches such a
 //!   texture without a twin as a PVRTC carrier's (`pvrtc.rs`): the neutral texture, announced
 //!   once ([`Degradation::UnreadableHandleTexture`](super::degradation::Degradation)).

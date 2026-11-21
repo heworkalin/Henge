@@ -5,12 +5,16 @@
 //! <root>/v1/<build>/<first byte of name, hex>/<name, hex>
 //! ```
 //!
-//! - `<build>` names the build ([`Directory::build`]); a build reads only its own directory.
+//! - `<build>` names the build ([`Store::build`]); a build reads only its own directory.
 //! - One directory beside the builds', the content directory ([`content`]), holds records no build
 //!   owns, named by the content they describe: the driver's pipeline cache data (It was the
 //!   build's; one record per pipeline making), named by what each making reads and read as an entry
 //!   is, with its counts (`driver.rs`), and the libraries pipeline records name, by their content
-//!   hash (`libraries.rs`); the scans bound them with the rest.
+//!   hash (`libraries.rs`); the scans bound them with the rest. A record of `chunks::WHOLE` bytes
+//!   or more is kept as a manifest over content-defined chunks in `<root>/chunks`, outside the
+//!   layout directory, each run of bytes the records share kept once, and read as its chunks
+//!   joined (`chunks.rs`); the chunks count against the cap, and a cleanup in the scans removes
+//!   those no manifest names.
 //! - An entry's name is the SHA-256 of a domain tag, the build, the entry's kind, its key and the
 //!   profile fingerprint ([`entry_name`]). The decoder the caller hands to [`Store::load`] checks
 //!   the contents against the request byte for byte; contents it refuses are removed.
@@ -22,6 +26,11 @@
 //!   bounded, an entry queued is visible to this device's lookups at once, and what is queued when
 //!   the device goes is written before its drop returns (`worker.rs` states the bound and what
 //!   happens at it). A store with no cache thread (the tests') writes on the calling thread.
+//! - **A store may have no directory** ([`Store::without_directory`]): that of a device whose
+//!   default directory does not exist or takes no write, which keeps its cache in memory alone
+//!   (`shader_cache/mod.rs`). Every lookup in it finds nothing and every write is refused, each
+//!   with no filesystem call, and it scans nothing; a writer asks [`Store::has_directory`] first,
+//!   so it encodes nothing the store would refuse.
 //! - **The directory's time is counted**, in three figures the asking thread's are apart from the
 //!   cache thread's: the reads ([`Counters::read_nanos`]), the writes a thread that asked made
 //!   itself ([`Counters::write_nanos`]), and everything the device's cache thread did here
@@ -33,11 +42,13 @@
 //!   creation the scan also removes other builds' directories that nothing used for
 //!   [`UNUSED_BUILD`].
 
+use super::chunks::{self, Chunks};
 use super::worker::{Asked, Write as Queued, QUEUED_BYTES};
 use super::EntryKind;
 use crate::{DebugMessage, Degradation, DegradeNotice, MessageKind, MessageSeverity, MessageSink};
 use metal2vulkan::cache::Hash256;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -107,9 +118,9 @@ impl Directory {
         &self.root
     }
 
-    /// The build this directory serves.
-    pub(super) fn build(&self) -> &Hash256 {
-        &self.build
+    /// The largest entry this directory takes.
+    fn entry_limit(&self) -> u64 {
+        MAX_ENTRY.min(self.capacity)
     }
 
     /// `<root>/v1`.
@@ -129,10 +140,23 @@ impl Directory {
 
     /// The path of the record named `name` in the content directory.
     pub(crate) fn record_path(&self, name: &str) -> PathBuf {
-        self.layout_dir()
-            .join(hex(&content()))
-            .join(&name[..2])
-            .join(name)
+        self.content_dir().join(&name[..2]).join(name)
+    }
+
+    /// `<root>/v1/<content>`: the content directory ([`content`]).
+    fn content_dir(&self) -> PathBuf {
+        self.layout_dir().join(hex(&content()))
+    }
+
+    /// Whether `path` is a record's in the content directory, which a large one's write keeps
+    /// as chunks (`chunks.rs`).
+    fn is_record(&self, path: &Path) -> bool {
+        path.parent().and_then(Path::parent) == Some(self.content_dir().as_path())
+    }
+
+    /// The chunks the content directory's large records are kept as (`chunks.rs`).
+    fn chunks(&self) -> Chunks {
+        Chunks::of(&self.root)
     }
 }
 
@@ -267,27 +291,24 @@ pub(crate) struct Counters {
 }
 
 /// The kinds of artifact a lookup asks the directory for, which [`Counters::hits_by`] and
-/// [`Counters::misses_by`] count apart: one entry kind each, and the three a pipeline state's
-/// creation looks up.
+/// [`Counters::misses_by`] count apart: one entry kind each, and the two a pipeline state's
+/// creation looks up (a compute pipeline is linked from its function, `pipeline/sources.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Looked {
     /// A translated function ([`EntryKind::Function`]).
     Function = 0,
-    /// A compiled compute pipeline ([`EntryKind::ComputePipeline`]).
-    ComputePipeline = 1,
     /// A compiled render pipeline ([`EntryKind::RenderPipeline`]).
-    RenderPipeline = 2,
+    RenderPipeline = 1,
 }
 
 impl Looked {
     /// How many there are.
-    pub(crate) const COUNT: usize = 3;
+    pub(crate) const COUNT: usize = 2;
 
     /// The kind of entry it is looked up as.
     pub(crate) fn kind(self) -> EntryKind {
         match self {
             Looked::Function => EntryKind::Function,
-            Looked::ComputePipeline => EntryKind::ComputePipeline,
             Looked::RenderPipeline => EntryKind::RenderPipeline,
         }
     }
@@ -321,7 +342,10 @@ pub(super) fn count(counter: &AtomicU64) {
 
 /// One device's view of the directory: reads, writes, and the scans that bound it.
 pub(crate) struct Store {
-    directory: Directory,
+    /// The directory; `None` in a store with no directory (the module docs).
+    directory: Option<Directory>,
+    /// The build whose entries the store names ([`entry_name`]): the directory's, where it has one.
+    build: Hash256,
     pub(crate) counters: Counters,
     /// The bytes this process takes the directory to hold: the last scan's total plus what it
     /// wrote since. Other processes' writes show at the next scan.
@@ -357,8 +381,28 @@ impl Store {
         sink: Option<MessageSink>,
         asked: Option<Arc<Asked>>,
     ) -> Store {
+        let build = directory.build;
+        Store::of(Some(directory), build, sink, asked)
+    }
+
+    /// The store of a device that keeps no directory, naming the entries of `build`, whose
+    /// warnings go to `sink`, else on stderr: every lookup finds nothing and every write is
+    /// refused, with no filesystem call (the module docs). Its device says so
+    /// ([`Store::announce_no_directory`]).
+    pub(crate) fn without_directory(build: Hash256, sink: Option<MessageSink>) -> Store {
+        Store::of(None, build, sink, None)
+    }
+
+    /// The store of `directory`, or of none, for `build` ([`Store::new`]).
+    fn of(
+        directory: Option<Directory>,
+        build: Hash256,
+        sink: Option<MessageSink>,
+        asked: Option<Arc<Asked>>,
+    ) -> Store {
         Store {
             directory,
+            build,
             counters: Counters::default(),
             used: AtomicU64::new(0),
             scanned: AtomicBool::new(false),
@@ -374,36 +418,67 @@ impl Store {
     /// Count an entry not written (`ShaderCacheStatistics::write_failures`); the first is
     /// announced as [`Degradation::ShaderCacheEntryNotWritten`], naming the directory and its
     /// cap. Never an error: the work the entry would have saved is the directory's regardless.
+    /// A store with no directory counts it alone: its device said so as it was made
+    /// ([`Store::announce_no_directory`]).
     pub(crate) fn write_failed(&self) {
         count(&self.counters.write_failures);
+        let Some(directory) = &self.directory else {
+            return;
+        };
         if !self.warnings.write_failed.swap(true, Ordering::Relaxed) {
-            let degradation = Degradation::ShaderCacheEntryNotWritten;
-            let root = self.directory.root().display();
+            let root = directory.root().display();
             let reason = format!(
                 "the directory, a temporary file in it or the rename over the entry failed (cap \
                  {} bytes, an entry at most {} bytes). This device's later failures are counted \
                  alone (`ShaderCacheStatistics::write_failures`).",
-                self.directory.capacity,
-                self.entry_limit(),
+                directory.capacity,
+                directory.entry_limit(),
             );
-            self.say(
-                degradation.code(),
-                Some(DegradeNotice {
-                    degradation,
-                    object: format!("the shader cache directory {root}"),
-                    reason: reason.clone(),
-                    cost: degradation.cost(),
-                    object_id: None,
-                    misplaced: None,
-                    call: None,
-                }),
-                format!(
-                    "metal2vulkan: an entry of the shader cache directory {root} was not \
-                     written: {reason} {}",
-                    degradation.cost(),
-                ),
+            self.say_not_written(
+                format!("the shader cache directory {root}"),
+                reason,
+                &format!("an entry of the shader cache directory {root} was not written"),
             );
         }
+    }
+
+    /// Announce, as [`Degradation::ShaderCacheEntryNotWritten`], that this store has no
+    /// directory: `object` names the directory it does not have, and `why` why. Said once, by the
+    /// device's creation; the entries it does not write are counted alone
+    /// (`ShaderCacheStatistics::write_failures`).
+    pub(crate) fn announce_no_directory(&self, object: String, why: &str) {
+        let reason = format!(
+            "{why}. This device keeps its shader cache in memory alone \
+             (`ShaderCacheOptions::memory_capacity`) and writes no entry, each counted alone \
+             (`ShaderCacheStatistics::write_failures`); `ShaderCacheOptions::directory` names a \
+             directory."
+        );
+        self.say_not_written(
+            object,
+            reason,
+            "no entry of this device's shader cache is written",
+        );
+    }
+
+    /// Say [`Degradation::ShaderCacheEntryNotWritten`] of `object` for `reason`, its text led by
+    /// `what`.
+    fn say_not_written(&self, object: String, reason: String, what: &str) {
+        let degradation = Degradation::ShaderCacheEntryNotWritten;
+        let text = format!("metal2vulkan: {what}: {reason} {}", degradation.cost());
+        self.say(
+            degradation.code(),
+            Some(DegradeNotice {
+                degradation,
+                object,
+                reason,
+                cost: degradation.cost(),
+                object_id: None,
+                misplaced: None,
+                call: None,
+                command_buffer: None,
+            }),
+            text,
+        );
     }
 
     /// Say `text` as the notice `id_name`, carrying `degradation` where it announces one: through
@@ -428,13 +503,20 @@ impl Store {
         }
     }
 
-    pub(crate) fn directory(&self) -> &Directory {
-        &self.directory
+    /// The directory, where the store has one.
+    pub(crate) fn directory(&self) -> Option<&Directory> {
+        self.directory.as_ref()
     }
 
-    /// The largest entry this directory takes.
-    fn entry_limit(&self) -> u64 {
-        MAX_ENTRY.min(self.directory.capacity)
+    /// Whether the store has a directory, so a write can take: a writer asks first, and encodes
+    /// nothing where it has none (the module docs).
+    pub(crate) fn has_directory(&self) -> bool {
+        self.directory.is_some()
+    }
+
+    /// The build whose entries the store names.
+    pub(crate) fn build(&self) -> &Hash256 {
+        &self.build
     }
 
     /// Whether the entry named `name` is there to be read: its file is in place and of a length
@@ -442,23 +524,25 @@ impl Store {
     /// happened yet. Reads no contents and counts in no hit or miss -- it is a question about the
     /// directory, not a lookup of an entry -- but its `stat` is in [`Counters::read_nanos`].
     pub(crate) fn holds(&self, name: &str) -> bool {
-        self.holds_at(&self.directory.entry_path(name))
+        (self.directory.as_ref())
+            .is_some_and(|directory| self.holds_at(directory, &directory.entry_path(name)))
     }
 
     /// [`Store::holds`] of the record named `name` in the content directory: a library a pipeline
     /// record names (`shader_cache/libraries.rs`).
     pub(crate) fn holds_record(&self, name: &str) -> bool {
-        self.holds_at(&self.directory.record_path(name))
+        (self.directory.as_ref())
+            .is_some_and(|directory| self.holds_at(directory, &directory.record_path(name)))
     }
 
-    /// [`Store::holds`] of the file at `path`.
-    fn holds_at(&self, path: &Path) -> bool {
+    /// [`Store::holds`] of the file at `path` in `directory`.
+    fn holds_at(&self, directory: &Directory, path: &Path) -> bool {
         if self.asked.as_ref().is_some_and(|asked| asked.holds(path)) {
             return true;
         }
         count(&self.counters.holds_questions);
         timed(&self.counters.read_nanos, || {
-            fs::metadata(path).is_ok_and(|metadata| metadata.len() <= self.entry_limit())
+            fs::metadata(path).is_ok_and(|metadata| metadata.len() <= directory.entry_limit())
         })
     }
 
@@ -478,7 +562,10 @@ impl Store {
         name: &str,
         decode: impl FnOnce(&[u8]) -> Result<T, E>,
     ) -> Lookup<T> {
-        self.load_at(&self.directory.entry_path(name), decode)
+        match &self.directory {
+            Some(directory) => self.load_at(directory, &directory.entry_path(name), decode),
+            None => Lookup::Absent,
+        }
     }
 
     /// The entry named `name` in the content directory, read and counted as [`Store::load`]
@@ -489,8 +576,11 @@ impl Store {
         name: &str,
         decode: impl FnOnce(Vec<u8>) -> Option<T>,
     ) -> Lookup<T> {
-        let path = self.directory.record_path(name);
-        let (bytes, file) = match self.read(&path) {
+        let Some(directory) = &self.directory else {
+            return Lookup::Absent;
+        };
+        let path = directory.record_path(name);
+        let (bytes, file) = match self.read(directory, &path) {
             Found::Absent => return Lookup::Absent,
             Found::Failed => {
                 count(&self.counters.read_failures);
@@ -511,9 +601,14 @@ impl Store {
         }
     }
 
-    /// [`Store::load`] of the file at `path`.
-    fn load_at<T, E>(&self, path: &Path, decode: impl FnOnce(&[u8]) -> Result<T, E>) -> Lookup<T> {
-        let (bytes, file) = match self.read(path) {
+    /// [`Store::load`] of the file at `path` in `directory`.
+    fn load_at<T, E>(
+        &self,
+        directory: &Directory,
+        path: &Path,
+        decode: impl FnOnce(&[u8]) -> Result<T, E>,
+    ) -> Lookup<T> {
+        let (bytes, file) = match self.read(directory, path) {
             Found::Absent => return Lookup::Absent,
             Found::Failed => {
                 count(&self.counters.read_failures);
@@ -558,13 +653,16 @@ impl Store {
     /// the bytes the directory holds and, where this thread writes it itself, the time
     /// ([`Counters::write_nanos`]).
     pub(crate) fn write_record_soon(&self, name: &str, bytes: Vec<u8>) -> io::Result<u64> {
-        self.write_soon_at(self.directory.record_path(name), name, bytes)
+        let Some(directory) = &self.directory else {
+            return Err(no_directory());
+        };
+        self.write_soon_at(directory, directory.record_path(name), name, bytes)
     }
 
-    /// Read the file at `path`, or the bytes of a write of it the cache thread has not made yet
-    /// (`worker.rs`): its file is not in place until its `rename`, so the queue answers first. A
-    /// file larger than any entry is removed and found absent.
-    fn read(&self, path: &Path) -> Found {
+    /// Read the file at `path` in `directory`, or the bytes of a write of it the cache thread has
+    /// not made yet (`worker.rs`): its file is not in place until its `rename`, so the queue
+    /// answers first. A file larger than any entry is removed and found absent.
+    fn read(&self, directory: &Directory, path: &Path) -> Found {
         if let Some(bytes) = self.asked.as_ref().and_then(|asked| asked.pending(path)) {
             return Found::Queued(bytes);
         }
@@ -578,13 +676,21 @@ impl Store {
             let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
                 return Found::Failed;
             };
-            let limit = self.entry_limit();
+            let limit = directory.entry_limit();
             if length > limit {
                 remove(path);
                 return Found::Absent;
             }
             let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
             match (&file).take(limit + 1).read_to_end(&mut bytes) {
+                // A record kept as chunks is read as its chunks joined; one that names a chunk
+                // not there is a miss, which a making writes again (`chunks.rs`).
+                Ok(_) if bytes.starts_with(&chunks::MAGIC) && directory.is_record(path) => {
+                    match directory.chunks().read(&bytes, limit) {
+                        Some(joined) => Found::Bytes(joined, file),
+                        None => Found::Absent,
+                    }
+                }
                 Ok(_) if bytes.len() as u64 <= limit => Found::Bytes(bytes, file),
                 Ok(_) => {
                     remove(path);
@@ -598,20 +704,30 @@ impl Store {
     /// Give `bytes` to the cache thread to write as the entry named `name` (`worker.rs`): the
     /// same file and the same `rename`, off this thread. Their length, as a write of them gives
     /// it; the failure of one this thread wrote itself, where the queue was at a bound. The
-    /// failure of a queued write is counted when the thread meets it, not here.
+    /// failure of a queued write is counted when the thread meets it, not here. A store with no
+    /// directory refuses it, with no filesystem call.
     pub(crate) fn write_soon(&self, name: &str, bytes: Vec<u8>) -> io::Result<u64> {
-        self.write_soon_at(self.directory.entry_path(name), name, bytes)
+        let Some(directory) = &self.directory else {
+            return Err(no_directory());
+        };
+        self.write_soon_at(directory, directory.entry_path(name), name, bytes)
     }
 
-    /// [`Store::write_soon`] of the file at `path`, named `name`.
-    fn write_soon_at(&self, path: PathBuf, name: &str, bytes: Vec<u8>) -> io::Result<u64> {
+    /// [`Store::write_soon`] of the file at `path` in `directory`, named `name`.
+    fn write_soon_at(
+        &self,
+        directory: &Directory,
+        path: PathBuf,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> io::Result<u64> {
         let length = bytes.len() as u64;
         // An entry the queue could never hold whole is written here, as one past a bound is.
-        let takeable = length <= QUEUED_BYTES && length <= self.entry_limit();
+        let takeable = length <= QUEUED_BYTES && length <= directory.entry_limit();
         let Some(asked) = self.asked.as_ref().filter(|_| takeable) else {
             count(&self.counters.writes_on_thread);
             return timed(&self.counters.write_nanos, || {
-                self.write_at(&path, name, &bytes)
+                self.write_at(directory, &path, name, &bytes)
             });
         };
         match asked.queue(Queued::new(path, bytes)) {
@@ -622,7 +738,7 @@ impl Store {
             Some(write) => {
                 count(&self.counters.writes_on_thread);
                 timed(&self.counters.write_nanos, || {
-                    self.write_at(&write.path, name, &write.bytes)
+                    self.write_at(directory, &write.path, name, &write.bytes)
                 })
             }
         }
@@ -636,50 +752,51 @@ impl Store {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("entry");
-        let written = timed(&self.counters.off_thread_nanos, || {
-            self.write_at(path, name, bytes)
-        });
+        let written = match &self.directory {
+            Some(directory) => timed(&self.counters.off_thread_nanos, || {
+                self.write_at(directory, path, name, bytes)
+            }),
+            None => Err(no_directory()),
+        };
         if written.is_err() {
             self.write_failed();
         }
     }
 
-    /// Write `bytes` as the entry at `path`, named `name`, on the calling thread: a temporary
-    /// file beside it, flushed and renamed over it. The bytes written, or the failure (the
-    /// temporary file is removed). An entry larger than [`Store::entry_limit`] fails.
-    fn write_at(&self, path: &Path, name: &str, bytes: &[u8]) -> io::Result<u64> {
-        let length = bytes.len() as u64;
-        if length > self.entry_limit() {
+    /// Write `bytes` as the entry at `path` in `directory`, named `name`, on the calling thread:
+    /// a temporary file beside it, flushed and renamed over it; a content record of
+    /// [`chunks::WHOLE`] bytes or more as its chunks and then its manifest there (`chunks.rs`).
+    /// The bytes written, or the failure (the temporary file is removed). An entry larger than
+    /// [`Directory::entry_limit`] fails.
+    fn write_at(
+        &self,
+        directory: &Directory,
+        path: &Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> io::Result<u64> {
+        if bytes.len() as u64 > directory.entry_limit() {
             return Err(io::Error::other("the entry is larger than the cache takes"));
         }
-        let parent = path.parent().expect("an entry has a directory");
-        create_private_dir_all(parent)?;
-        let temporary = parent.join(format!(".{name}.{}.tmp", unique()));
-        let written = (|| {
-            let mut file = new_private_file(&temporary)?;
-            file.write_all(bytes)?;
-            drop(file);
-            fs::rename(&temporary, path)?;
-            Ok(length)
-        })();
-        match &written {
-            Ok(bytes) => {
-                self.used.fetch_add(*bytes, Ordering::Relaxed);
-                self.counters
-                    .written_bytes
-                    .fetch_add(*bytes, Ordering::Relaxed);
-            }
-            Err(_) => {
-                let _ = fs::remove_file(&temporary);
-            }
+        let written = match bytes.len() >= chunks::WHOLE && directory.is_record(path) {
+            true => (directory.chunks()).write(bytes, |manifest| write_file(path, name, manifest)),
+            false => write_file(path, name, bytes),
+        };
+        if let Ok(bytes) = &written {
+            self.used.fetch_add(*bytes, Ordering::Relaxed);
+            self.counters
+                .written_bytes
+                .fetch_add(*bytes, Ordering::Relaxed);
         }
         written
     }
 
     /// Whether the bytes this process counts are past the cap (judged only after a scan).
     pub(crate) fn over_capacity(&self) -> bool {
-        self.scanned.load(Ordering::Acquire)
-            && self.used.load(Ordering::Relaxed) > self.directory.capacity
+        self.directory.as_ref().is_some_and(|directory| {
+            self.scanned.load(Ordering::Acquire)
+                && self.used.load(Ordering::Relaxed) > directory.capacity
+        })
     }
 
     /// The scan at device creation: remove other builds' directories nothing used for
@@ -696,13 +813,26 @@ impl Store {
         timed(&self.counters.off_thread_nanos, || self.scan(stop, false));
     }
 
-    /// [`Store::sweep`] (with `unused_builds`) or [`Store::evict`].
+    /// [`Store::sweep`] (with `unused_builds`) or [`Store::evict`]; nothing in a store with no
+    /// directory.
     fn scan(&self, stop: &AtomicBool, unused_builds: bool) {
-        let now = SystemTime::now();
-        let own = hex(&self.directory.build);
-        let Ok(builds) = fs::read_dir(self.directory.layout_dir()) else {
+        let Some(directory) = &self.directory else {
             return;
         };
+        let now = SystemTime::now();
+        let own = hex(&directory.build);
+        let chunks = directory.chunks();
+        let content = directory.content_dir();
+        let retired = &super::driver::RETIRED;
+        // The sweep's cleanup of the chunks where it is due (`chunks.rs`), first: it removes the
+        // content records of a retired frame, which the survey would count.
+        if unused_builds && chunks.due() {
+            chunks.cleanup(&content, retired, stop);
+        }
+        let Ok(builds) = fs::read_dir(directory.layout_dir()) else {
+            return;
+        };
+        let mut content_removed = false;
         let mut entries = Vec::new();
         for build in builds.flatten() {
             if stop.load(Ordering::Relaxed) {
@@ -717,27 +847,59 @@ impl Store {
             let unused = now.duration_since(newest).unwrap_or_default() >= UNUSED_BUILD;
             if unused_builds && unused && build.file_name().to_str() != Some(own.as_str()) {
                 entries.truncate(start);
+                content_removed |= path == content;
                 let _ = fs::remove_dir_all(&path);
             }
         }
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let total: u64 = entries.iter().map(|entry| entry.bytes).sum();
-        let remaining = if total > self.directory.capacity {
-            self.remove_oldest(entries, total)
-        } else {
-            total
+        // The chunks count against the cap with the entries; a removed manifest frees the bytes
+        // of the chunks no other names, which the cleanup after removes.
+        let chunk_bytes = chunks.bytes();
+        let total: u64 = entries.iter().map(|entry| entry.bytes).sum::<u64>() + chunk_bytes;
+        let mut freed_chunks = content_removed && chunk_bytes > 0;
+        let remaining = match total > directory.capacity {
+            true => match chunks.manifests(&content, retired, stop) {
+                Some(manifests) => {
+                    let (remaining, freed) =
+                        self.remove_oldest(directory, entries, total, (&manifests, chunk_bytes));
+                    freed_chunks |= freed;
+                    remaining
+                }
+                None => return,
+            },
+            false => total,
         };
+        if freed_chunks {
+            chunks.cleanup(&content, retired, stop);
+        }
         // Writes since the scan began may be counted twice: the next scan corrects it.
         self.used.store(remaining, Ordering::Relaxed);
         self.scanned.store(true, Ordering::Release);
     }
 
-    /// Remove the least recently used of `entries` (holding `total` bytes) until what remains
-    /// is at most [`LOW_WATER`] of the cap; the bytes that remain.
-    fn remove_oldest(&self, mut entries: Vec<Entry>, mut total: u64) -> u64 {
-        let target = self.directory.capacity / 100 * LOW_WATER;
+    /// Remove the least recently used of `entries` in `directory` (holding `total` bytes, of which
+    /// the chunks `chunk_bytes`, which `manifests` name) until what remains is at most
+    /// [`LOW_WATER`] of the cap: the bytes that remain, counting the chunks no remaining manifest
+    /// names as freed, and whether any are, which the cleanup after removes (`chunks.rs`).
+    fn remove_oldest(
+        &self,
+        directory: &Directory,
+        mut entries: Vec<Entry>,
+        mut total: u64,
+        (manifests, chunk_bytes): (&HashMap<PathBuf, chunks::Listed>, u64),
+    ) -> (u64, bool) {
+        let target = directory.capacity / 100 * LOW_WATER;
+        // Each chunk's manifests and length; the bytes of chunks none names go at the cleanup.
+        let mut named: HashMap<&Hash256, (usize, u64)> = HashMap::new();
+        for (digest, length) in manifests.values().flatten() {
+            named.entry(digest).or_insert((0, u64::from(*length))).0 += 1;
+        }
+        let held: u64 = named.values().map(|(_, length)| length).sum();
+        let unnamed = chunk_bytes.saturating_sub(held);
+        total = total.saturating_sub(unnamed);
+        let mut freed = unnamed > 0;
         entries.sort_by_key(|entry| entry.used);
         for entry in entries {
             if total <= target {
@@ -756,17 +918,53 @@ impl Store {
                              (translations, driver pipeline data) is made again when \
                              next needed. A larger cap keeps them. This device's later removals \
                              are counted alone (`ShaderCacheStatistics::evictions`).",
-                            self.directory.root().display(),
-                            self.directory.capacity,
+                            directory.root().display(),
+                            directory.capacity,
                             LOW_WATER,
                         ),
                     );
                 }
             }
             total = total.saturating_sub(entry.bytes);
+            for (digest, _) in manifests.get(&entry.path).into_iter().flatten() {
+                if let Some((count, length)) = named.get_mut(digest) {
+                    *count -= 1;
+                    if *count == 0 {
+                        total = total.saturating_sub(*length);
+                        freed = true;
+                    }
+                }
+            }
         }
-        total
+        (total, freed)
     }
+}
+
+/// Write `bytes` as the file at `path`, named `name`: a temporary file beside it, flushed and
+/// renamed over it. Their length, or the failure (the temporary file is removed).
+fn write_file(path: &Path, name: &str, bytes: &[u8]) -> io::Result<u64> {
+    let parent = path.parent().expect("an entry has a directory");
+    create_private_dir_all(parent)?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", unique()));
+    let written = (|| {
+        let mut file = new_private_file(&temporary)?;
+        file.write_all(bytes)?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        Ok(bytes.len() as u64)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// The refusal of a write by a store with no directory.
+fn no_directory() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "the device keeps no shader cache directory",
+    )
 }
 
 /// Remove the file at `path` (another process may have removed it first).
@@ -853,7 +1051,7 @@ fn touch(file: &fs::File) {
 }
 
 /// A name no other writer uses: this process's id, a per-process sequence number, and the time.
-fn unique() -> String {
+pub(super) fn unique() -> String {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -878,7 +1076,7 @@ pub(super) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
 }
 
 /// Create the new file `path`, which only its owner may read; fails if it exists.
-fn new_private_file(path: &Path) -> io::Result<fs::File> {
+pub(super) fn new_private_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

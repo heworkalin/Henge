@@ -16,13 +16,18 @@
 //! - **The exit guard.** Each piece runs inside a section (`exit_guard`), which registers the
 //!   hook again after the process's first pipeline made in one. Once the process is exiting, a
 //!   piece not started is dropped unrun: it fails its making (`making::Ticket`), as Metal's
-//!   pending work stays pending. While a piece's driver call makes a pipeline
-//!   (`exit_guard::driver_making`), the exit waits for it, on macOS up to
-//!   `exit_guard::MAKING_BOUND`, not the guard's two seconds: the program need not wait for the
-//!   command buffer whose making it is before it exits, and a making outlasts those. On Linux the
-//!   exit waits as for any section, and then ends the process at once (`exit_guard`).
+//!   pending work stays pending. Once the exit ended the makings alone (its run of the hook after
+//!   a making), a piece's making answers that the process is exiting
+//!   (`exit_guard::driver_making`), which fails it too. While a piece's driver call makes a pipeline
+//!   (`exit_guard::driver_making`), the exit waits for it up to `exit_guard::MAKING_BOUND`, not
+//!   the guard's two seconds: the program need not wait for the command buffer whose making it is
+//!   before it exits, and a making outlasts those. Past it, on Linux, the process ends at once
+//!   (`exit_guard`).
 //! - **No thread.** Where the host cannot start a thread and none runs, the piece runs on the
 //!   caller's thread, as before the pool.
+//! - **On a stack with room.** Each thread starts with `device::COMPILE_STACK` (8 MiB), the room
+//!   a driver's compile takes (`device/compiles.rs`), so its pieces' makings run on it, not
+//!   handed to a thread of their own.
 //! - **At the user-initiated class** (a concurrency change). On macOS each thread runs at the
 //!   user-initiated quality of service, or the user-interactive class it started at, whoever
 //!   started it: the driver's compile takes the class of the thread asking (MoltenVK's dispatch
@@ -43,7 +48,7 @@
 //!   piece with the turn. A thread asking is busy, so the pool starts another for a piece handed
 //!   meanwhile, up to its threads.
 
-use super::budget::{self, Budget, Candidate, Urgency};
+use super::budget::{self, Asked, Budget, Candidate, Urgency};
 use crate::device::lock;
 use crate::exit_guard::{self, Call};
 use std::cell::Cell;
@@ -88,16 +93,19 @@ impl<T> Join<T> {
         self.finished.notify_all();
     }
 
-    /// Wait until every piece finished: the full join.
+    /// Wait until every piece finished: the full join. No work of a warm record's: its pieces'
+    /// own work is (`warm/pass.rs`).
     fn wait(&self) -> std::sync::MutexGuard<'_, (Vec<Option<T>>, usize)> {
-        let mut state = lock(&self.state);
-        while state.1 > 0 {
-            state = self
-                .finished
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        state
+        crate::warm::waiting(|| {
+            let mut state = lock(&self.state);
+            while state.1 > 0 {
+                state = self
+                    .finished
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state
+        })
     }
 }
 
@@ -174,6 +182,10 @@ struct State {
 struct Queued {
     number: u64,
     urgency: Urgency,
+    /// The rank something that came to wait for it asked, shared with its place: once it runs,
+    /// its thread's turn reads it where the piece lends that turn for a wait
+    /// (`budget::without_turn`), to take it again at the rank it rose to.
+    asked: Arc<Asked>,
     /// When it was handed here: it ages from then (`budget::aged`).
     handed: Instant,
     work: Work,
@@ -196,10 +208,10 @@ impl PoolQueue {
         lock(&self.state).next_rank(self.budget.age(), ahead_free)
     }
 
-    /// The piece [`next_rank`](Self::next_rank) ranks, taken, with its rank unaged and whether
-    /// nothing waits for it: for the budget, which hands it to the thread it gives the turn
-    /// (`budget.rs`).
-    pub(crate) fn next_piece(&self, ahead_free: bool) -> Option<(Work, Candidate)> {
+    /// The piece [`next_rank`](Self::next_rank) ranks, taken, with its rank unaged, whether
+    /// nothing waits for it, and what was asked of it: for the budget, which hands it to the
+    /// thread it gives the turn (`budget.rs`).
+    pub(crate) fn next_piece(&self, ahead_free: bool) -> Option<(Work, Candidate, Arc<Asked>)> {
         lock(&self.state).next_piece(self.budget.age(), ahead_free)
     }
 }
@@ -226,12 +238,16 @@ impl State {
     }
 
     /// The next piece to run, taken, as [`next_rank`](Self::next_rank) ranks it, with its rank
-    /// unaged (its urgency, its number) and whether nothing waits for it.
-    fn next_piece(&mut self, age: Duration, ahead_free: bool) -> Option<(Work, Candidate)> {
+    /// unaged (its urgency, its number), whether nothing waits for it, and what was asked of it.
+    fn next_piece(
+        &mut self,
+        age: Duration,
+        ahead_free: bool,
+    ) -> Option<(Work, Candidate, Arc<Asked>)> {
         let ((_, number), ahead) = self.next_rank(age, ahead_free)??;
         let at = self.work.iter().position(|q| q.number == number)?;
         let queued = self.work.remove(at)?;
-        Some((queued.work, ((queued.urgency, number), ahead)))
+        Some((queued.work, ((queued.urgency, number), ahead), queued.asked))
     }
 }
 
@@ -240,13 +256,18 @@ impl State {
 pub(crate) struct Place {
     shared: Weak<PoolQueue>,
     number: u64,
+    /// What was asked of the piece, which its thread's turn reads once it runs
+    /// ([`Queued::asked`]).
+    asked: Arc<Asked>,
 }
 
 impl Place {
     /// Something waits for the piece, as `urgency` says (the module docs): it runs before every
-    /// piece waiting of a lower rank. No change where it started, or ranks as high already; a
-    /// rank never falls.
+    /// piece waiting of a lower rank. Where it started, its thread takes a turn it lends for a
+    /// wait again at this rank (`budget::without_turn`), and nothing else changes; no change
+    /// where it ranks as high already; a rank never falls.
     pub(crate) fn hasten(&self, urgency: Urgency) {
+        self.asked.raise(urgency);
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
@@ -320,16 +341,19 @@ impl Pool {
                 None => work(),
             }
         });
+        let asked = Arc::new(Asked::new());
         let mut state = lock(&self.shared.state);
         state.work.push_back(Queued {
             number,
             urgency,
+            asked: Arc::clone(&asked),
             handed,
             work,
         });
         let place = Place {
             shared: Arc::downgrade(&self.shared),
             number,
+            asked,
         };
         if state.free >= state.work.len() || state.threads >= self.shared.makers() {
             drop(state);
@@ -340,10 +364,7 @@ impl Pool {
         state.free += 1;
         drop(state);
         let shared = Arc::clone(&self.shared);
-        let started = exit_guard::spawn(
-            std::thread::Builder::new().name("metal2vulkan-pipelines".into()),
-            move || serve(&shared),
-        );
+        let started = exit_guard::spawn(pool_thread(), move || serve(&shared));
         if started.is_ok() {
             return place;
         }
@@ -356,7 +377,7 @@ impl Pool {
         // No thread: the work waiting runs here, in its order.
         let age = self.shared.budget.age();
         let waiting: Vec<Work> = std::iter::from_fn(|| state.next_piece(age, true))
-            .map(|(work, _)| work)
+            .map(|(work, _, _)| work)
             .collect();
         drop(state);
         for work in waiting {
@@ -457,6 +478,13 @@ impl Pool {
         state.work.len() + state.threads.saturating_sub(state.free)
     }
 
+    /// The pieces waiting for a thread, and those its threads run now: what the encoder trail's
+    /// line names (`encoder_trail.rs`).
+    pub(crate) fn queued(&self) -> (usize, usize) {
+        let state = lock(&self.shared.state);
+        (state.work.len(), state.threads.saturating_sub(state.free))
+    }
+
     /// The threads alive and those of them free (the pool's tests).
     #[cfg(test)]
     fn census(&self) -> (usize, usize) {
@@ -503,6 +531,14 @@ fn serve(shared: &Arc<PoolQueue>) {
     }
 }
 
+/// The builder of a thread of the pool: its stack has the room a driver's compile takes, so its
+/// pieces' makings run on it (`device/compiles.rs`'s **On a stack with room**).
+fn pool_thread() -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name("metal2vulkan-pipelines".into())
+        .stack_size(crate::device::COMPILE_STACK)
+}
+
 /// A thread of the pool, counted until it ends, by a panic in its work too.
 struct Alive<'a>(&'a Arc<PoolQueue>);
 
@@ -519,10 +555,7 @@ impl Drop for Alive<'_> {
             state.free += 1;
             drop(state);
             let shared = Arc::clone(self.0);
-            let started = exit_guard::spawn(
-                std::thread::Builder::new().name("metal2vulkan-pipelines".into()),
-                move || serve(&shared),
-            );
+            let started = exit_guard::spawn(pool_thread(), move || serve(&shared));
             if started.is_err() {
                 let mut state = lock(&self.0.state);
                 state.threads -= 1;
@@ -681,8 +714,8 @@ pub(crate) mod held {
     /// A draw's making that took what its state kept for it (`render.rs`).
     static MID_MAKING: Stop = Stop::new();
 
-    /// A dispatch's making that its piece settled, before the piece gives back what it took
-    /// (`dispatch_making.rs`): inside the piece's trail (`trails.rs`).
+    /// A dispatch's or a draw's making that its piece settled, before the piece gives back what
+    /// it took (`dispatch_making.rs`, `render.rs`): inside the piece's trail (`trails.rs`).
     static SETTLED: Stop = Stop::new();
 
     /// Hold every draw's making from now, once it took what its state kept for it, until the
@@ -697,14 +730,15 @@ pub(crate) mod held {
         MID_MAKING.reach();
     }
 
-    /// Hold every dispatch's piece from now, once it settled its making and before it gives back
-    /// what it took, until the hold is dropped: the batches that waited for the making may run
-    /// and complete meanwhile.
+    /// Hold every dispatch's and draw's piece from now, once it settled its making and before it
+    /// gives back what it took, until the hold is dropped: the batches and the state creation that
+    /// waited for the making may go on meanwhile.
     pub(crate) fn settled_hold() -> Holding {
         SETTLED.hold()
     }
 
-    /// A dispatch's piece that settled its making: wait while a [`settled_hold`] lives.
+    /// A dispatch's or a draw's piece that settled its making: wait while a [`settled_hold`]
+    /// lives.
     pub(crate) fn settled() {
         SETTLED.reach();
     }
@@ -731,6 +765,28 @@ mod tests {
     /// at once, whatever the other tests make in the process's.
     fn roomy() -> Pool {
         Pool::within(Arc::new(Budget::new(MAKERS, MAKERS)))
+    }
+
+    /// A piece runs on a thread of the pool whose stack has the room a driver's compile takes
+    /// (`device::COMPILE_ROOM`), so its makings run there, not on a thread of their own.
+    #[test]
+    fn a_piece_runs_on_a_stack_with_the_room_a_compile_takes() {
+        let pool = roomy();
+        let (sent, got) = mpsc::channel();
+        pool.run(Box::new(move || {
+            let name = std::thread::current().name().map(str::to_owned);
+            sent.send((name, crate::this_thread::stack_room())).unwrap();
+        }));
+        let (name, room) = got.recv_timeout(GUARD).unwrap();
+        assert_eq!(
+            name.as_deref(),
+            Some("metal2vulkan-pipelines"),
+            "on the pool"
+        );
+        assert!(
+            room.is_some_and(|room| room >= crate::device::COMPILE_ROOM),
+            "{room:?} bytes of room"
+        );
     }
 
     /// [`MAKERS`] pieces handed to the pool at once run together, each on a thread of its own,

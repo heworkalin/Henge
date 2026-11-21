@@ -2,8 +2,9 @@
 //! its command buffer completed: `blit_holds.rs`'s drop-after-commit legs for the other encoder
 //! kinds. Each leg encodes a command that reads or writes a no-copy buffer over host pages, by one
 //! way a command reaches a buffer (a binding, an index or indirect buffer, an attachment or a
-//! texture over the buffer, an address held in memory that `use_resource` or `use_heap` makes
-//! resident, an indirect command buffer's command, a sparse texture's indirect mapping update),
+//! texture over the buffer, one whose write back the shadow merges on the host, an address held
+//! in memory that `use_resource` or `use_heap` makes resident, an indirect command buffer's
+//! command, a sparse texture's indirect mapping update),
 //! before busy work is committed, commits it after that work, and releases the no-copy buffer
 //! and every other object the command uses: once at the commit and once more where the command
 //! buffer was scheduled. While the command buffer has not completed, the buffer's deallocator
@@ -17,7 +18,7 @@
 //! `engine/tob_renders.ll` and `engine/ob2_loaded_pointer.ll` (`llvm-as`).
 
 use super::blit_holds::{
-    busy, device, over_host, until, Host, Scratch, BYTES, FILLED, SOURCE, WAIT,
+    busy, device, over_host, shadow_device, until, Host, Scratch, BYTES, FILLED, SOURCE, WAIT,
 };
 use crate::error::RuntimeGap;
 use crate::{
@@ -37,7 +38,6 @@ use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource,
 };
 use std::any::Any;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -67,6 +67,11 @@ enum Leg {
     /// A draw whose vertex function reads its positions and colors from it, bound
     /// (`set_vertex_buffer`).
     VertexBuffers,
+    /// The same, bound after a draw of the encoder that read them from another buffer bound at
+    /// those indices: the second draw's retain of the vertex table takes the no-copy buffer, which
+    /// the encoder did not hold as it was bound, where a retain of the table after calls that
+    /// bound only objects the encoder held looks at none (`argument_table::retain_into`).
+    VertexBuffersRebound,
     /// A draw whose fragment function reads its color from it, bound (`set_fragment_buffer`).
     FragmentBuffer,
     /// An indexed draw whose indices it holds.
@@ -83,6 +88,13 @@ enum Leg {
     IndirectDispatch,
     /// A dispatch that writes a texture over it.
     TextureWrite,
+    /// The same, the texture's rows a texel short of their pitch, so that a line of the device's
+    /// memory holds each row's last texels and bytes beside them, and every texture over host
+    /// pages a shadow (`HostPageTexturePolicy::Shadow`, under which the check gives no answer):
+    /// its write back merges on the host (`shadow_splice.rs`, **Merges**), in a host step whose
+    /// drain holds none of the program's objects, so the import goes at the completion as for
+    /// every other leg, though the command buffer is kept.
+    TextureMergedOnHost,
     /// A dispatch that reads and writes it through an address held in memory, made resident with
     /// `use_resource`.
     UsedResource,
@@ -173,11 +185,10 @@ pub(super) fn words_of(buffer: &Buffer) -> Vec<u32> {
         .collect()
 }
 
-/// The library of the fixture at `path` under `validation/fixtures/public/`.
+/// The library of the fixture at `path` under `validation/fixtures/public/`
+/// ([`metal2vulkan_devtools::fixtures_dir`]).
 pub(super) fn library(device: &Device, path: &str) -> Library {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public")
-        .join(path);
+    let ll = metal2vulkan_devtools::fixtures_dir().join(path);
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
     let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
     device.new_library_with_compile_library(library)
@@ -227,11 +238,11 @@ pub(super) fn pass(target: &Texture) -> RenderPassDescriptor {
     pass
 }
 
-/// An `RGBA8Unorm` texture over the no-copy buffer's bytes of `usage`; `None`, printed, where the
-/// device makes none.
-fn over_buffer(no_copy: &Buffer, usage: TextureUsage) -> Option<Texture> {
+/// An `RGBA8Unorm` texture over the no-copy buffer's bytes of `usage`, `width` texels a row of
+/// [`ROW`] bytes; `None`, printed, where the device makes none.
+fn over_buffer(no_copy: &Buffer, usage: TextureUsage, width: u64) -> Option<Texture> {
     let mut descriptor =
-        TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, OVER_WIDTH, OVER_HEIGHT, false);
+        TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, width, OVER_HEIGHT, false);
     descriptor.usage = usage;
     descriptor.resource_options = ResourceOptions::default();
     match no_copy.new_texture(&descriptor, 0, ROW) {
@@ -264,14 +275,26 @@ fn encode(
     no_copy: &Buffer,
 ) -> Option<Encoded> {
     match leg {
-        Leg::VertexBuffers | Leg::FragmentBuffer | Leg::IndexBuffer | Leg::IndirectDraw => {
-            Some(draw(leg, device, command_buffer, host, no_copy))
-        }
+        Leg::VertexBuffers
+        | Leg::VertexBuffersRebound
+        | Leg::FragmentBuffer
+        | Leg::IndexBuffer
+        | Leg::IndirectDraw => Some(draw(leg, device, command_buffer, host, no_copy)),
         Leg::Attachment => attachment(device, command_buffer, host, no_copy),
         Leg::KernelReads | Leg::KernelWrites | Leg::IndirectDispatch => {
             Some(dispatch(leg, device, command_buffer, host, no_copy))
         }
-        Leg::TextureWrite => texture_write(device, command_buffer, host, no_copy),
+        Leg::TextureWrite => texture_write(device, command_buffer, host, no_copy, OVER_WIDTH),
+        Leg::TextureMergedOnHost => {
+            // A row's last texel and the bytes beside it share a line only where a line holds
+            // more than a texel.
+            let line = device.shared().in_place.line();
+            if line <= 4 {
+                eprintln!("ENCODER-HOLDS: lines of {line} bytes hold no byte beside a texel");
+                return None;
+            }
+            texture_write(device, command_buffer, host, no_copy, OVER_WIDTH - 1)
+        }
         Leg::UsedResource => Some(used_resource(device, command_buffer, host, no_copy)),
         Leg::UsedHeap => Some(used_heap(device, queue, command_buffer, host, no_copy)),
         Leg::IndirectCommands => Some(indirect_commands(device, command_buffer, host, no_copy)),
@@ -291,7 +314,7 @@ fn draw(
     no_copy: &Buffer,
 ) -> Encoded {
     let state = match leg {
-        Leg::VertexBuffers => render_state(
+        Leg::VertexBuffers | Leg::VertexBuffersRebound => render_state(
             device,
             "examples/runtime_examples.ll",
             "colored_vertex",
@@ -313,11 +336,35 @@ fn draw(
     encoder.set_render_pipeline_state(&state).unwrap();
     let corners = bytes_of(&[-1.0f32, -1.0, 1.0, 1.0], f32::to_le_bytes);
     let color = bytes_of(&COLOR, f32::to_le_bytes);
+    let mut watched = Vec::new();
+    let mut released: Vec<Box<dyn Any>> = Vec::new();
+    let mut counts_before_draw = None;
     match leg {
-        Leg::VertexBuffers => {
+        Leg::VertexBuffers | Leg::VertexBuffersRebound => {
             // A triangle over the target: its positions, then each vertex's color.
-            host.set(0, &bits(&[-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]));
+            let triangle = bits(&[-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]);
+            host.set(0, &triangle);
             host.set(COLORS_AT as usize / 4, &bits(&COLOR.repeat(3)));
+            if leg == Leg::VertexBuffersRebound {
+                // The same triangle from another buffer first, then the no-copy buffer's at the
+                // same indices, then the no-copy buffer bound again at another index: the second
+                // draw's retain takes the no-copy buffer, and the third's looks at nothing, the
+                // encoder holding it as it was bound.
+                let mut words = vec![0; (COLORS_AT / 4) as usize];
+                words[..triangle.len()].copy_from_slice(&triangle);
+                words.extend(bits(&COLOR.repeat(3)));
+                let other = shared_words(device, &words);
+                encoder.set_vertex_buffer(Some(&other), 0, 0).unwrap();
+                encoder
+                    .set_vertex_buffer(Some(&other), COLORS_AT, 1)
+                    .unwrap();
+                encoder
+                    .draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)
+                    .unwrap();
+                watched.push(watch("the first draw's buffer", other.held()));
+                released.push(Box::new(other));
+            }
+            let before = device.work_counts();
             encoder.set_vertex_buffer(Some(no_copy), 0, 0).unwrap();
             encoder
                 .set_vertex_buffer(Some(no_copy), COLORS_AT, 1)
@@ -325,6 +372,15 @@ fn draw(
             encoder
                 .draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)
                 .unwrap();
+            if leg == Leg::VertexBuffersRebound {
+                // At an index the function does not read: bound at the same index and offset, it
+                // would change nothing, and the draw would draw again, retaining nothing.
+                encoder.set_vertex_buffer(Some(no_copy), 0, 2).unwrap();
+                encoder
+                    .draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)
+                    .unwrap();
+            }
+            counts_before_draw = Some(before);
         }
         Leg::FragmentBuffer => {
             host.set(0, &bits(&COLOR));
@@ -362,6 +418,23 @@ fn draw(
         }
     }
     encoder.end_encoding().unwrap();
+    // The draw's retains took the no-copy buffer, once for its two slots, and nothing else (the
+    // fragment table binds nothing); the draw after it, which bound it again, looked at nothing.
+    if let Some(before) = counts_before_draw {
+        let after = device.work_counts();
+        let grew = |count: fn(&crate::WorkCounts) -> u64| count(&after) - count(&before);
+        let held = grew(|c| c.argument_tables_held_at_bind);
+        assert_eq!(
+            held,
+            u64::from(leg == Leg::VertexBuffersRebound),
+            "{leg:?}: retains of tables whose objects the encoder held at bind"
+        );
+        let retained = (
+            grew(|c| c.argument_tables_retained),
+            grew(|c| c.argument_objects_retained),
+        );
+        assert_eq!(retained, (1, 1), "{leg:?}: tables and objects retained");
+    }
     let mut blit = command_buffer.blit_command_encoder().unwrap();
     blit.copy_from_texture_to_buffer(
         &target,
@@ -377,12 +450,14 @@ fn draw(
     )
     .unwrap();
     blit.end_encoding().unwrap();
+    watched.extend([
+        watch("the target", target.held()),
+        watch_render_state(&state),
+    ]);
+    released.extend([Box::new(target) as Box<dyn Any>, Box::new(state)]);
     Encoded {
-        watched: vec![
-            watch("the target", target.held()),
-            watch_render_state(&state),
-        ],
-        released: vec![Box::new(target), Box::new(state)],
+        watched,
+        released,
         check: Box::new(move |_| {
             assert!(
                 words_of(&back).iter().all(|&word| word == PACKED),
@@ -399,7 +474,7 @@ fn attachment(
     host: &Host,
     no_copy: &Buffer,
 ) -> Option<Encoded> {
-    let target = over_buffer(no_copy, TextureUsage::RENDER_TARGET)?;
+    let target = over_buffer(no_copy, TextureUsage::RENDER_TARGET, OVER_WIDTH)?;
     let state = render_state(device, "engine/tob_renders.ll", "tob_rect", "tob_solid");
     host.fill(SOURCE);
     let mut encoder = command_buffer
@@ -510,27 +585,28 @@ fn dispatch(
 }
 
 /// The texture write leg: `invert_texels` from a texture of zeros into a texture over the no-copy
-/// buffer, which takes `(1, 1, 1, 0)`.
+/// buffer, `width` texels a row, which takes `(1, 1, 1, 0)`.
 fn texture_write(
     device: &Device,
     command_buffer: &CommandBuffer,
     host: &Host,
     no_copy: &Buffer,
+    width: u64,
 ) -> Option<Encoded> {
-    let destination = over_buffer(no_copy, TextureUsage::SHADER_WRITE)?;
+    let destination = over_buffer(no_copy, TextureUsage::SHADER_WRITE, width)?;
     let library = library(device, "examples/runtime_examples.ll");
     let function = library.new_function_with_name("invert_texels").unwrap();
     let state = device
         .new_compute_pipeline_state_with_function(&function, &PipelineOptions::default())
         .unwrap();
     let mut descriptor =
-        TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, OVER_WIDTH, OVER_HEIGHT, false);
+        TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, width, OVER_HEIGHT, false);
     descriptor.usage = TextureUsage::SHADER_READ;
     descriptor.resource_options = ResourceOptions::shared();
     let source = device.new_texture(&descriptor).unwrap();
     source
         .replace_region(
-            Region::new_2d(0, 0, OVER_WIDTH, OVER_HEIGHT),
+            Region::new_2d(0, 0, width, OVER_HEIGHT),
             0,
             0,
             &vec![0; BYTES],
@@ -544,7 +620,7 @@ fn texture_write(
     encoder.set_texture(Some(&source), 0).unwrap();
     encoder.set_texture(Some(&destination), 1).unwrap();
     encoder
-        .dispatch_threads(Size::new(OVER_WIDTH, OVER_HEIGHT, 1), Size::new(8, 8, 1))
+        .dispatch_threads(Size::new(width, OVER_HEIGHT, 1), Size::new(8, 8, 1))
         .unwrap();
     encoder.end_encoding().unwrap();
     Some(Encoded {
@@ -554,11 +630,21 @@ fn texture_write(
             watch("the texture over the buffer", destination.held()),
         ],
         released: vec![Box::new(state), Box::new(source), Box::new(destination)],
-        check: Box::new(|host| {
-            assert!(
-                host.holds(u32::from_le_bytes([255, 255, 255, 0])),
-                "the dispatch's texels are not in the pages under the texture"
-            );
+        // Each row's texels hold the dispatch's, and the bytes past them to the pitch the pages'
+        // own, which the dispatch did not write.
+        check: Box::new(move |host| {
+            let texel = u32::from_le_bytes([255, 255, 255, 0]);
+            for (at, row) in host.words().chunks((ROW / 4) as usize).enumerate() {
+                let (texels, padding) = row.split_at(width as usize);
+                assert!(
+                    texels.iter().all(|&word| word == texel),
+                    "row {at}: the dispatch's texels are not in the pages under the texture"
+                );
+                assert!(
+                    padding.iter().all(|&word| word == SOURCE),
+                    "row {at}: the bytes past its texels changed"
+                );
+            }
         }),
     })
 }
@@ -816,12 +902,16 @@ fn sparse_mapping(
 fn run(leg: Leg) {
     let scratch = Scratch::new(&format!("encoder-{leg:?}"));
     let host = Host::new();
-    let device = device(&scratch.0);
+    let device = match leg {
+        Leg::TextureMergedOnHost => shadow_device(&scratch.0),
+        _ => device(&scratch.0),
+    };
     let queue = device.new_command_queue().unwrap();
     let target = device
         .new_buffer(FILLED, ResourceOptions::private())
         .unwrap();
     for release in [Release::Committed, Release::Scheduled] {
+        let host_steps = device.work_counts().shadow_host_steps;
         let runs = Arc::new(AtomicUsize::new(0));
         let Some(no_copy) = over_host(&device, &host, &runs) else {
             return;
@@ -870,6 +960,11 @@ fn run(leg: Leg) {
         command_buffer.wait_until_completed_for(WAIT).unwrap();
         assert_eq!(command_buffer.error(), None);
         busy.wait_until_completed_for(WAIT).unwrap();
+        if leg == Leg::TextureMergedOnHost {
+            let steps = device.work_counts().shadow_host_steps - host_steps;
+            eprintln!("ENCODER-HOLDS {leg:?} released {release:?}: host steps {steps}");
+            assert!(steps > 0, "{leg:?}: no merge on the host ran");
+        }
         until("the deallocator never ran", || {
             runs.load(Ordering::SeqCst) == 1
         });
@@ -880,6 +975,11 @@ fn run(leg: Leg) {
 #[test]
 fn a_no_copy_buffer_a_committed_draw_reads_as_vertex_buffers_keeps_its_import_until_completion() {
     run(Leg::VertexBuffers);
+}
+
+#[test]
+fn a_no_copy_buffer_a_committed_draw_binds_over_another_keeps_its_import_until_completion() {
+    run(Leg::VertexBuffersRebound);
 }
 
 #[test]
@@ -921,6 +1021,11 @@ fn a_no_copy_buffer_a_committed_dispatch_reads_arguments_from_keeps_its_import_u
 #[test]
 fn a_no_copy_buffer_a_committed_dispatch_writes_a_texture_over_keeps_its_import_until_completion() {
     run(Leg::TextureWrite);
+}
+
+#[test]
+fn a_no_copy_buffer_a_committed_dispatch_merged_on_the_host_keeps_its_import_until_completion() {
+    run(Leg::TextureMergedOnHost);
 }
 
 #[test]

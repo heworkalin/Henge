@@ -3,7 +3,12 @@
 //!
 //! - **What it holds.** Translated functions by their [`FunctionCompileKey`], and compiled
 //!   pipelines by their [`PipelineKey`], each beside a weak reference to the variant a live state
-//!   made of it. Metal compiles a function once per process and gives every later state of it at
+//!   made of it. Under a function's key it holds instead the compile layer's refusal of it, where
+//!   that is `Unsupported` ([`PipelineMemo::keep_refusal`]): a refusal the translator holds
+//!   permanent for its input on the device's profile (`Error::is_permanent_for`), which the key
+//!   names, so a later ask of the same key gets the same answer at once, translating nothing. A
+//!   transient outcome (a deadline, a cancellation, a failed allocation) is never kept, nor is any
+//!   other error. Metal compiles a function once per process and gives every later state of it at
 //!   once (measured on an M3 Max and an M4: 39 ms, then 20 us), as a new object with its own
 //!   resource ID. So does the runtime: a state made again shares the live variant (its shader
 //!   modules, layouts, plans and `VkPipeline`s), or makes the variant's objects again from the
@@ -11,8 +16,8 @@
 //! - **Bounded.** The memo holds at most [`ShaderCacheOptions::memory_capacity`] bytes of
 //!   artifacts and at most [`MEMO_ENTRIES`] entries; past either, the least recently used go. An
 //!   entry is counted at its encoded length where it was encoded for the directory, and at what
-//!   it retains ([`RenderPipeline::footprint`]) where it was kept without being encoded
-//!   (`pipeline/sources.rs`) -- never at the zero bytes a skipped encoding returns, which would
+//!   it retains ([`RenderPipeline::footprint`], [`ComputePipeline::footprint`]) where it was kept
+//!   without being encoded (`pipeline/sources.rs`) -- never at the zero bytes a skipped encoding returns, which would
 //!   let 4096 entries of a few hundred kilobytes each sit in a memo that believed its bound
 //!   untouched. It holds no Vulkan object, and no strong reference to a variant: those live as
 //!   long as a state or a pending command holds them. A variant's own memos (its plans and
@@ -25,6 +30,7 @@ use super::Variant;
 use crate::device::lock;
 use crate::key_hash::KeyMap;
 use metal2vulkan::cache::PipelineKey;
+use metal2vulkan::error::Error;
 use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
 use metal2vulkan::pipeline::{ComputePipeline, RenderPipeline, StageEntries};
 use std::collections::BTreeMap;
@@ -33,6 +39,20 @@ use std::sync::{Arc, Mutex, Weak};
 
 /// The most entries the device's memo holds, whatever their sizes.
 pub(crate) const MEMO_ENTRIES: usize = 4096;
+
+/// What watches a map's entries as they are kept, used and let go ([`Lru::watched`]): told under
+/// the lock that holds the map, so it takes no lock a holder of another such map's may wait for
+/// while holding its own.
+pub(crate) trait Watch<K, V>: Send + Sync {
+    /// `key` was kept, by an insert.
+    fn kept(&self, key: &K);
+    /// `key`'s entry was used, by a lookup.
+    fn used(&self, key: &K);
+    /// `key`'s entry went past the map's bounds, with its value.
+    fn evicted(&self, key: &K, value: &V);
+    /// `key`'s entry was removed by its key.
+    fn removed(&self, key: &K);
+}
 
 /// A map that keeps at most `max_weight` of its entries' weights and at most `max_entries`
 /// entries, removing the least recently used past either. A lookup or an insert is a use.
@@ -50,6 +70,8 @@ pub(crate) struct Lru<K, V> {
     weight: u64,
     max_weight: u64,
     max_entries: usize,
+    /// Told of each entry kept, used and let go, where the map is watched.
+    watch: Option<Box<dyn Watch<K, V>>>,
     /// The uses that moved an entry in `order` ([`used`](Self::used)).
     #[cfg(test)]
     reordered: u64,
@@ -78,6 +100,7 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
             weight: 0,
             max_weight,
             max_entries,
+            watch: None,
             #[cfg(test)]
             reordered: 0,
         }
@@ -86,6 +109,41 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
     /// An empty map of at most `max_entries` entries, each of weight 1.
     pub(crate) fn counted(max_entries: usize) -> Lru<K, V> {
         Lru::new(u64::MAX, max_entries)
+    }
+
+    /// The map, telling `watch` of each entry kept, used and let go.
+    pub(crate) fn watched(mut self, watch: Box<dyn Watch<K, V>>) -> Lru<K, V> {
+        self.watch = Some(watch);
+        self
+    }
+
+    /// How many entries it holds.
+    pub(crate) fn count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Remove the least recently used entry, and hand it back: an eviction the caller makes, which
+    /// the watch is not told of.
+    pub(crate) fn pop_oldest(&mut self) -> Option<(K, V)> {
+        let (_, oldest) = self.order.pop_first()?;
+        let slot = self.entries.remove(&oldest)?;
+        self.numbers.remove(&slot.key);
+        self.weight -= slot.weight;
+        Some((slot.key, slot.value))
+    }
+
+    /// Its entries with their weights, the least recently used first, their uses left as they
+    /// were.
+    pub(crate) fn oldest_first(&self) -> impl Iterator<Item = (&K, &V, u64)> {
+        (self.order.values())
+            .filter_map(|number| self.entries.get(number))
+            .map(|slot| (&slot.key, &slot.value, slot.weight))
+    }
+
+    /// The value of `key`, its use left as it was.
+    pub(crate) fn peek(&self, key: &K) -> Option<&V> {
+        let number = self.numbers.get(key)?;
+        self.entries.get(number).map(|slot| &slot.value)
     }
 
     /// The value of `key`, now the most recently used.
@@ -117,6 +175,9 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
     /// would leave it.
     fn used(&mut self, number: u64) -> Option<&mut Slot<K, V>> {
         let slot = self.entries.get_mut(&number)?;
+        if let Some(watch) = self.watch.as_deref() {
+            watch.used(&slot.key);
+        }
         // The latest stamp given is the clock's last.
         if slot.used + 1 == self.clock {
             return Some(slot);
@@ -135,15 +196,21 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
 
     /// Keep `value` under `key` with `weight`, as the most recently used, replacing what `key`
     /// held; then remove the least recently used entries until both bounds hold. A value heavier
-    /// than the whole bound is not kept.
+    /// than the whole bound is not kept, and what `key` held is then removed.
     pub(crate) fn insert(&mut self, key: K, value: V, weight: u64) {
-        self.remove(&key);
+        let replaced = self.take(&key);
         if weight > self.max_weight || self.max_entries == 0 {
+            if let Some(watch) = self.watch.as_deref().filter(|_| replaced) {
+                watch.removed(&key);
+            }
             return;
         }
         let stamp = self.clock;
         self.clock += 1;
         self.numbers.insert(key.clone(), stamp);
+        if let Some(watch) = self.watch.as_deref() {
+            watch.kept(&key);
+        }
         let slot = Slot {
             key,
             value,
@@ -160,19 +227,33 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
             if let Some(slot) = self.entries.remove(&oldest) {
                 self.numbers.remove(&slot.key);
                 self.weight -= slot.weight;
+                if let Some(watch) = self.watch.as_deref() {
+                    watch.evicted(&slot.key, &slot.value);
+                }
             }
         }
     }
 
     /// Remove `key`'s entry, if any.
     pub(crate) fn remove(&mut self, key: &K) {
-        let Some(number) = self.numbers.remove(key) else {
-            return;
-        };
-        if let Some(slot) = self.entries.remove(&number) {
-            self.order.remove(&slot.used);
-            self.weight -= slot.weight;
+        if self.take(key) {
+            if let Some(watch) = self.watch.as_deref() {
+                watch.removed(key);
+            }
         }
+    }
+
+    /// Remove `key`'s entry, if any, telling the watch nothing: whether there was one.
+    fn take(&mut self, key: &K) -> bool {
+        let Some(number) = self.numbers.remove(key) else {
+            return false;
+        };
+        let Some(slot) = self.entries.remove(&number) else {
+            return false;
+        };
+        self.order.remove(&slot.used);
+        self.weight -= slot.weight;
+        true
     }
 
     /// How many uses moved an entry in the order: none that used the latest used again.
@@ -203,6 +284,8 @@ enum MemoKey {
 /// A memo entry.
 enum MemoValue {
     Function(CompiledFunction),
+    /// The compile layer's `Unsupported` refusal of the function of a [`MemoKey::Function`] key.
+    Refused(Error),
     Compute(Arc<ComputePipeline>, Weak<Variant>),
     Render(Arc<RenderPipeline>, Weak<RenderVariant>),
 }
@@ -271,6 +354,30 @@ impl PipelineMemo {
         );
     }
 
+    /// The compile layer's refusal of the function of `key`, where the memo keeps it
+    /// ([`keep_refusal`](Self::keep_refusal)).
+    pub(crate) fn refusal(&self, key: &FunctionCompileKey) -> Option<Error> {
+        match lock(&self.pipelines).get(&MemoKey::Function(*key)) {
+            Some(MemoValue::Refused(refusal)) => Some(refusal.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keep `refusal`, the compile layer's answer to the function of `key`, where it is
+    /// `Unsupported` (the module docs); any other error is not kept. Weighed at what the entry
+    /// holds, never zero, as every entry is.
+    pub(crate) fn keep_refusal(&self, key: &FunctionCompileKey, refusal: &Error) {
+        if !matches!(refusal, Error::Unsupported(_)) {
+            return;
+        }
+        let weight = std::mem::size_of::<(MemoKey, MemoValue)>() as u64;
+        lock(&self.pipelines).insert(
+            MemoKey::Function(*key),
+            MemoValue::Refused(refusal.clone()),
+            weight,
+        );
+    }
+
     /// The compute pipeline compiled under `key`.
     pub(crate) fn compute(
         &self,
@@ -326,6 +433,29 @@ impl PipelineMemo {
         let key = MemoKey::Render(variant.pipeline().key);
         if let Some(MemoValue::Render(_, live)) = lock(&self.pipelines).get_mut(&key) {
             *live = Arc::downgrade(variant);
+        }
+    }
+
+    /// Take `earlier`'s compiled functions, refusals and pipelines as this memo's own, in their
+    /// order of use and at their weights: the memo of a lost generation of the device whose
+    /// recovery made this one's, of the same profile (the caller's check), so each is what a
+    /// compile here would give. None of its live variants: their objects were the lost
+    /// `VkDevice`'s.
+    pub(crate) fn carry_from(&self, earlier: &PipelineMemo) {
+        let earlier = lock(&earlier.pipelines);
+        let mut pipelines = lock(&self.pipelines);
+        for (key, value, weight) in earlier.oldest_first() {
+            let value = match value {
+                MemoValue::Function(function) => MemoValue::Function(function.clone()),
+                MemoValue::Refused(refusal) => MemoValue::Refused(refusal.clone()),
+                MemoValue::Compute(pipeline, _) => {
+                    MemoValue::Compute(Arc::clone(pipeline), Weak::new())
+                }
+                MemoValue::Render(pipeline, _) => {
+                    MemoValue::Render(Arc::clone(pipeline), Weak::new())
+                }
+            };
+            pipelines.insert(key.clone(), value, weight);
         }
     }
 

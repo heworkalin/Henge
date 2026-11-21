@@ -37,22 +37,44 @@
 //!   completed (they hold it), so no GPU work reaches it. Not an image of a shareable texture, one
 //!   that took its storage form, one presenting a stand-in, or one whose memory is not its
 //!   placement alone; not a heap's buffer, nor a buffer of the caller's or over host pages.
+//! - **The book.** The recycler keeps the making of each live object it made or handed out, by its
+//!   handle, and parks an object as its last holder goes only where the book holds its handle.
+//!   A driver gives a destroyed object's handle to a later object (MoltenVK's handle is the
+//!   object's address), so every live object the book holds leaves it before it is destroyed:
+//!   at its last holder's going (parked, or forgotten where it may not park), and an image swapped
+//!   out of its texture as the image swapped out goes (`texture.rs`'s `ImageObjects`: a texture's
+//!   first image, which its storage form replaced, `texture/storage_form.rs`). One left in the book
+//!   would park the next image the driver makes at its handle, where the book does not note that
+//!   one (a `Shared` or `Managed` texture's host-copy image), as the old one's making, and a
+//!   texture of that making would take an image of another format or shape: views and copies of
+//!   its format over an image of another, which MoltenVK refuses or Metal's texture view creation
+//!   aborts on. Counted: `WorkCounts::object_churn.swapped_out_images_forgotten`, the images
+//!   swapped out that left the book as they went.
 //! - **Which.** A take hands out the latest parked object of its making, found through a map of
 //!   each making's parked objects (a hash of the making, not a search of every parked one).
 //! - **Bounded.** At most [`IMAGES`]' and [`BUFFERS`]' count and bytes parked, and none parked
 //!   longer than their time: one parked longer goes, as it went before (destroyed, its memory
-//!   freed). Past the count or bytes, the one parked earliest goes of those no take has handed out
-//!   before; one a take has handed out (its making came again while it was parked, as a frame's
-//!   textures of the same shapes do every frame) goes first only where such hold more than three
+//!   freed), at the next park or take, or within a second after on the device's idle sweep
+//!   (`idle_sweep.rs`) where none comes. Past the count or bytes, the one parked earliest goes of
+//!   those no take has handed out before; one a take has handed out (its making came again while
+//!   it was parked, as a frame's textures of the same shapes do every frame) goes first only
+//!   where such hold more than three
 //!   quarters of the count or bytes, or no other is parked. So a run of makings that never come
 //!   again (a window resized frame by frame) evicts its own, not the objects each frame takes,
 //!   and those still leave a quarter of the bounds to makings new to them. The memory a parked
 //!   image or buffer holds is the runtime's, never a program object's: no deallocator, range or
-//!   use count waits on it. Counted: `WorkCounts::object_churn` (`images_recycled`,
-//!   `buffers_parked`, `images_evicted`, ...). A build of `--cfg m2v_no_recycle` parks nothing,
-//!   the control that measures what recycling changes.
+//!   use count waits on it. The buffers' count bound is the bytes bound over the upload arena's
+//!   largest chunk (`upload.rs`): the dedicated 64 KiB chunks a command buffer's regions took (a
+//!   written slot's neutral region, one a dispatch) park whole as it completes, and the next
+//!   command buffer takes them rather than making them again. At most 64 parked buffers hold an
+//!   allocation of their own (`Placement::holds_allocation`: a dedicated block, an import of
+//!   their own pages), each a `VkDeviceMemory` the device's `maxMemoryAllocationCount` counts
+//!   (`allocations.rs`); past that, the earliest parked of them goes, one no take handed out
+//!   first. Counted: `WorkCounts::object_churn` (`images_recycled`, `buffers_parked`,
+//!   `images_evicted`, ...). A build of `--cfg m2v_no_recycle` parks nothing, the control that
+//!   measures what recycling changes.
 
-use super::memory::{Memory, MemoryClass, Placement};
+use super::memory::{Holds, Memory, MemoryClass, Placement};
 use crate::image_plan::ImagePlan;
 use crate::key_hash::KeyMap;
 use crate::release::{self, Released};
@@ -61,13 +83,18 @@ use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
-/// How much a recycler parks: at most `most` objects and `most_bytes` of their memory, each for
-/// at most `parked_for`.
+/// How much a recycler parks: at most `most` objects and `most_bytes` of their memory, at most
+/// `most_alone` of them holding an allocation of their own, each for at most `parked_for`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bounds {
     most: usize,
     most_bytes: u64,
-    parked_for: Duration,
+    /// The most parked objects that hold an allocation of their own
+    /// (`Placement::holds_allocation`).
+    most_alone: usize,
+    /// The longest an object stays parked: one parked longer goes at the next park or take, or on
+    /// the device's idle sweep where none comes (`idle_sweep.rs`).
+    pub(crate) parked_for: Duration,
 }
 
 /// The most parked: none in a build of `--cfg m2v_no_recycle` (each object then goes as it is
@@ -80,17 +107,25 @@ const fn most(count: usize) -> usize {
     }
 }
 
-/// The images' bounds: 32 images, 128 MiB, a second.
+/// The images' bounds: 32 images, 128 MiB, a second; any of the 32 may hold an allocation of its
+/// own.
 pub(crate) const IMAGES: Bounds = Bounds {
     most: most(32),
     most_bytes: 128 << 20,
+    most_alone: most(32),
     parked_for: Duration::from_secs(1),
 };
 
-/// The buffers' bounds: 64 buffers, 64 MiB, a second.
+/// The bytes the buffers' bounds park at most.
+const BUFFER_BYTES: u64 = 64 << 20;
+
+/// The buffers' bounds: 64 MiB, a second, and 1024 buffers, as many as the bytes hold of the
+/// upload arena's largest chunk (`upload.rs`), of which at most 64 hold an allocation of their own
+/// (the module docs' "Bounded").
 pub(crate) const BUFFERS: Bounds = Bounds {
-    most: most(64),
-    most_bytes: 64 << 20,
+    most: most((BUFFER_BYTES / crate::upload::CHUNK_BYTES) as usize),
+    most_bytes: BUFFER_BYTES,
+    most_alone: most(64),
     parked_for: Duration::from_secs(1),
 };
 
@@ -106,13 +141,19 @@ pub(crate) struct ImageMaking {
 }
 
 /// What fixes a buffer's making (`Device::placed_new_buffer`): its size (padded), the memory
-/// class it lies in, and whether it lies in fresh pages it imported (`fresh_pages.rs`), its
-/// `VkBuffer` made for host allocations.
+/// class it lies in, whether it lies in fresh pages it imported (`fresh_pages.rs`), its
+/// `VkBuffer` made for host allocations, the kind of block it lies in otherwise
+/// (`memory.rs`'s `Holds`), whose `VkBuffer` names the block's handle type where it has one, and
+/// which a buffer that declares its padding unobserved takes as `memory.rs`'s
+/// `Memory::unobserved_buffers` says, and the alignment its placement starts and ends on (the
+/// device's linear images' for such a buffer, `Device::linear_image_alignment`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BufferMaking {
     pub(crate) size: u64,
     pub(crate) class: MemoryClass,
     pub(crate) fresh_pages: bool,
+    pub(crate) holds: Holds,
+    pub(crate) granule: u64,
 }
 
 /// A parked object.
@@ -130,10 +171,12 @@ struct Live<M> {
     taken: bool,
 }
 
-/// Parked objects of one standing, keyed by the order they were parked in, and their memory.
+/// Parked objects of one standing, keyed by the order they were parked in, their memory, and how
+/// many of them hold an allocation of their own.
 struct Segment<R, M> {
     parked: BTreeMap<u64, Parked<R, M>>,
     bytes: u64,
+    alone: usize,
 }
 
 impl<R, M> Segment<R, M> {
@@ -141,6 +184,7 @@ impl<R, M> Segment<R, M> {
         Segment {
             parked: BTreeMap::new(),
             bytes: 0,
+            alone: 0,
         }
     }
 
@@ -150,13 +194,27 @@ impl<R, M> Segment<R, M> {
 
     fn put(&mut self, order: u64, parked: Parked<R, M>) {
         self.bytes += parked.placement.size();
+        self.alone += usize::from(parked.placement.holds_allocation());
         self.parked.insert(order, parked);
     }
 
     fn remove(&mut self, order: u64) -> Option<Parked<R, M>> {
         let parked = self.parked.remove(&order)?;
-        self.bytes -= parked.placement.size();
+        self.left(&parked);
         Some(parked)
+    }
+
+    /// `parked` left the segment.
+    fn left(&mut self, parked: &Parked<R, M>) {
+        self.bytes -= parked.placement.size();
+        self.alone -= usize::from(parked.placement.holds_allocation());
+    }
+
+    /// The order of the one parked earliest that holds an allocation of its own.
+    fn first_alone(&self) -> Option<u64> {
+        let mut entries = self.parked.iter();
+        let (&order, _) = entries.find(|(_, parked)| parked.placement.holds_allocation())?;
+        Some(order)
     }
 
     /// The one parked earliest, out of the segment, where it was parked at least `parked_for`
@@ -170,7 +228,7 @@ impl<R, M> Segment<R, M> {
             return None;
         }
         let (order, parked) = self.parked.pop_first()?;
-        self.bytes -= parked.placement.size();
+        self.left(&parked);
         Some((order, parked))
     }
 }
@@ -289,12 +347,19 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
             };
             gone.push(evicted);
         }
+        while self.trial.alone + self.proven.alone > self.bounds.most_alone {
+            let Some(evicted) = self.evict_alone() else {
+                break;
+            };
+            gone.push(evicted);
+        }
         Ok(gone)
     }
 
-    /// `raw`, live, goes without parking (it is not recyclable as it goes).
-    pub(crate) fn forget(&mut self, raw: R) {
-        self.live.remove(&raw);
+    /// `raw`, live, goes without parking (it is not recyclable as it goes): whether the book held
+    /// it.
+    pub(crate) fn forget(&mut self, raw: R) -> bool {
+        self.live.remove(&raw).is_some()
     }
 
     /// The object that goes to keep the bounds, out of the recycler: the earliest parked trial
@@ -309,6 +374,40 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
         };
         let (order, parked) = segment.pop_first(None)?;
         Some(self.unindexed(order, parked))
+    }
+
+    /// The object that goes to keep the bounds' count of those that hold an allocation of their
+    /// own, out of the recycler: the earliest parked such of those no take handed out before, or,
+    /// where none of those is parked, of those a take did.
+    fn evict_alone(&mut self) -> Option<(R, Placement)> {
+        let segment = match self.trial.alone > 0 {
+            true => &mut self.trial,
+            false => &mut self.proven,
+        };
+        let order = segment.first_alone()?;
+        let parked = segment.remove(order)?;
+        Some(self.unindexed(order, parked))
+    }
+
+    /// The objects parked longer than the bounds' time at `now`, out of the recycler, to destroy,
+    /// for the device's idle sweep (`idle_sweep.rs`); and when the next still parked goes.
+    pub(crate) fn sweep(&mut self, now: Instant) -> (Gone<R>, Option<Instant>) {
+        let gone = self.stale(now);
+        (gone, self.due())
+    }
+
+    /// When the object parked earliest has stayed parked for the bounds' time: `None` where none
+    /// is parked.
+    pub(crate) fn due(&self) -> Option<Instant> {
+        let first = |segment: &Segment<R, M>| {
+            let (_, parked) = segment.parked.first_key_value()?;
+            Some(parked.since)
+        };
+        let since = first(&self.trial)
+            .into_iter()
+            .chain(first(&self.proven))
+            .min()?;
+        Some(since + self.bounds.parked_for)
     }
 
     /// The objects parked longer than the bounds' time at `now`, out of the recycler.
@@ -337,11 +436,20 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
 }
 
 impl<R: Released, M> Recycler<R, M> {
+    /// Every parked object destroyed and its memory freed, and none parked from now on: each
+    /// live one goes as its last holder lets go of it (`park` hands it back). A lost device whose
+    /// recovery carried its objects on, on which nothing is made again (`device/carry.rs`).
+    pub(crate) fn close(&mut self, device: &ash::Device, memory: &mut Memory) {
+        self.live.clear();
+        self.destroy(device, memory);
+    }
+
     /// Every parked object, destroyed and its memory freed, as the device goes.
     pub(crate) fn destroy(&mut self, device: &ash::Device, memory: &mut Memory) {
         self.index.clear();
         for segment in [&mut self.trial, &mut self.proven] {
             segment.bytes = 0;
+            segment.alone = 0;
             let parked = std::iter::from_fn(|| segment.parked.pop_first());
             destroy(device, memory, parked.map(|(_, p)| (p.raw, p.placement)));
         }

@@ -4,7 +4,9 @@
 //! here: a blit between a buffer and a texture over a buffer, or between two textures over buffers
 //! (`blit_texture.rs`, `RowsCopy`, through a scratch buffer too where its rows share bytes); a
 //! buffer-texture copy's rows through its staging buffer; and a shadow's copy back out of its
-//! staging buffer (`shadow.rs`, `ShadowCopy::staged_back`): a texture over a buffer's bytes, a
+//! staging buffer (`shadow.rs`, `ShadowCopy::staged_back`), or one spliced (`shadow_splice.rs`,
+//! `SplicePlan::place`: its rows' whole lines into the buffer, and their heads and their tails
+//! into the region its host step copies them from): a texture over a buffer's bytes, a
 //! texture buffer, a rotated texture (`rotated.rs`), a heap's two-plane or tiled texture
 //! (`texture/heap_two_planes.rs`, `texture/heap_tiled.rs`), as an encoder records it or as a
 //! render pass's steps record it between its instances (`render/pass_steps.rs`).
@@ -151,6 +153,9 @@ impl RowCopies {
     /// no source region meets a destination region.
     pub(super) unsafe fn record(&self, device: &Vk, command_buffer: vk::CommandBuffer) {
         match &self.form {
+            // No rows: a texture's whose texels all lie past its buffer's length, which its tail
+            // keeps (`buffer_texture::inside_rows`).
+            Form::Copy { regions, .. } if regions.is_empty() => {}
             // SAFETY: the caller's contract.
             Form::Copy { src, dst, regions } => unsafe {
                 device.cmd_copy_buffer(command_buffer, *src, *dst, regions);

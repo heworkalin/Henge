@@ -18,29 +18,36 @@
 //!   compiles nothing. Where the descriptor states `requiredThreadsPerThreadgroup`, that size is
 //!   the threadgroup every dispatch of the state must have, so the local size of a first
 //!   dispatch's region is part of the request itself. The creation then makes that
-//!   region's `VkPipeline` ([`Variant::make_at_creation`]): a `dispatchThreadgroups:` on the base
+//!   region's `VkPipeline` ([`Variant::make_predicted`]): a `dispatchThreadgroups:` on the base
 //!   variant, planned for nothing bound but Metal's default sampler at each runtime sampler slot
 //!   that does not compare (as a render state's prediction, `predicted.rs`), at that size
-//!   ([`predicted_threads`]). A dispatch whose region has that key takes the pipeline made; one
-//!   whose key differs from it only where it reads a uniform view at its bind offset alone takes
-//!   it too, at once, while its own key is made on the pool, nothing waiting for it, as a draw
-//!   takes its key's residual form (`render/residual.rs`); any other hands its own making to the
-//!   pool, as before (on MoltenVK the kernel's MSL library is then compiled already, so that
-//!   making is its specialization and Metal's pipeline compile).
-//!   Under `PipelineWaitPolicy::Bounded` (the default) the making is handed to the device's pool,
-//!   kept by the state's piece holds as a dispatch's is, and the creation waits for it the
-//!   policy's `pipeline_creation_wait` (4.5 s by default) at most, as a render state's does
-//!   (`render.rs`): a driver's cold
-//!   compile holds the thread creating the state, which a host may create inside a command
-//!   buffer's encoding, no longer, and a dispatch that finds the making in flight takes it, its
-//!   command buffer waiting a bound for it in turn (`WorkCounts::creations_left_making`). A
-//!   making still running then may run past the state's release, holding the variant and the
-//!   device until it ends. Under `PipelineWaitPolicy::Exact` it runs on the creating thread and
-//!   ends before the creation returns: none runs past the state's release, which would hold the
-//!   variant and the device past the program's last drop, which Metal's never does. Its
-//!   specialized notices wait for the first dispatch that takes it, which announces them naming
-//!   what it binds. A creation inside a host step, a tile function's state and a stand-in compile
-//!   make nothing here.
+//!   ([`predicted_threads`]). A storage view bound to nothing plans as one bound at offset 0, the
+//!   commonest bind (`bind::plan::slots::range_at_bind_offset`), so on a profile whose storage
+//!   views declare `SpecKey::RangeAtBindOffset` (`DriverWorkaround::PushReadsLengthenThreadPayload`)
+//!   the predicted region reads them at their bind offsets, as a dispatch binding them there does,
+//!   and the creation makes its residual form beside it, every view read at its residual, which a
+//!   dispatch binding them elsewhere takes. A dispatch whose region has either key takes that
+//!   pipeline; one whose key differs from the residual form's only where it reads a view at its
+//!   bind offset alone takes the residual form's at once, while its own key is made on the pool,
+//!   nothing waiting for it, as a draw takes its key's general form (`render/residual.rs`); any
+//!   other hands its own making to the pool, as before (on MoltenVK the kernel's MSL library is
+//!   then compiled already, so that making is its specialization and Metal's pipeline compile).
+//!   Under `PipelineWaitPolicy::Bounded` (the default) each making is handed to the device's
+//!   pool, kept by the state's piece holds as a dispatch's is, and the creation waits for them
+//!   together, within one `pipeline_creation_wait` of the policy (4.5 s by default), as a render
+//!   state's does (`render.rs`): a driver's cold compile holds the thread creating the state,
+//!   which a host may create inside a command buffer's encoding, no longer, and a dispatch that
+//!   finds a making in flight takes it, its command buffer waiting a bound for it in turn
+//!   (`WorkCounts::creations_left_making`). A making still running then may run past the state's
+//!   release, holding the variant and the device until it ends. Under `PipelineWaitPolicy::Exact`
+//!   the first runs on the creating thread and the other on the pool, both ended before the
+//!   creation returns: none runs past the state's release, which would hold the variant and the
+//!   device past the program's last drop, which Metal's never does. Their specialized notices
+//!   wait for the first dispatch that takes each, which announces them naming what it binds. A creation inside a host step, a tile function's state and a stand-in compile
+//!   make nothing here, nor does the creation of a large kernel's state whose dispatches of whole
+//!   threadgroups run on its partial-threadgroups variant (`compute::partial_direct`), which the
+//!   creation does not compile: no dispatch would take the base's region, and its first dispatch
+//!   hands the variant's making to the pool.
 //! - **Where the request states no threadgroup, the creation predicts nothing**, because nothing
 //!   in the request answers what the dispatch will ask for. The local size is the dispatch's own
 //!   call, and a size guessed from the state instead -- Apple's guide to threadgroup sizes
@@ -73,8 +80,9 @@ use super::kept;
 use super::making::{Begun, Pending, Ticket};
 use super::objects::RawPipeline;
 use super::piece_holds::PieceHolds;
-use super::pool::Place;
-use super::{ComputePipelineState, RegionKey, Variant};
+use super::pool::{Joined, Place};
+use super::region_ledger;
+use super::{ComputePipelineState, Kernel, RegionKey, Variant};
 use crate::degradation::{BoundFormats, Occurrence};
 use crate::error::Error;
 use crate::Device;
@@ -98,6 +106,8 @@ pub(crate) enum RegionHeld {
     Making(Arc<Variant>, RegionKey, Box<Ticket<RegionKey, RawPipeline>>),
     /// What a making gives back once settled, held until let go of: its variant.
     Made { _variant: Arc<Variant> },
+    /// A unit-axes variant's translation (`unit_axes.rs`), and what it gives back.
+    Compile(Box<super::unit_axes::CompilePiece>),
 }
 
 impl RegionKey {
@@ -141,7 +151,9 @@ impl Variant {
         formats: BoundFormats<'_>,
     ) -> RegionPipeline {
         let key = RegionKey::of(region);
-        match self.pipelines.begin(&key) {
+        let begun = self.pipelines.begin(&key);
+        region_ledger::let_go(self.objects.device.shared());
+        match begun {
             Begun::Made(made) => {
                 self.first_use(&made, &key, formats);
                 RegionPipeline::Made(made)
@@ -165,7 +177,7 @@ impl Variant {
                 match residual {
                     // Handed to the pool: nothing waits for the making.
                     Some(made) => {
-                        counts.residual_form_making();
+                        counts.thread().residual_form_making();
                         RegionPipeline::Made(made)
                     }
                     None => RegionPipeline::Making(pending),
@@ -195,7 +207,12 @@ impl Variant {
         };
         let made = self.pipelines.made(&residual)?;
         self.first_use(&made, &residual, formats);
-        self.objects.device.shared().counts.residual_form_drawn();
+        self.objects
+            .device
+            .shared()
+            .counts
+            .thread()
+            .residual_form_drawn();
         Some(made)
     }
 
@@ -224,51 +241,106 @@ impl Variant {
     }
 
     /// Make the `VkPipeline` of the region a first dispatch of a state of `descriptor` on this
-    /// variant, its base, is predicted to take (the module docs), where no caller made or began
-    /// it: its notices wait for the first dispatch that takes it. Under
-    /// `PipelineWaitPolicy::Bounded` handed to the device's pool, kept by `holds`, the state's,
-    /// and waited for the policy's `pipeline_creation_wait` at most; under `Exact` made on this
-    /// thread. A
-    /// descriptor that requires no threadgroup size predicts no region at all, and a prediction
-    /// the plan refuses or that runs on another variant makes nothing; a failed making is not
-    /// kept and refuses nothing, its dispatch meeting it as before.
-    pub(super) fn make_at_creation(
+    /// variant, its base, is predicted to take (the module docs), and where that region differs
+    /// from its residual form (`render/residual.rs`: a storage view read at its bind offset, on a
+    /// profile whose storage views declare the key), the residual form's beside it, which a
+    /// dispatch binding those views elsewhere takes at once; each where no caller made or began
+    /// it, its notices waiting for the first dispatch that takes it. The two are made together,
+    /// never one after the other. Under `PipelineWaitPolicy::Bounded` each is handed to the
+    /// device's pool, kept by `holds`, the state's, and, where `waited` (a creation's), waited for
+    /// within one `pipeline_creation_wait` of the policy (a recovery's making again of the state
+    /// waits for none, `pipeline/carry.rs`); under `Exact` the first is made on this thread and
+    /// the other on the pool, joined before the creation returns. A descriptor that requires no
+    /// threadgroup size predicts no region at all, and a prediction the plan refuses or that runs
+    /// on another variant makes nothing, the partial-threadgroups variant of a large kernel among
+    /// them (`compiled`, the creation's compile of the descriptor's kernel, says whether its
+    /// kernel is such: `ComputePipelineState::whole_on_partial`); a failed making is not kept and
+    /// refuses nothing, its dispatch meeting it as before.
+    pub(super) fn make_predicted(
         self: &Arc<Self>,
         device: &Device,
-        descriptor: &ComputePipelineDescriptor,
+        (descriptor, compiled): (&ComputePipelineDescriptor, &Kernel),
         holds: &Arc<PieceHolds<RegionHeld>>,
+        waited: bool,
     ) {
         if crate::exit_guard::in_host_step() {
             return;
         }
-        let Some(key) = self.predicted_region(device, descriptor) else {
+        let Some(key) = self.predicted_region(device, descriptor, compiled) else {
             return;
         };
-        let Begun::Yours(ticket) = self.pipelines.begin(&key) else {
-            return;
-        };
+        let constants = &self.pipeline.stage.specialization.constants;
+        let residual =
+            super::residual_form(constants.iter(), &key.specialization).map(|specialization| {
+                RegionKey {
+                    specialization,
+                    ..key.clone()
+                }
+            });
+        let begun: Vec<_> = std::iter::once(key)
+            .chain(residual)
+            .filter_map(|key| match self.pipelines.begin(&key) {
+                Begun::Yours(ticket) => Some((key, ticket)),
+                Begun::Made(_) | Begun::Pending(_) => None,
+            })
+            .collect();
         let policy = device.compile_device().policy();
         if policy.pipeline_waits == PipelineWaitPolicy::Bounded {
-            let pending = ticket.pending();
-            pending.queued_at(self.pooled(holds, key, ticket, true));
+            let pending: Vec<_> = begun
+                .into_iter()
+                .map(|(key, ticket)| {
+                    let pending = ticket.pending();
+                    pending.queued_at(self.pooled(holds, key, ticket, true));
+                    pending
+                })
+                .collect();
             // A making still running at the bound goes on for the dispatches that take it.
-            if pending
-                .wait_until(Instant::now() + policy.pipeline_creation_wait)
-                .is_none()
-            {
-                device.shared().counts.creation_left_making();
+            let deadline = Instant::now() + policy.pipeline_creation_wait;
+            for making in pending.iter().filter(|_| waited) {
+                if making.wait_until(deadline).is_none() {
+                    device.shared().counts.creation_left_making();
+                }
             }
             return;
         }
+        let mut pending = Vec::with_capacity(begun.len());
+        let pieces: Vec<Joined<()>> = begun
+            .into_iter()
+            .map(|(key, ticket)| {
+                pending.push(ticket.pending());
+                let variant = Arc::clone(self);
+                Box::new(move || variant.make_at_creation(key, ticket)) as Joined<()>
+            })
+            .collect();
+        if pieces.is_empty() {
+            return;
+        }
+        // The full join: every key begun here is settled before the creation returns, each a
+        // dispatch finds in flight hastened through its place.
+        drop(
+            device
+                .shared()
+                .pipeline_pool
+                .join_all(pieces, true, |index, place| {
+                    if let Some(pending) = pending.get(index) {
+                        pending.queued_at(place.clone());
+                    }
+                }),
+        );
+    }
+
+    /// Make `key`'s `VkPipeline` for a creation under `PipelineWaitPolicy::Exact`
+    /// ([`make_predicted`](Self::make_predicted)), wherever its piece runs, and settle `ticket`
+    /// with it: counted as the creation's making, its notices waiting for the first dispatch
+    /// that takes it. Dropped unrun (the process exiting), the ticket fails the making.
+    fn make_at_creation(&self, key: RegionKey, ticket: Ticket<RegionKey, RawPipeline>) {
         let made = self
             .objects
             .pipeline(&key, Notices::FirstDraw)
             .map(|made| made.kept_at(&self.objects, kept::Place::Region(key.clone())));
         if made.is_ok() {
-            device
-                .shared()
-                .counts
-                .creation_pipeline_made(crate::work_counts::Predicted::Dispatch);
+            let counts = &self.objects.device.shared().counts;
+            counts.creation_pipeline_made(crate::work_counts::Predicted::Dispatch);
         }
         drop(ticket.settle(made));
     }
@@ -277,15 +349,21 @@ impl Variant {
     /// (the module docs): one `dispatchThreadgroups:` threadgroup of [`predicted_threads`],
     /// planned for [`predicted_bindings`]. `None` where `descriptor` requires no threadgroup
     /// size, so the request names none to predict; and where it plans or instantiates no region,
-    /// or runs on another variant (a threadgroup the kernel's simd tier cannot run whole).
+    /// or runs on another variant (a threadgroup the kernel's simd tier cannot run whole, or a
+    /// large kernel's dispatch of whole threadgroups, on its partial-threadgroups variant).
     fn predicted_region(
         &self,
         device: &Device,
         descriptor: &ComputePipelineDescriptor,
+        compiled: &Kernel,
     ) -> Option<RegionKey> {
         // The threadgroup first, before anything is planned: where the request states none there
         // is no region to predict, and the plan below would be built for a key nobody makes.
         let threads_per_group = predicted_threads(descriptor.required_threads_per_threadgroup)?;
+        // One threadgroup, a grid of one row where it is one row.
+        if super::whole_on_partial(self, compiled, threads_per_group[1..] == [1, 1]) {
+            return None;
+        }
         let state = predicted_bindings(&self.pipeline);
         let plan = self.plan(device, &state.shape()).ok()?;
         let dispatch = Dispatch::Threadgroups {
@@ -358,7 +436,7 @@ impl ComputePipelineState {
         region: &DispatchRegion,
         formats: BoundFormats<'_>,
     ) -> RegionPipeline {
-        let holds = &self.0.program.pieces;
+        let holds = &self.0.program().pieces;
         variant.begin_region_pipeline(holds, (region, self.is_tile()), formats)
     }
 }
@@ -376,7 +454,7 @@ fn predicted_threads(required: Option<[u32; 3]>) -> Option<[u32; 3]> {
 /// What the predicted first dispatch of `pipeline`'s kernel binds (the module docs): Metal's
 /// default sampler (`MTLSamplerDescriptor`'s defaults) at each runtime sampler slot that does not
 /// compare, and nothing else.
-fn predicted_bindings(pipeline: &ComputePipeline) -> BindState {
+pub(super) fn predicted_bindings(pipeline: &ComputePipeline) -> BindState {
     let mut state = BindState::default();
     for (slot, used) in &pipeline.interface.slots {
         if let SlotInterface::Sampler(sampler) = used {

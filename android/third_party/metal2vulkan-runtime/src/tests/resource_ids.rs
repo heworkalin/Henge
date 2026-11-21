@@ -2,8 +2,18 @@
 //! space per kind of resource; placed IDs, reservations, and each ID's slot, whose generation
 //! changes with its holder.
 
-use crate::resource_ids::{Holder, IdHold, IdPlacement, IdSpace, ResourceId, ResourceIds};
-use std::sync::{Arc, Mutex, Weak};
+use super::capabilities::{committed_descriptions, created};
+use crate::resource_ids::{
+    check_capacity, texture_arrays, ArrayBound, Holder, IdHold, IdPlacement, IdSpace, PassingHolds,
+    ResourceId, ResourceIds,
+};
+use crate::Error;
+use metal2vulkan::bind::HANDLE_TABLE_CAPACITY;
+use metal2vulkan::device::{Device, DevicePolicy, VkLimit};
+use metal2vulkan::error::{Capability, Feature, Unsupported};
+use std::collections::BTreeMap;
+use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::time::Duration;
 
 fn ids() -> Arc<Mutex<ResourceIds>> {
     Arc::default()
@@ -669,4 +679,111 @@ fn ids_held_twice_come_back_as_metal_s_pool_gives_them() {
             "{reserved:?}, {made} made, {released:?} given back"
         );
     }
+}
+
+/// A set-1 image array reaches no further than the handle table (`HANDLE_TABLE_CAPACITY`, 65536
+/// entries, link's cap on every heap array) on every committed profile, so a texture ID past it is
+/// refused as not implemented rather than taken where no array holds it: MoltenVK's and lavapipe's
+/// update-after-bind image limits of 1,000,000 and more, and RADV's, ANV's and NVIDIA's, read
+/// alone, reached past it. Where a device limit is the lesser (the desktop baseline's 128 sampled
+/// and 8 storage images a stage), the refusal names it.
+#[test]
+fn texture_arrays_reach_no_further_than_the_handle_table() {
+    let reach = u64::from(HANDLE_TABLE_CAPACITY);
+    let table = (reach, ArrayBound::HandleTable);
+    let refused = |id: u64, array: (u64, ArrayBound)| match check_capacity(id, array) {
+        Ok(()) => None,
+        Err(Error::Unsupported(u)) => Some(u),
+        Err(other) => panic!("{other:?}"),
+    };
+    let mut arrays = BTreeMap::new();
+    for (stem, desc) in committed_descriptions() {
+        let (enabled, _) = created(&stem, &desc);
+        let compile = Device::new(enabled, DevicePolicy::UNTRUSTED).unwrap();
+        for array in texture_arrays(compile.profile()) {
+            assert!(array.0 <= reach, "{stem}: {array:?}");
+            if array.0 > 0 {
+                assert_eq!(refused(array.0 - 1, array), None, "{stem}: {array:?}");
+            }
+            let past = refused(array.0, array).unwrap();
+            let want = match array.1 {
+                ArrayBound::HandleTable => {
+                    Unsupported::not_implemented(Feature::ArgumentBufferTextures)
+                }
+                ArrayBound::Limit(limit) => Unsupported::needs(
+                    Feature::ArgumentBufferTextures,
+                    Capability::Limit {
+                        limit,
+                        required: array.0 + 1,
+                        available: array.0,
+                    },
+                ),
+            };
+            assert_eq!(past, want, "{stem}");
+        }
+        arrays.insert(stem, texture_arrays(compile.profile()));
+    }
+    let limit = |n: u64, limit: VkLimit| (n, ArrayBound::Limit(limit));
+    for (stem, want) in [
+        ("moltenvk-m3", [table, table]),
+        ("lavapipe", [table, table]),
+        ("amd-780m-radv", [table, table]),
+        ("intel-irisxe-rplp-anv", [table, table]),
+        ("nvidia-rtx5080-laptop", [table, table]),
+        (
+            "lunarg-desktop-baseline-2023",
+            [
+                limit(
+                    128,
+                    VkLimit::MaxPerStageDescriptorUpdateAfterBindSampledImages,
+                ),
+                limit(
+                    8,
+                    VkLimit::MaxPerStageDescriptorUpdateAfterBindStorageImages,
+                ),
+            ],
+        ),
+    ] {
+        assert_eq!(arrays.get(stem), Some(&want), "{stem}");
+    }
+}
+
+/// The last passing hold to end signals only where a making waits (`PassingHolds::end`): holds
+/// that end with no making waiting signal nothing, and a making that waits for holds under way
+/// goes on once the last of them ends, however the two race.
+#[test]
+fn a_making_waiting_for_passing_holds_goes_on_as_the_last_ends_and_no_hold_signals_alone() {
+    let holds = PassingHolds::default();
+    for _ in 0..1000 {
+        holds.begin();
+        holds.end();
+    }
+    assert_eq!(
+        holds.signals(),
+        0,
+        "a hold that ended with no making waiting signalled"
+    );
+    let holds = &holds;
+    for round in 0..2000u32 {
+        holds.begin();
+        holds.begin();
+        let (done, went) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                holds.wait();
+                done.send(()).unwrap();
+            });
+            // Every 16th round, the making surely waits before the holds end.
+            if round % 16 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            holds.end();
+            holds.end();
+            assert!(
+                went.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "round {round}: the making never went on"
+            );
+        });
+    }
+    assert!(holds.signals() > 0, "no making waited for a hold's signal");
 }

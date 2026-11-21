@@ -2,15 +2,26 @@
 //! what the first already did, as Metal programs get from the OS.
 //!
 //! - **The directory.** [`ShaderCacheOptions::directory`], or the platform's per-user cache
-//!   directory: `~/Library/Caches/metal2vulkan` on macOS, `$XDG_CACHE_HOME/metal2vulkan`
-//!   elsewhere, or `~/.cache/metal2vulkan` when that is unset or not absolute. Never the OS temp
-//!   directory. Creating or adopting a device makes it (owner-only) and checks that it takes a
-//!   write; if not, the call fails with [`Error::ShaderCache`], naming the path and the I/O error.
-//!   After that, a failed read or write is a miss the [statistics](ShaderCacheStatistics) count,
-//!   never an error.
+//!   directory: `%LOCALAPPDATA%\metal2vulkan` on Windows, `~/Library/Caches/metal2vulkan` on
+//!   macOS, `$XDG_CACHE_HOME/metal2vulkan` elsewhere, or `~/.cache/metal2vulkan` when that is
+//!   unset or not absolute. Never the OS temp directory. Creating or adopting a device makes it
+//!   (owner-only) and checks that it takes a write. A directory the caller named that does not
+//!   fails the call with [`Error::ShaderCache`], naming the path and the I/O error: the caller's
+//!   own choice. The default is the runtime's, and Metal makes its device whatever its shader
+//!   cache does: where the caller named none and the default does not exist (the variable it is
+//!   found by unset or not absolute) or takes no write, the device keeps its cache in memory
+//!   alone ([`Device::shader_cache_directory`] is `None`). It reads and writes no directory,
+//!   encodes no entry for one but a translated function (whose encoding weighs it in the memo),
+//!   counts each entry it does not write in
+//!   [`write_failures`](ShaderCacheStatistics::write_failures), and says so once as it is made,
+//!   as the degrade notice
+//!   [`Degradation::ShaderCacheEntryNotWritten`](crate::Degradation::ShaderCacheEntryNotWritten)
+//!   naming why. After that, a failed read or write is a miss the
+//!   [statistics](ShaderCacheStatistics) count, never an error.
 //! - **What it holds.** The compile layer's artifacts in their self-checking envelope: translated
-//!   functions under their [`FunctionCompileKey`] and compute and render pipelines under their
-//!   [`PipelineKey`]; and the driver's `VkPipelineCache` data, one record per family of makings
+//!   functions under their [`FunctionCompileKey`] and render pipelines under their
+//!   [`PipelineKey`] (a compute pipeline is linked from its function, never kept,
+//!   `pipeline/sources.rs`); and the driver's `VkPipelineCache` data, one record per family of makings
 //!   that convert the same stages, named by what a stage's conversion reads (`driver.rs`); and
 //!   what render creations work out from their descriptors before their compiles, under the
 //!   descriptor's key (`creation.rs`).
@@ -58,6 +69,7 @@
 //!   variant's link asks once per stage; the answer is kept under exactly that key (`held.rs`),
 //!   so a sweep of pipeline states over one function pair asks it once rather than once a state.
 
+mod chunks;
 mod creation;
 mod libraries;
 /// The name of a creation's record under a runtime version, which `tests::shader_cache` reads.
@@ -71,6 +83,7 @@ pub(crate) use creation::VariantStages;
 pub(crate) mod driver;
 mod held;
 pub(super) mod store;
+pub(crate) mod warm_refusals;
 pub(super) mod worker;
 
 use super::error::{invalid, Error, Problem, ShaderCacheError};
@@ -82,8 +95,9 @@ use creation::CreationMemo;
 use driver::{LiveCaches, Making, Records};
 use metal2vulkan::cache::{Hash256, PipelineArtifact, PipelineKey};
 use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
-use metal2vulkan::pipeline::{ComputePipeline, RenderPipeline};
+use metal2vulkan::pipeline::RenderPipeline;
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -102,7 +116,10 @@ pub const DEFAULT_MEMORY_CAPACITY: u64 = 256 << 20;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShaderCacheOptions {
     /// The cache directory; `None` is the platform's per-user cache directory (the module's
-    /// documentation names it). Devices of different processes and builds may share one.
+    /// documentation names it), and where that does not exist or takes no write, no directory:
+    /// the device keeps its cache in memory alone and says so. A directory named here that cannot
+    /// be made or written fails the device's creation ([`Error::ShaderCache`]). Devices of
+    /// different processes and builds may share one.
     pub directory: Option<PathBuf>,
     /// The most bytes the directory holds, every build's entries together; past it the least
     /// recently used entries are removed, the device's first removal said once as a warning.
@@ -192,20 +209,15 @@ pub struct ShaderCacheStatistics {
     /// Artifact lookups that found nothing usable, for any reason; each was compiled.
     pub misses: u64,
     /// Of [`hits`](Self::hits), those of a translated function: a creation asks for one per stage
-    /// it compiles. The three kinds are counted apart because only the kind says which artifact a
+    /// it compiles. The two kinds are counted apart because only the kind says which artifact a
     /// lookup decoded, and they differ in size and in how often a creation stores one -- a
     /// creation that makes one answered lookup and one unanswered one cannot be read off the
-    /// whole counts.
+    /// whole counts. A compute or tile state looks up its function alone: its pipeline is linked
+    /// from it (`pipeline/sources.rs`'s `kernel`).
     pub function_hits: u64,
     /// Of [`misses`](Self::misses), those of a translated function: each one a function
     /// translated.
     pub function_misses: u64,
-    /// Of [`hits`](Self::hits), those of a compiled compute pipeline: a compute or tile state's
-    /// whole artifact, which such a creation stores on every miss
-    /// (`pipeline/sources.rs`'s `kernel`).
-    pub compute_pipeline_hits: u64,
-    /// Of [`misses`](Self::misses), those of a compiled compute pipeline.
-    pub compute_pipeline_misses: u64,
     /// Of [`hits`](Self::hits), those of a compiled render pipeline: a render state's whole
     /// artifact, which such a creation stores only where linking a variant again would translate
     /// (`pipeline/sources.rs`'s `linked_render`), so a warm render creation decodes none of
@@ -236,7 +248,9 @@ pub struct ShaderCacheStatistics {
     /// Lookups answered from an entry the cache thread had not written yet: a translation or
     /// compile not run, counted in [`hits`](Self::hits) as a read of the file is.
     pub queued_hits: u64,
-    /// Entries that could not be written, by whichever thread wrote them.
+    /// Entries that could not be written, by whichever thread wrote them. On a device with no
+    /// directory (the module docs), each translated function, render pipeline, creation answer
+    /// and library its creations would have given the directory.
     pub write_failures: u64,
     /// Entries removed to keep the directory under its cap.
     pub evictions: u64,
@@ -250,7 +264,10 @@ pub struct ShaderCacheStatistics {
     /// `APPLICATION_PIPELINE_CACHE_HIT`, or every stage's feedback is valid and says it. Drivers
     /// differ in where they say it: most for the whole pipeline; MoltenVK 1.4.1 for each stage
     /// alone, whose Metal function it found converted in the cache (its whole pipeline's
-    /// feedback is only ever valid).
+    /// feedback is only ever valid). The runtime's own pipelines (its copies, resolves and
+    /// kernels) count as the program's do; where the device links render pipelines from graphics
+    /// pipeline libraries, each library of shaders is such a making (its pre-rasterization or
+    /// fragment shader part), and the link itself is none.
     pub driver_pipeline_hits: u64,
     /// Such pipelines whose valid feedback says no hit, for the whole pipeline or for every
     /// stage: compiled, or a stage converted again.
@@ -287,6 +304,8 @@ pub struct ShaderCacheStatistics {
 #[repr(u32)]
 pub(crate) enum EntryKind {
     Function = 1,
+    /// A compiled compute pipeline: a binary archive's entry. The directory keeps none: a
+    /// creation links its compute pipeline from its function (`pipeline/sources.rs`).
     ComputePipeline = 2,
     // 3 named the device's one driver cache entry, retired.
     RenderPipeline = 4,
@@ -302,6 +321,8 @@ pub(crate) enum EntryKind {
     VariantPipeline = 10,
     /// A library a pipeline record names, in the content directory (`libraries.rs`).
     Library = 11,
+    /// The failure a warm pass's creation of a record met for good (`warm_refusals.rs`).
+    WarmRefusal = 12,
 }
 
 /// The translations this build reads and writes: the SHA-256 of the crate's version, both artifact
@@ -321,61 +342,102 @@ pub(crate) fn this_build() -> Hash256 {
     hash.finalize().into()
 }
 
-/// The platform's per-user cache directory for this crate.
-fn default_directory() -> Result<PathBuf, ShaderCacheError> {
+/// The platform's per-user cache directory for this crate, from the variables `environment`
+/// reads (`std::env::var_os` for a device, a test's own for a test): `%LOCALAPPDATA%\metal2vulkan`
+/// on Windows, `~/Library/Caches/metal2vulkan` on macOS, `$XDG_CACHE_HOME/metal2vulkan`
+/// elsewhere, or `~/.cache/metal2vulkan` when that is unset or not absolute. `None` where the
+/// variable it is found by is unset or not absolute ([`NO_DEFAULT`]).
+pub(super) fn default_directory(environment: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let absolute = |name: &str| {
-        std::env::var_os(name)
+        environment(name)
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
     };
-    let home = || {
-        absolute(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| {
-            ShaderCacheError::new(
-                None,
-                std::io::ErrorKind::NotFound,
-                "no home directory for the default shader cache directory",
-            )
-        })
-    };
+    if cfg!(windows) {
+        return absolute("LOCALAPPDATA").map(|base| base.join("metal2vulkan"));
+    }
     if cfg!(target_os = "macos") {
-        return Ok(home()?.join("Library/Caches/metal2vulkan"));
+        return absolute("HOME").map(|home| home.join("Library/Caches/metal2vulkan"));
     }
     match absolute("XDG_CACHE_HOME") {
-        Some(base) => Ok(base.join("metal2vulkan")),
-        None => Ok(home()?.join(".cache/metal2vulkan")),
+        Some(base) => Some(base.join("metal2vulkan")),
+        None => absolute("HOME").map(|home| home.join(".cache/metal2vulkan")),
     }
 }
 
+/// Why [`default_directory`] finds none, as its device's notice says it.
+const NO_DEFAULT: &str = if cfg!(windows) {
+    "`LOCALAPPDATA` is unset or not an absolute path"
+} else if cfg!(target_os = "macos") {
+    "`HOME` is unset or not an absolute path"
+} else {
+    "neither `XDG_CACHE_HOME` nor `HOME` is an absolute path"
+};
+
 /// A device's shader cache as its options set it up, before the device is made: the directory
-/// opened for this build, and the memo's cap.
+/// opened for this build, or why it keeps none, and the memo's cap.
 #[derive(Clone, Debug)]
 pub(super) struct CacheSetup {
-    directory: Directory,
+    directory: Result<Directory, Unkept>,
     memory_capacity: u64,
 }
 
+/// Why a device keeps no shader cache directory (the module docs), which its creation announces
+/// ([`Store::announce_no_directory`]).
+#[derive(Clone, Debug)]
+struct Unkept {
+    /// The directory it does not have: the default one, by its path where there is one.
+    object: String,
+    /// Why.
+    reason: String,
+}
+
 impl CacheSetup {
-    /// The cache `options` describe: its directory opened for this build. `call` names the
-    /// creating call.
+    /// The cache `options` describe: its directory opened for this build, the platform's default
+    /// found in the process's environment. `call` names the creating call.
     pub(super) fn of(
         options: &ShaderCacheOptions,
         call: &'static str,
     ) -> Result<CacheSetup, Error> {
+        CacheSetup::of_in(options, call, |name| std::env::var_os(name))
+    }
+
+    /// [`CacheSetup::of`], the platform's default directory found by the variables `environment`
+    /// reads ([`default_directory`]). A directory `options` name that cannot be used fails it;
+    /// where they name none and the default does not exist or cannot be used, the cache has no
+    /// directory (the module docs).
+    pub(super) fn of_in(
+        options: &ShaderCacheOptions,
+        call: &'static str,
+        environment: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<CacheSetup, Error> {
         if options.capacity == 0 || options.memory_capacity == 0 {
             return Err(invalid(call, Problem::ShaderCacheCapacity));
         }
-        let root = match &options.directory {
-            Some(directory) => directory.clone(),
-            None => default_directory().map_err(Error::ShaderCache)?,
-        };
-        let directory =
-            Directory::open(root, this_build(), options.capacity).map_err(|failed| {
+        let open = |root: PathBuf| Directory::open(root, this_build(), options.capacity);
+        let directory = match &options.directory {
+            Some(directory) => Ok(open(directory.clone()).map_err(|failed| {
                 Error::ShaderCache(ShaderCacheError::new(
                     Some(failed.path),
                     failed.error.kind(),
                     &failed.error.to_string(),
                 ))
-            })?;
+            })?),
+            None => match default_directory(environment) {
+                Some(root) => open(root.clone()).map_err(|failed| Unkept {
+                    object: format!("the default shader cache directory {}", root.display()),
+                    reason: format!(
+                        "{} cannot be made or written: {}",
+                        failed.path.display(),
+                        failed.error
+                    ),
+                }),
+                None => Err(Unkept {
+                    object: "the default shader cache directory".to_owned(),
+                    reason: format!("there is none: {NO_DEFAULT}"),
+                }),
+            },
+        };
         Ok(CacheSetup {
             directory,
             memory_capacity: options.memory_capacity,
@@ -429,7 +491,15 @@ impl ShaderCache {
             memory_capacity,
         } = setup;
         let asked = Arc::new(Asked::new());
-        let store = Arc::new(Store::new(directory, sink, Some(Arc::clone(&asked))));
+        let store = match directory {
+            Ok(directory) => Store::new(directory, sink, Some(Arc::clone(&asked))),
+            Err(unkept) => {
+                let store = Store::without_directory(this_build(), sink);
+                store.announce_no_directory(unkept.object, &unkept.reason);
+                store
+            }
+        };
+        let store = Arc::new(store);
         let worker = Worker::start(Arc::clone(&store), asked)?;
         Ok(ShaderCache {
             memo: PipelineMemo::new(memory_capacity),
@@ -452,6 +522,12 @@ impl ShaderCache {
     /// device's check of textures over host pages keeps its verdicts there, `in_place.rs`).
     pub(crate) fn content_store(&self) -> &Store {
         &self.store
+    }
+
+    /// A share of [`content_store`](Self::content_store), for a thread that holds no device
+    /// (`queue_switch_check.rs`).
+    pub(crate) fn content_store_share(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
     }
 
     /// Destroy the `VkPipelineCache` of every record the device holds, then stop the cache
@@ -573,11 +649,14 @@ impl ShaderCache {
         compile: &metal2vulkan::device::Device,
         key: &FunctionCompileKey,
     ) -> bool {
+        if !self.store.has_directory() {
+            return false;
+        }
         let profile = compile.profile_fingerprint();
         self.held
             .holds((key.digest(), &profile), self.store.removals(), || {
                 let name = entry_name(
-                    self.store.directory().build(),
+                    self.store.build(),
                     EntryKind::Function,
                     key.digest(),
                     &profile,
@@ -586,7 +665,9 @@ impl ShaderCache {
             })
     }
 
-    /// Keep `function`, which `compile` compiled; its encoded length.
+    /// Keep `function`, which `compile` compiled; its encoded length, which weighs it in the memo
+    /// whether or not the directory takes it (encoded on a device with no directory too, which
+    /// counts it as not written).
     pub(super) fn store_function(
         &self,
         compile: &metal2vulkan::device::Device,
@@ -597,32 +678,6 @@ impl ShaderCache {
             function.key().digest(),
             compile,
             function.to_bytes(),
-        )
-    }
-
-    /// The compute pipeline `compile` compiled under `key`, from the cache, and its encoded
-    /// length.
-    pub(super) fn load_compute_pipeline(
-        &self,
-        compile: &metal2vulkan::device::Device,
-        key: &PipelineKey,
-    ) -> Option<(ComputePipeline, u64)> {
-        self.load(Looked::ComputePipeline, key.digest(), compile, |bytes| {
-            ComputePipeline::from_bytes_for_key(bytes, key, compile)
-        })
-    }
-
-    /// Keep `pipeline`, which `compile` compiled; its encoded length.
-    pub(super) fn store_compute_pipeline(
-        &self,
-        compile: &metal2vulkan::device::Device,
-        pipeline: &ComputePipeline,
-    ) -> u64 {
-        self.store(
-            EntryKind::ComputePipeline,
-            pipeline.key().digest(),
-            compile,
-            pipeline.to_bytes(),
         )
     }
 
@@ -638,18 +693,23 @@ impl ShaderCache {
         })
     }
 
-    /// Keep `pipeline`, which `compile` compiled; its encoded length.
+    /// Keep `pipeline`, which `compile` compiled; its encoded length. `None` on a device with no
+    /// directory, which encodes nothing and counts it as not written.
     pub(super) fn store_render_pipeline(
         &self,
         compile: &metal2vulkan::device::Device,
         pipeline: &RenderPipeline,
-    ) -> u64 {
-        self.store(
+    ) -> Option<u64> {
+        if !self.store.has_directory() {
+            self.store.write_failed();
+            return None;
+        }
+        Some(self.store(
             EntryKind::RenderPipeline,
             pipeline.key().digest(),
             compile,
             pipeline.to_bytes(),
-        )
+        ))
     }
 
     /// The entry of `looked`'s kind under `key` for `compile`'s profile, as `decode` accepts it,
@@ -664,7 +724,7 @@ impl ShaderCache {
     ) -> Option<(T, u64)> {
         let counters = &self.store.counters;
         let name = entry_name(
-            self.store.directory().build(),
+            self.store.build(),
             looked.kind(),
             key,
             &compile.profile_fingerprint(),
@@ -695,7 +755,7 @@ impl ShaderCache {
     ) -> u64 {
         let counters = &self.store.counters;
         let name = entry_name(
-            self.store.directory().build(),
+            self.store.build(),
             kind,
             key,
             &compile.profile_fingerprint(),
@@ -709,6 +769,12 @@ impl ShaderCache {
             self.worker.evict();
         }
         length
+    }
+
+    /// The directory's root, which every generation of the device's line shares
+    /// (`device/line.rs`, `Device::shader_cache_directory`); `None` where it keeps none.
+    pub(super) fn directory_root(&self) -> Option<PathBuf> {
+        (self.store.directory()).map(|directory| directory.root().to_owned())
     }
 
     /// What the directory cost this device: its time, the asking threads' apart from the cache
@@ -734,8 +800,6 @@ impl ShaderCache {
             misses: read(&counters.misses),
             function_hits: read(&counters.hits_by[Looked::Function as usize]),
             function_misses: read(&counters.misses_by[Looked::Function as usize]),
-            compute_pipeline_hits: read(&counters.hits_by[Looked::ComputePipeline as usize]),
-            compute_pipeline_misses: read(&counters.misses_by[Looked::ComputePipeline as usize]),
             render_pipeline_hits: read(&counters.hits_by[Looked::RenderPipeline as usize]),
             render_pipeline_misses: read(&counters.misses_by[Looked::RenderPipeline as usize]),
             rejected: read(&counters.rejected),
@@ -762,11 +826,19 @@ impl ShaderCache {
 impl Device {
     /// The device's shader cache counts since it was made. No Metal counterpart.
     pub fn shader_cache_statistics(&self) -> ShaderCacheStatistics {
+        self.current().shader_cache_statistics_now()
+    }
+
+    /// [`Device::shader_cache_statistics`] on the generation that serves (`device/line.rs`).
+    pub(crate) fn shader_cache_statistics_now(&self) -> ShaderCacheStatistics {
         self.shared().shader_cache.statistics()
     }
 
-    /// The device's shader cache directory. No Metal counterpart.
-    pub fn shader_cache_directory(&self) -> &Path {
-        self.shared().shader_cache.store.directory().root()
+    /// The device's shader cache directory, the same through its GPU's recoveries; `None` where
+    /// the device keeps its cache in memory alone: its options named no directory and the
+    /// platform's default ([`ShaderCacheOptions::directory`]) does not exist or takes no write, as
+    /// its creation announced. No Metal counterpart: Metal keeps its shader cache to itself.
+    pub fn shader_cache_directory(&self) -> Option<&Path> {
+        self.line().invariant.cache_directory.as_deref()
     }
 }

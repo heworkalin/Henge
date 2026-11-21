@@ -17,8 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <stdint.h>
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
@@ -358,6 +360,37 @@ static void vmapple_serial_out(void *opaque, uint8_t c) {
     if (n < sizeof line - 1) line[n++] = (char) c;
 }
 
+#if defined(__ANDROID__)
+/* Guest RAM as a dma-buf from `heap` (`/dev/dma_heap/system` by default): the allocation's
+ * descriptor, or -1. The nodes are 0444, so an unprivileged process opens its own, and the ioctl
+ * needs no capability (measured: 2 GiB from `shell`, `work/dmatest`). */
+static int henge_dmabuf(const char *heap, size_t bytes) {
+    struct dma_heap_allocation_data {
+        uint64_t len;
+        uint32_t fd;
+        uint32_t fd_flags;
+        uint64_t heap_flags;
+    };
+#define HENGE_DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x00, struct dma_heap_allocation_data)
+    int node = open(heap, O_RDONLY | O_CLOEXEC);
+    if (node < 0) {
+        fprintf(stderr, "hengevm: no dma-buf heap %s: %s\n", heap, strerror(errno));
+        return -1;
+    }
+    struct dma_heap_allocation_data ask = {
+        .len = bytes,
+        .fd = 0,
+        .fd_flags = O_RDWR | O_CLOEXEC,
+        .heap_flags = 0,
+    };
+    int made = ioctl(node, HENGE_DMA_HEAP_IOCTL_ALLOC, &ask) == 0 ? (int)ask.fd : -1;
+    if (made < 0)
+        fprintf(stderr, "hengevm: %s refused %zu bytes: %s\n", heap, bytes, strerror(errno));
+    close(node);
+    return made;
+}
+#endif
+
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
@@ -391,6 +424,33 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
      * punching, which takes a file descriptor.
      */
     if (!getenv("HV_RAM_ANON")) {
+        /* A dma-buf first, where the kernel has one: the GPU then maps the guest's own pages
+         * instead of a copy of them. A `memfd` is file-backed, which is all the views need, but
+         * Vulkan can only import a file as a buffer through a dma-buf (`VK_EXT_external_memory_dma_buf`;
+         * no Android driver has `VK_EXT_external_memory_host`), and a device that cannot import
+         * the pages copies them, in which the runtime drops the GPU's writes and faults the
+         * command buffer that stores into them (measured: 7 faults, then the queue revoked and
+         * the guest waiting forever on a stamp — `docs/gpu-render-bringup-2026-11-21.md`).
+         * `/dev/dma_heap/system` answers a 2 GiB allocation to an unprivileged process here
+         * (tested: `work/dmatest`), and `HV_RAM_NO_DMABUF=1` keeps the memfd for comparison. */
+        if (!getenv("HV_RAM_NO_DMABUF")) {
+            const char *heap = getenv("HV_RAM_DMABUF");
+            int fd = henge_dmabuf(heap && *heap ? heap : "/dev/dma_heap/system", ram_size);
+            if (fd >= 0) b->ram_fd = fd;
+            if (b->ram_fd >= 0) {
+                b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, b->ram_fd, 0);
+                if (b->ram != MAP_FAILED) {
+                    fprintf(stderr, "hengevm: guest RAM (%llu MB) is a dma-buf (fd %d)\n",
+                            (unsigned long long)(ram_size >> 20), b->ram_fd);
+                } else {
+                    fprintf(stderr, "hengevm: mapping the guest RAM dma-buf failed: %s\n",
+                            strerror(errno));
+                    close(b->ram_fd);
+                    b->ram_fd = -1;
+                }
+            }
+        }
+        if (b->ram == MAP_FAILED) {
         int fd = (int)syscall(__NR_memfd_create, "henge-ram", 1 /* MFD_CLOEXEC */);
         if (fd >= 0) {
             if (ftruncate(fd, (off_t)ram_size) == 0)
@@ -402,6 +462,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             } else {
                 close(fd);
             }
+        }
         }
         if (b->ram == MAP_FAILED)
             fprintf(stderr, "hengevm: memfd for guest RAM failed: %s; using anonymous memory "

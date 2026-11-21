@@ -23,7 +23,7 @@
 //!   that continue it, `Instance::continues`), which is known only once the next instance
 //!   begins or the pass ends. So the later instance's commands (its draws, and the barriers
 //!   between them) are kept as they come (`Kept`), and recorded into the primary command buffer
-//!   when its group ends ([`RenderCommandEncoder::flush_inline`]): there the end of the
+//!   when its group ends ([`RenderLowering::flush_inline`]): there the end of the
 //!   instance before it, the barrier, the copies, the steps, the render pass instance's begin,
 //!   and its commands, in their order. The encoder's commands meanwhile record into the command
 //!   buffer before the pass, as for the first instance. Every command keeps its place in
@@ -33,7 +33,7 @@
 //!   before's first (the pass's first instance's go before the pass, into the command buffer
 //!   before it), as each instance's group ends. An instance's writes of the colors the pass
 //!   loads are bounded by its draws' scissors as the end bounds them, the pass's drawn area and
-//!   reach taken as far as the pass has gone ([`RenderCommandEncoder::plan_one`]): the next copy
+//!   reach taken as far as the pass has gone ([`RenderLowering::plan_one`]): the next copy
 //!   takes the texels inside them alone. Where the end would find them unbounded by its time, it
 //!   copies more, never fewer. Where neither the instance's draws nor any command of the encoder
 //!   before them used a shadowed texture, nothing is planned: there is nothing to copy, as the
@@ -41,6 +41,11 @@
 //! - **The kept draws' room** is one the device keeps from an earlier such instance whose pass
 //!   ended ([`SpareKept`]): each draw's recording is written over one left there, so an instance
 //!   of no more draws than an earlier one's allocates nothing for them.
+//! - **Draws kept to draw again** (`render/draw_again.rs`): a plain draw recorded into such an
+//!   instance is kept as any, and so are the kept draws a split re-homes into it; the next draw
+//!   of each is rebound (`render/draw_again/rebound.rs`), its recording kept in the room as
+//!   every step's is, never a Vulkan draw recorded into the pass's command buffer ahead of the
+//!   room's.
 //! - **Admitted** at a split, the new instance's first draw recording: the pass's first instance
 //!   recorded inline, every instance since did, and the instance before is no continuation; the
 //!   pass has no attachment that is a shadowed texture (`shadows::attachments_shadowed`), so the
@@ -51,11 +56,21 @@
 //!   made, no view of another format, multiview, shader-side test, depth stand-in, tile
 //!   dispatch, execution of render commands, pending pipeline, imageblock or visibility query in
 //!   the pass so far, no stand-in arriving with it but memoryless colors' backings (below), and
-//!   no color its draw reads through a snapshot (`render/snapshot.rs`), whose feedback loop
-//!   layout the later render pass would lack. Elsewhere the instance records as before, in a
-//!   secondary, and so does every later one.
-//! - **Render passes and framebuffers** ([`Later`]): one of each per shape and set of
-//!   attachments, made at the first instance that needs it. Two attachment references "are
+//!   no snapshots of its draw that lead it (`render/snapshot.rs`), which run in a render pass
+//!   instance of their own before it. Elsewhere the instance records as before, in a secondary,
+//!   and so does every later one.
+//! - **Colors in the feedback loop layout** (`render_target::Feedback`): an instance whose draw
+//!   reads colors through snapshots inside it, or in place (`render/snapshot.rs`), holds them
+//!   there for its render pass instance, as the pass's end holds a secondary's: its render pass
+//!   and framebuffer are of those colors in that layout (`render_target::final_pass`,
+//!   `render_target::framebuffer`, whose views of them have the usage it needs), and they move
+//!   there from `GENERAL` right before its begin and back right after its end
+//!   (`render_target::moved_barriers`), between the instance before and the barrier after it.
+//!   A later draw of such a reader's colors, or of some of them, records into it, as into a
+//!   secondary's instance; one of another color records into a new instance
+//!   (`RenderCommandEncoder::snapshot_apart`).
+//! - **Render passes and framebuffers** ([`Later`]): one of each per shape, colors in the
+//!   feedback loop layout and set of attachments, made at the first instance that needs it. Two attachment references "are
 //!   compatible if they have matching format and sample count, or are both
 //!   `VK_ATTACHMENT_UNUSED`", so a render pass that leaves a color out for the interlock is not
 //!   compatible with the first instance's, whose framebuffer it cannot begin in: it takes a
@@ -82,11 +97,12 @@ use crate::encoder::EncoderCore;
 use crate::error::Error;
 use crate::render_pass::PassLayout;
 use crate::render_target::{
-    self, Feedback, FramebufferObject, PassShape, Position, RenderPassObject,
+    self, Feedback, FramebufferObject, MovedImage, PassShape, Position, RenderPassObject,
 };
 use crate::render_values::LoadAction;
+use crate::resource::ResourceKey;
 use crate::shadow::ShadowCopy;
-use crate::tracker::{Barrier, LegacyBarrier};
+use crate::tracker::{Barrier, LegacyBarrier, Use};
 use ash::vk;
 use std::sync::Mutex;
 
@@ -102,6 +118,23 @@ pub(super) struct Kept {
     objects: (vk::RenderPass, vk::Framebuffer),
     /// The clears of the memoryless colors' backings that arrived with it, before it.
     clears: Option<Clears>,
+    /// Its colors in the feedback loop layout, moved there right before its render pass instance
+    /// begins and back right after it ends (`render_target::moved_images`); none for an instance
+    /// of no such color.
+    moved: Vec<MovedImage>,
+    /// It is the pass's first instance, kept to continue the render pass instance its command
+    /// buffer's tail holds open (`encoder_fold.rs`'s **Continued passes**): the extent its own
+    /// render pass instance renders over from the origin, where it begins one.
+    first: Option<[u32; 2]>,
+}
+
+/// The instances of a pass whose first instance waits to continue the render pass instance its
+/// command buffer's tail holds open (`Kept::first`), planned while it waits, each with its
+/// copies, in order: at its index among the pass's earlier instances, or the current one
+/// (`None`). Recorded after the first, at the pass's end.
+#[derive(Default)]
+pub(super) struct Waiting {
+    later: Vec<(Option<usize>, Vec<ShadowCopy>)>,
 }
 
 /// Where a [`Kept`] keeps its draws and commands, which the device keeps once its pass ended
@@ -170,9 +203,42 @@ enum KeptCommand {
     /// A barrier before a draw whose fragment shader touches what a draw before it wrote before
     /// its fragments, of the view mask (`render_target::after_geometry_writes`).
     GeometryBarrier(u32, LegacyBarrier),
+    /// The begin of the precise occlusion query a reader's drawing commands record inside, and
+    /// its end, of the pool and query (`render/coverage.rs`).
+    BeginQuery(vk::QueryPool, u32),
+    EndQuery(vk::QueryPool, u32),
 }
 
 impl Kept {
+    /// The pass's first instance, kept to continue the render pass instance its command buffer's
+    /// tail holds open (`encoder_fold.rs`'s **Continued passes**), in a room of `rooms`'; where it
+    /// begins one of its own, it does in `objects` over `area` from the origin.
+    pub(super) fn first(
+        rooms: &SpareKept,
+        objects: (vk::RenderPass, vk::Framebuffer),
+        area: [u32; 2],
+    ) -> Kept {
+        Kept {
+            room: rooms.take(),
+            draws: 0,
+            objects,
+            clears: None,
+            moved: Vec::new(),
+            first: Some(area),
+        }
+    }
+
+    /// Whether it is the pass's first instance, kept to continue an open one ([`Kept::first`]).
+    pub(super) fn is_first(&self) -> bool {
+        self.first.is_some()
+    }
+
+    /// Its colors in the feedback loop layout, which move back to `GENERAL` right after its render
+    /// pass instance ends.
+    pub(super) fn moved(&self) -> &[MovedImage] {
+        &self.moved
+    }
+
     /// Keep a draw's `recording`, of its made `pipeline`: over the room an earlier instance's
     /// recording left where there is one.
     pub(super) fn draw(&mut self, recording: &Recording, pipeline: vk::Pipeline) {
@@ -192,11 +258,14 @@ impl Kept {
         self.room.commands.push(KeptCommand::Barrier(view_mask));
     }
 
-    /// Keep a barrier before a draw that reaches interlocked storage.
-    pub(super) fn storage_barrier(&mut self, view_mask: u32) {
-        self.room
-            .commands
-            .push(KeptCommand::StorageBarrier(view_mask));
+    /// Keep a barrier before a draw that reaches interlocked storage, or input attachments
+    /// ordered between draws alone (`render_target::DrawsBarrier`).
+    pub(super) fn storage_barrier(&mut self, view_mask: u32, barrier: render_target::DrawsBarrier) {
+        let command = match barrier {
+            render_target::DrawsBarrier::Storage => KeptCommand::StorageBarrier(view_mask),
+            render_target::DrawsBarrier::Whole => KeptCommand::Barrier(view_mask),
+        };
+        self.room.commands.push(command);
     }
 
     /// Keep a barrier before a draw that writes, in `stages`, what a draw before it read as its
@@ -214,15 +283,30 @@ impl Kept {
             .commands
             .push(KeptCommand::GeometryBarrier(view_mask, barrier));
     }
+
+    /// Keep the begin of a reader's coverage query, before its drawing commands
+    /// (`render/coverage.rs`).
+    pub(super) fn begin_query(&mut self, pool: vk::QueryPool, query: u32) {
+        self.room
+            .commands
+            .push(KeptCommand::BeginQuery(pool, query));
+    }
+
+    /// Keep the end of a reader's coverage query, after its drawing commands.
+    pub(super) fn end_query(&mut self, pool: vk::QueryPool, query: u32) {
+        self.room.commands.push(KeptCommand::EndQuery(pool, query));
+    }
 }
 
 /// A render pass and framebuffer inline instances after a split begin in: a render pass of
-/// their shape that loads and stores every attachment, and a framebuffer of the pass's
-/// attachments as they stand, made at the first such instance; the first instance's framebuffer
-/// serves those of its shape and attachments.
+/// their shape and colors in the feedback loop layout that loads and stores every attachment,
+/// and a framebuffer of the pass's attachments as they stand, made at the first such instance;
+/// the first instance's framebuffer serves those of its shape and attachments with no such color.
 pub(super) struct Later {
     /// The shape of the instances it serves.
     shape: PassShape,
+    /// Their colors in the feedback loop layout.
+    feedback: Feedback,
     /// The backings' arrivals before them (`inline_first::Begun::stood`).
     stood: u32,
     pass: RenderPassObject,
@@ -231,13 +315,14 @@ pub(super) struct Later {
 }
 
 /// The copies of the instance a split ends, planned as the split's draw is admitted
-/// ([`RenderCommandEncoder::inline_split`]), recorded once its new instance is installed
-/// ([`RenderCommandEncoder::begin_inline_split`]); and the new instance's objects and clears
+/// ([`RenderLowering::inline_split`]), recorded once its new instance is installed
+/// ([`RenderLowering::begin_inline_split`]); and the new instance's objects and clears
 /// ([`Kept`]).
 pub(super) struct SplitBegin {
     copies: Vec<ShadowCopy>,
     objects: (vk::RenderPass, vk::Framebuffer),
     clears: Option<Clears>,
+    moved: Vec<MovedImage>,
 }
 
 impl RenderLowering {
@@ -289,16 +374,21 @@ impl RenderLowering {
             && instance.reformats.is_empty()
             && instance.views == ViewSetup::default()
             && !instance.shadow
-            && !instance.shader_tests
-            && instance.feedback == Feedback::NONE;
+            && !instance.shader_tests;
         if !admitted {
             return None;
         }
-        // Its render pass and framebuffer: the instances' of its shape since the last backings
-        // arrived, else made now, of the pass's attachments as they stand from it on.
+        // Its render pass and framebuffer: the instances' of its shape and colors in the feedback
+        // loop layout since the last backings arrived, else made now, of the pass's attachments
+        // as they stand from it on.
         let stood_now = begun.stood + u32::from(stood.is_some());
+        let feedback = instance.feedback;
         let found = (begun.later.iter())
-            .find(|later| later.shape == *instance.shape && later.stood == stood_now)
+            .find(|later| {
+                later.shape == *instance.shape
+                    && later.feedback == feedback
+                    && later.stood == stood_now
+            })
             .map(|later| {
                 let framebuffer = later.framebuffer.as_ref().unwrap_or(&begun.framebuffer);
                 (later.pass.raw, framebuffer.raw)
@@ -311,22 +401,25 @@ impl RenderLowering {
                     first: false,
                     last: false,
                 };
-                let (none, general) = (Feedback::NONE, vk::ImageLayout::GENERAL);
+                let general = vk::ImageLayout::GENERAL;
                 let device = self.core.device().clone();
                 let (shape, views) = (&instance.shape, instance.views);
-                let pass =
-                    render_target::final_pass(&device, layout, shape, at, none, general).ok()?;
+                let pass = render_target::final_pass(&device, layout, shape, at, feedback, general)
+                    .ok()?;
                 // The first instance's framebuffer is compatible with a render pass of its
-                // shape, of the same attachments.
-                let framebuffer = match **shape == begun.shape && stood_now == 0 {
+                // shape, of the same attachments, whose views of colors in the feedback loop
+                // layout lack the usage it needs.
+                let first = **shape == begun.shape && stood_now == 0 && feedback == Feedback::NONE;
+                let framebuffer = match first {
                     true => None,
                     false => Some(
-                        render_target::framebuffer(&device, &pass, layout, shape, views, none)
+                        render_target::framebuffer(&device, &pass, layout, shape, views, feedback)
                             .ok()?,
                     ),
                 };
                 Some(Later {
                     shape: PassShape::clone(shape),
+                    feedback,
                     stood: stood_now,
                     pass,
                     framebuffer,
@@ -338,6 +431,8 @@ impl RenderLowering {
             Some((&color.target, color.clear))
         });
         let clears = Clears::plan(backings).ok()?;
+        let general = vk::ImageLayout::GENERAL;
+        let moved = render_target::moved_images(layout, instance.views, feedback, general).ok()?;
         let copies = self.plan_one(None).ok()?;
         let inline_first::Inline::Begun(begun) = &mut self.inline else {
             return None;
@@ -357,6 +452,7 @@ impl RenderLowering {
             copies,
             objects,
             clears,
+            moved,
         })
     }
 
@@ -373,8 +469,9 @@ impl RenderLowering {
             copies,
             objects,
             clears,
+            moved,
         } = begin;
-        self.record_flushed(before, &copies);
+        self.flush_planned(Some(before), copies);
         let device = self.core.device().clone();
         self.current.inline = true;
         self.current.kept = Some(Kept {
@@ -382,6 +479,8 @@ impl RenderLowering {
             draws: 0,
             objects,
             clears,
+            moved,
+            first: None,
         });
         self.current.rerecord = None;
         device.shared().counts.inline_split_instance();
@@ -394,16 +493,176 @@ impl RenderLowering {
         let waiting = |instance: &Instance| instance.kept.is_some() && !instance.planned;
         if waiting(&self.current) {
             let copies = self.plan_one(None)?;
-            let bound = &mut self.held_bound;
-            record_kept(&mut self.core, bound, &self.current, &copies, &self.layout);
-            self.current.planned = true;
-            return Ok(());
-        }
-        if let Some(at) = self.earlier.iter().position(waiting) {
+            self.flush_planned(None, copies);
+        } else if let Some(at) = self.earlier.iter().position(waiting) {
             let copies = self.plan_one(Some(at))?;
-            self.record_flushed(at, &copies);
+            self.flush_planned(Some(at), copies);
+        }
+        // The pass's first instance, waiting to continue the render pass instance its command
+        // buffer's tail holds open, and the instances planned after it.
+        if let Some(waiting) = self.continuing.take() {
+            self.record_waiting(*waiting);
         }
         Ok(())
+    }
+
+    /// What the render pass instance of the pass's last instance, the current one, renders
+    /// (`render_target::PassKey`), where it recorded inline: the first instance's, over its
+    /// framebuffer's extent, where it is the pass's only one; one kept after a split, over the
+    /// render area, in the render pass and framebuffer it began in, where none of its colors is
+    /// in the feedback loop layout. `None` otherwise: an instance in a secondary, or one whose
+    /// colors move back to `GENERAL` once it ends.
+    pub(super) fn last_instance_key(&self) -> Option<render_target::PassKey> {
+        let inline_first::Inline::Begun(begun) = &self.inline else {
+            return None;
+        };
+        if !self.current.inline {
+            return None;
+        }
+        match self.current.kept.as_ref().filter(|kept| !kept.is_first()) {
+            None => (self.earlier.is_empty())
+                .then(|| render_target::PassKey::over_all_of(&begun.shape, &begun.framebuffer)),
+            Some(kept) if !kept.moved.is_empty() => None,
+            Some(kept) => {
+                let (pass, framebuffer) = kept.objects;
+                (begun.later.iter())
+                    .map(|later| {
+                        let objects = later.framebuffer.as_ref().unwrap_or(&begun.framebuffer);
+                        (later, objects)
+                    })
+                    .find(|(later, objects)| {
+                        later.pass.raw == pass
+                            && objects.raw == framebuffer
+                            && later.feedback == Feedback::NONE
+                    })
+                    .map(|(later, objects)| {
+                        render_target::PassKey::of(&later.shape, objects, self.layout.extent)
+                    })
+            }
+        }
+    }
+
+    /// Whether the pass's instance at `at` among its earlier instances, or the current one
+    /// (`None`), touched nothing but its attachments as attachments, so it may continue a render
+    /// pass instance whose draws touched nothing else either, or stay open for a later pass to
+    /// continue (`encoder_fold.rs`'s **Continued passes**): no draw wrote memory or used the
+    /// attachments' images or bytes another way, and no command of the pass reached memory it
+    /// does not name (a root or handle table, a heap, an execution of render commands), recorded
+    /// later (a draw whose pipeline is being made) or dispatched tiles. A memory barrier between
+    /// its draws orders the draws before it in the instance, the continued one's among them, as it
+    /// orders the instance's own: it records against the subpass's dependency on itself, which
+    /// every render pass of the instance's shape holds (`render_target::PassKey`).
+    pub(super) fn touches_attachments_alone(&self, at: Option<usize>) -> bool {
+        let instance = at.map_or(&self.current, |at| &self.earlier[at]);
+        !self.reaches_unnamed
+            && self.executions.is_empty()
+            && self.pending.is_empty()
+            && !self.dispatched
+            && !self.core.reached_heaps()
+            && (instance.shadows).touches_alone(self.core.device(), &self.layout)
+    }
+
+    /// Record the earlier instance at `at`, or the current one (`None`), whose copies `copies`
+    /// were just planned, and mark it planned: the pass's first instance recorded inline as its
+    /// draws came takes its copies before the pass; one kept after a split, between the instance
+    /// before it and it, with its kept commands; one that waits to continue the render pass
+    /// instance its command buffer's tail holds open (`Kept::first`) waits on where it has no
+    /// copy or step before it and touched nothing but its attachments, else records as the
+    /// pass's own first instance now; and every instance planned while it waits waits with it.
+    fn flush_planned(&mut self, at: Option<usize>, copies: Vec<ShadowCopy>) {
+        let instance = at.map_or(&self.current, |at| &self.earlier[at]);
+        let first = (instance.kept.as_ref()).is_some_and(Kept::is_first);
+        if first {
+            let waits = copies.is_empty()
+                && instance.before.is_empty()
+                && self.touches_attachments_alone(at);
+            if !waits {
+                self.continuing = None;
+                self.core.let_go_of_group();
+                // Its copies before the pass, as the pass's first instance's go.
+                self.core.shadow_copies(&copies);
+                let instance = at.map_or(&self.current, |at| &self.earlier[at]);
+                record_first(&mut self.core, &mut self.held_bound, instance, true);
+            }
+        } else if let Some(waiting) = self.continuing.as_mut() {
+            waiting.later.push((at, copies));
+        } else if instance.kept.is_none() {
+            // The pass's first instance: its copies go before the pass, into the command buffer
+            // before the pass's, as the pass's end records them before its first instance.
+            self.core.shadow_copies(&copies);
+        } else {
+            let before = match at {
+                Some(at) => at.checked_sub(1).map(|before| &self.earlier[before]),
+                None => self.earlier.last(),
+            };
+            let (bound, ended) = (&mut self.held_bound, ended_moves(before));
+            record_kept(
+                &mut self.core,
+                bound,
+                (instance, &copies, ended),
+                &self.layout,
+            );
+        }
+        match at {
+            Some(at) => self.earlier[at].planned = true,
+            None => self.current.planned = true,
+        }
+    }
+
+    /// Record the pass's first instance, which waited to continue the render pass instance its
+    /// command buffer's tail holds open (`Kept::first`), and the instances planned after it,
+    /// `waiting`, in order: into that instance with no end, barrier or begin between, where the
+    /// pass continues it (`EncoderCore::continue_pass`), its draws still touching nothing but its
+    /// attachments; else into a render pass instance of its own, begun in the pass's own command
+    /// buffer, the group that held the open one closed.
+    fn record_waiting(&mut self, waiting: Waiting) {
+        let at = (!self.earlier.is_empty()).then_some(0);
+        let continues = self.touches_attachments_alone(at)
+            && (self.waiting_uses(&waiting)).is_some_and(|uses| self.core.continue_pass(&uses));
+        if !continues {
+            self.core.let_go_of_group();
+        }
+        let first = at.map_or(&self.current, |at| &self.earlier[at]);
+        record_first(&mut self.core, &mut self.held_bound, first, !continues);
+        for (at, copies) in waiting.later {
+            let instance = at.map_or(&self.current, |at| &self.earlier[at]);
+            let before = match at {
+                Some(at) => at.checked_sub(1).map(|before| &self.earlier[before]),
+                None => self.earlier.last(),
+            };
+            let (bound, ended) = (&mut self.held_bound, ended_moves(before));
+            record_kept(
+                &mut self.core,
+                bound,
+                (instance, &copies, ended),
+                &self.layout,
+            );
+        }
+    }
+
+    /// What the pass records into the command buffer its tail's open render pass instance lies
+    /// in besides its draws, where it continues that instance with its first instance and the
+    /// instances planned after it, `waiting` ([`record_waiting`](Self::record_waiting)), on a
+    /// device that splits at aliases (`alias_split.rs`): the uses of its attachments and of the
+    /// copies and steps before each later instance, which `EncoderCore::continue_pass` checks
+    /// with its draws' images against the bytes the group's encoders wrote. None to check
+    /// elsewhere; `None` where the attachments' uses are refused, which continues nothing.
+    fn waiting_uses(&self, waiting: &Waiting) -> Option<Vec<Use<ResourceKey>>> {
+        if !self.core.device().shared().splits_at_aliases() {
+            return Some(Vec::new());
+        }
+        let mut uses = render_target::attachment_uses(&self.layout).ok()?;
+        for (at, copies) in &waiting.later {
+            let instance = at.map_or(&self.current, |at| &self.earlier[at]);
+            uses.extend(
+                instance
+                    .before
+                    .iter()
+                    .flat_map(|step| step.uses().iter().cloned()),
+            );
+            uses.extend(copies.iter().flat_map(ShadowCopy::uses));
+        }
+        Some(uses)
     }
 
     /// The copies before the head of a group, the current instance (`at` `None`) or the earlier
@@ -444,29 +703,15 @@ impl RenderLowering {
                 .as_ref()
                 .is_some_and(|color| color.load == LoadAction::Load)
         }))?;
+        let attached = render_target::attachment_uses(&self.layout)?;
         let planned = shadows::plan(
             &mut self.core,
             std::iter::once((&instance.shadows, bound)),
-            &self.layout,
+            (&self.layout, &attached),
             (true, area.map(|area| (area, &loaded[..]))),
             area.is_some().then_some(&self.drawn),
         )?;
         Ok(planned.into_iter().next().unwrap_or_default())
-    }
-
-    /// Record the copies `copies` planned for the earlier instance at `at`, and mark it
-    /// planned: before the pass for the pass's first instance, recorded inline as its draws
-    /// came; else between the instance before it and it, with its kept commands.
-    fn record_flushed(&mut self, at: usize, copies: &[ShadowCopy]) {
-        if self.earlier[at].kept.is_none() {
-            // The pass's first instance: its copies go before the pass, into the command buffer
-            // before the pass's, as the pass's end records them before its first instance.
-            self.core.shadow_copies(copies);
-        } else {
-            let (bound, instance) = (&mut self.held_bound, &self.earlier[at]);
-            record_kept(&mut self.core, bound, instance, copies, &self.layout);
-        }
-        self.earlier[at].planned = true;
     }
 }
 
@@ -516,18 +761,24 @@ fn arriving_backings(layout: &PassLayout, stood: &PassLayout) -> Option<ColorLis
     Some(arriving)
 }
 
+/// The colors in the feedback loop layout of `instance`, whose render pass instance the next
+/// kept one's recording ends ([`record_kept`]): none for the pass's first instance, or one of no
+/// such color.
+fn ended_moves(instance: Option<&Instance>) -> &[MovedImage] {
+    (instance.and_then(|instance| instance.kept.as_ref())).map_or(&[][..], |kept| kept.moved())
+}
+
 /// Record `instance`, kept (the module docs), into the pass's command buffer after the render
-/// pass instance before it: that one's end, a barrier from everything before, `copies` (one run
-/// of them, `EncoderCore::held_shadow_copies`, followed by a barrier), the steps its draws take
-/// before it, its render pass instance's begin
-/// in `objects` (a render pass compatible with its draws' pipelines, and the pass's
-/// framebuffer), and its commands, recorded through `bound`, the record of what the command
-/// buffer bound.
+/// pass instance before it: that one's end, the moves of its colors in the feedback loop layout
+/// back to `GENERAL` (`ended`), a barrier from everything before, `copies` (one run of them,
+/// `EncoderCore::held_shadow_copies`, followed by a barrier), the steps its draws take before it,
+/// the moves of its own such colors there, its render pass instance's begin in `objects` (a
+/// render pass compatible with its draws' pipelines, and the pass's framebuffer), and its
+/// commands, recorded through `bound`, the record of what the command buffer bound.
 fn record_kept(
     core: &mut EncoderCore,
     bound: &mut Bound,
-    instance: &Instance,
-    copies: &[ShadowCopy],
+    (instance, copies, ended): (&Instance, &[ShadowCopy], &[MovedImage]),
     layout: &PassLayout,
 ) {
     let (Some(held), Some(kept)) = (core.held_pass(), instance.kept.as_ref()) else {
@@ -537,10 +788,14 @@ fn record_kept(
     let device = core.device().clone();
     let shared = device.shared();
     let raw = shared.vk();
+    let family = core.queue_flags();
     // SAFETY: the held command buffer is recording inside the render pass instance before this
-    // one, and only this encoder records it.
+    // one, and only this encoder records it; that instance's colors in the feedback loop layout
+    // (`ended`) are there from its begin, their images live until the command buffer completes
+    // (the layout's textures, which the encoder retains).
     unsafe {
         raw.cmd_end_render_pass(held);
+        render_target::moved_barriers(raw, held, ended, false, family);
         Barrier::everything().record(raw, held);
     }
     core.held_shadow_copies(copies);
@@ -562,23 +817,92 @@ fn record_kept(
             extent: vk::Extent2D { width, height },
         })
         .clear_values(clear_values.as_slice());
-    let mut recorded = Recorded::default();
     // SAFETY: the held command buffer is recording outside a render pass instance, and only this
     // encoder records it; the steps' objects are live until it completes (retained at their
     // draws); the pass and framebuffer are live until it completes (the encoder holds them to its
     // end, which retains them), the pass compatible with every kept draw's pipeline (made for
-    // the instance's shape, `render_target::final_pass`) and the framebuffer made for the pass's
-    // first instance, of the same attachments; every image rests in `GENERAL`; every kept
-    // draw's objects are live until the command buffer completes (retained at the draw), and
-    // `bound` is the record of what the draws recorded into it bound, which the copies and
-    // barriers recorded since (transfer commands) leave bound.
+    // the instance's shape, `render_target::final_pass`) and its framebuffer of the same
+    // attachments; every image rests in `GENERAL` but its colors in the feedback loop layout,
+    // moved there right before its begin; every kept draw's objects are live until the command
+    // buffer completes (retained at the draw), and `bound` is the record of what the draws
+    // recorded into it bound, which the copies and barriers recorded since (transfer commands)
+    // leave bound.
     unsafe {
         for step in &instance.before {
             step.record_in(raw, held);
         }
+        render_target::moved_barriers(raw, held, &kept.moved, true, family);
         raw.cmd_begin_render_pass(held, &info, vk::SubpassContents::INLINE);
         let begun = crate::work_counts::PassBegun::InlineSplit;
         shared.counts.render_pass_begun(begun);
+        record_kept_commands(shared, held, kept, bound);
+    }
+}
+
+/// Record the pass's first instance, kept to continue the render pass instance its command
+/// buffer's tail holds open (`Kept::first`), into the pass's command buffer: into that
+/// instance, which the pass holds once it continued it (`EncoderCore::continue_pass`), or into a
+/// render pass instance of its own, begun there in its render pass and framebuffer over its area
+/// (`begins`); its commands through `bound`, the record of what the command buffer bound, which
+/// is nothing where it continues another encoder's instance (the encoder's own record). Its
+/// copies and steps before it went before the pass, where it had any: it continues no instance
+/// then.
+fn record_first(core: &mut EncoderCore, bound: &mut Bound, instance: &Instance, begins: bool) {
+    let (Some(held), Some(kept)) = (core.held_pass(), instance.kept.as_ref()) else {
+        return;
+    };
+    let Some([width, height]) = kept.first else {
+        return;
+    };
+    let device = core.device().clone();
+    let shared = device.shared();
+    let raw = shared.vk();
+    if begins {
+        let (pass, framebuffer) = kept.objects;
+        // It loads every attachment (`inline_first::loads_all`): no clear value is read.
+        let info = vk::RenderPassBeginInfo::default()
+            .render_pass(pass)
+            .framebuffer(framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            });
+        // SAFETY: the held command buffer, the encoder's own, is recording outside a render pass
+        // instance, and only this encoder records it; the pass and framebuffer are live until it
+        // completes (the encoder holds them to its end, which retains them), the render area is
+        // the framebuffer's extent, and every image rests in `GENERAL`.
+        unsafe { raw.cmd_begin_render_pass(held, &info, vk::SubpassContents::INLINE) };
+        shared
+            .counts
+            .render_pass_begun(crate::work_counts::PassBegun::Inline);
+    }
+    // SAFETY: the held command buffer is recording inside a render pass instance of a render pass
+    // compatible with every kept draw's pipeline (made for the instance's shape, as the open
+    // instance's is: `render_target::PassKey`), over the same attachments, and only this encoder
+    // records it; every kept draw's objects are live until the command buffer completes
+    // (retained at the draw), and `bound` is the record of what the draws recorded into it bound:
+    // the encoder's own, of nothing recorded before its first draw.
+    unsafe { record_kept_commands(shared, held, kept, bound) };
+}
+
+/// Record `kept`'s commands into `held`, through `bound`.
+///
+/// # Safety
+///
+/// `held` is recording inside a render pass instance its kept draws' pipelines are compatible
+/// with, of the instance's attachments, and only the caller records it; the kept draws' objects
+/// are live until it completes, and `bound` is the record of what the draws recorded into it
+/// bound.
+unsafe fn record_kept_commands(
+    shared: &crate::device::DeviceShared,
+    held: vk::CommandBuffer,
+    kept: &Kept,
+    bound: &mut Bound,
+) {
+    let raw = shared.vk();
+    let mut recorded = Recorded::default();
+    // SAFETY: the caller's.
+    unsafe {
         let mut draws = kept.room.recordings[..kept.draws].iter();
         for command in &kept.room.commands {
             match command {
@@ -603,13 +927,16 @@ fn record_kept(
                         index: owned.index,
                         indirect: owned.indirect,
                         dynamic: &owned.dynamic,
+                        settled: None,
                         topology: owned.topology,
                         primitive_restart: owned.primitive_restart,
                         state: &owned.state,
                         extended: owned.extended,
                         mesh: shared.mesh_draws.as_ref(),
+                        multi: shared.multi_draws.as_ref(),
                         draw: owned.draw,
                         pair: owned.pair.clone(),
+                        routed: None,
                     }
                     .record(bound);
                 }
@@ -625,8 +952,12 @@ fn record_kept(
                 KeptCommand::GeometryBarrier(view_mask, barrier) => {
                     render_target::after_geometry_writes(raw, held, *view_mask, *barrier)
                 }
+                KeptCommand::BeginQuery(pool, query) => {
+                    raw.cmd_begin_query(held, *pool, *query, vk::QueryControlFlags::PRECISE)
+                }
+                KeptCommand::EndQuery(pool, query) => raw.cmd_end_query(held, *pool, *query),
             }
         }
     }
-    recorded.count(&shared.counts);
+    recorded.count(shared.counts.thread());
 }

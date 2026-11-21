@@ -2,14 +2,19 @@
 //! calibration pair or by the completion, across a wrap of the timestamps' bits; a pair that
 //! places them outside the command buffer's life by more than its deviation and the clocks'
 //! drift allow set aside for the completion; the pair, the
-//! reading of the least deviation; the host time domain a calibration reads; the extension's
-//! preferred form; and the device's timestamp pools, their slots held by the command buffers in
-//! flight, made as those need them up to the most.
+//! reading of the least deviation, announced and counted where it still states more than 20 us;
+//! the host time domain a calibration reads; the extension's
+//! preferred form; the device's timestamp pools, their slots held by the command buffers in
+//! flight, made as those need them up to the most; and the kernel times, the start shown with the
+//! end alone.
 
+use crate::degradation::Announced;
 use crate::gpu_time::{
-    host_domain, host_time, least_deviation, Extension, GpuClock, Life, Pair, Placement, Pool,
-    Pools, Reading, DRIFT_PPM, PLAIN, PREFIXED, SLOTS,
+    host_domain, host_time, least_deviation, Extension, GpuClock, KernelTimes, Life, Pair,
+    Placement, Pool, Pools, Reading, DRIFT_PPM, PLAIN, PREFIXED, READINGS, SLOTS,
 };
+use crate::work_counts::Counters;
+use crate::Degradation;
 use ash::vk;
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -234,6 +239,95 @@ fn a_pair_that_places_times_outside_the_life_is_set_aside() {
     ));
 }
 
+/// A pair whose readings each state more than `SETTLED` (20 us) is read four times, and the least
+/// places the times inside the command buffer's life, loosely: the duration exact, each time
+/// within that deviation of the GPU's. The first read of each command buffer placed so counts it
+/// (`WorkCounts::loosely_calibrated_gpu_times`) and gives `loosely-calibrated-gpu-times`, the
+/// deviation in its reason, which the device announces once. A pair that settles at 20 us or
+/// below (the Iris Xe's first reading after an idle GPU, 165 us, then 7.6 us) is Metal's answer:
+/// nothing counted or announced. A loose pair that places a time outside the life is set aside,
+/// as any pair that disagrees.
+#[test]
+fn a_pair_still_beyond_the_settled_deviation_is_announced_once_and_counted() {
+    let clock = clock(64, 1.0);
+    // A fake calibration whose readings state `deviations` in turn, ticks counting host
+    // nanoseconds.
+    let reading_of = |deviations: &[u64]| {
+        let mut readings = deviations.iter().map(|&deviation| Reading {
+            pair: Pair {
+                ticks: 1_000_000,
+                host: 1_000_000,
+            },
+            deviation,
+        });
+        least_deviation(|| readings.next()).expect("a first reading")
+    };
+    let (start, end, inside) = (2_000_100, 2_001_100, life(2_000_000, 2_002_000));
+    let counts = Counters::default();
+    let announced = Announced::default();
+    // An RX 7900 XTX's under full parallel suites: the least of four, 93.4 us; no fifth read.
+    let (loose, readings) = reading_of(&[124_900, 93_400, 110_000, 99_000, 1_000]);
+    assert_eq!((readings, loose.deviation), (READINGS, 93_400));
+    let (times, placement) = clock.span(Some(loose), start, end, inside);
+    assert_eq!(times, (start, end));
+    assert_eq!(placement, Placement::Loose { deviation: 93_400 });
+    let first_announced: Vec<bool> = (0..2)
+        .map(|_| {
+            let (kind, reason) = placement.read(&clock, &counts).expect("a notice");
+            assert_eq!(kind, Degradation::LooselyCalibratedGpuTimes);
+            assert!(reason.contains("a deviation of 93400 ns"), "{reason}");
+            assert!(reason.ends_with("(64-bit timestamps of 1 ns)"), "{reason}");
+            announced.now(kind)
+        })
+        .collect();
+    assert_eq!(first_announced, [true, false], "announced once");
+    assert_eq!(
+        counts.loosely_calibrated_gpu_times(),
+        2,
+        "each read counted"
+    );
+
+    // Settled: the first reading after an idle GPU, then a settled one and one that halves
+    // nothing; and one at 20 us exactly.
+    for (deviations, calls, least) in [
+        (&[165_000, 7_600, 7_600][..], 3, 7_600),
+        (&[30_000, 20_000][..], 2, 20_000),
+    ] {
+        let (settled, readings) = reading_of(deviations);
+        assert_eq!((readings, settled.deviation), (calls, least));
+        let (times, placement) = clock.span(Some(settled), start, end, inside);
+        assert_eq!((times, placement), ((start, end), Placement::Calibrated));
+        assert_eq!(placement.read(&clock, &counts), None);
+    }
+    assert_eq!(
+        counts.loosely_calibrated_gpu_times(),
+        2,
+        "nothing counted when settled"
+    );
+
+    // Loose and a second off: set aside for the completion, the uncalibrated kind, not counted.
+    let (times, placement) = clock.span(
+        Some(loose),
+        start + 1_000_000_000,
+        end + 1_000_000_000,
+        inside,
+    );
+    assert_eq!(times, (2_001_000, 2_002_000));
+    assert!(
+        matches!(
+            placement,
+            Placement::Disagreed {
+                deviation: 93_400,
+                ..
+            }
+        ),
+        "{placement:?}"
+    );
+    let (kind, _) = placement.read(&clock, &counts).expect("a notice");
+    assert_eq!(kind, Degradation::UncalibratedGpuTimes);
+    assert_eq!(counts.loosely_calibrated_gpu_times(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn calibration_reads_the_devices_domain_and_a_monotonic_host_one() {
@@ -248,6 +342,20 @@ fn calibration_reads_the_devices_domain_and_a_monotonic_host_one() {
     );
     assert!(chosen(&[D::CLOCK_MONOTONIC_RAW]).is_none());
     assert!(chosen(&[D::DEVICE, D::QUERY_PERFORMANCE_COUNTER]).is_none());
+    assert!(chosen(&[]).is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn calibration_reads_the_devices_domain_and_the_performance_counter() {
+    use vk::TimeDomainKHR as D;
+    // `TimeDomainKHR` has no `Debug` without ash's `debug` feature: compared, not printed.
+    let chosen = |offered: &[D]| host_domain(offered);
+    assert!(
+        chosen(&[D::DEVICE, D::QUERY_PERFORMANCE_COUNTER]) == Some(D::QUERY_PERFORMANCE_COUNTER)
+    );
+    assert!(chosen(&[D::QUERY_PERFORMANCE_COUNTER]).is_none());
+    assert!(chosen(&[D::DEVICE, D::CLOCK_MONOTONIC_RAW]).is_none());
     assert!(chosen(&[]).is_none());
 }
 
@@ -420,4 +528,31 @@ fn a_refused_pool_ends_the_making_and_scarce_pools_are_one() {
     assert!(!asked);
     assert_eq!(scarce.slots(), SLOTS as usize);
     drop(held);
+}
+
+/// A command buffer's kernel start shows only once its end is known (`kernelStartTime`), as no
+/// read of Metal's sees a start without an end: between the first batch's start and the last
+/// batch's end (while the last batch is submitted, or waits for an event), the shown start reads 0
+/// and the scheduler's own read (`start`) has it; once the end is stored, both reads of the pair,
+/// in either order, see both.
+#[test]
+fn a_kernel_start_shows_with_its_end_alone() {
+    let kernel = KernelTimes::default();
+    assert_eq!(
+        (kernel.shown_start(), kernel.end(), kernel.start()),
+        (0, 0, 0)
+    );
+    kernel.begin();
+    let began = kernel.start();
+    assert_ne!(began, 0, "the scheduler's own read of the start");
+    assert_eq!(
+        (kernel.shown_start(), kernel.end()),
+        (0, 0),
+        "a start shown before its end"
+    );
+    kernel.end_at(began + 7);
+    let (end, start) = (kernel.end(), kernel.shown_start());
+    assert_eq!((start, end), (began, began + 7));
+    let (start, end) = (kernel.shown_start(), kernel.end());
+    assert_eq!((start, end), (began, began + 7));
 }

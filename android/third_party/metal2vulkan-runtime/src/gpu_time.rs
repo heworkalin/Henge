@@ -4,8 +4,9 @@
 //!
 //! - **The host's clock.** `CLOCK_UPTIME_RAW` on macOS, the clock of `mach_absolute_time` and so
 //!   of Metal's times and `CACurrentMediaTime`; `CLOCK_MONOTONIC_RAW` elsewhere on Unix, its
-//!   counterpart (monotonic, never slewed, stopped while the system sleeps). Other platforms count
-//!   the runtime's own monotonic clock, which no device can calibrate against.
+//!   counterpart (monotonic, never slewed, stopped while the system sleeps); on Windows the
+//!   performance counter (`QueryPerformanceCounter`, in nanoseconds of its frequency), which
+//!   devices calibrate against as `VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR`.
 //! - **GPU times.** The command buffer's first batch writes a timestamp at the top of its work
 //!   (after a barrier its first encoder waits behind for earlier work, once every command before
 //!   it completed, where Metal's start follows such work's end), and its last batch one after the
@@ -21,8 +22,15 @@
 //!   the batch begins with no command buffer of its own, and the prefix's start is the command
 //!   buffer's. It is the same place: either start is written at the top of the pipe, after every
 //!   command submitted before the batch's work and before any of it; where batches are ordered by
-//!   their ends (`batch_order.rs`), at the bottom, once every command submitted before it
-//!   completed, when such a driver starts the batch. Elsewhere (a barrier planned
+//!   their ends (`batch_order.rs`), once every command submitted before it completed, which the
+//!   earlier batch's end barrier to all later commands holds, when such a driver starts the
+//!   batch. A first batch with first work (new resources' first moves and fills, `Managed`
+//!   copies in: `texture/first_move.rs`) writes the start in that work's command buffer instead,
+//!   after a barrier from every command before and before the work, which runs in the batch's
+//!   submission ahead of its commands, so its GPU time is the command buffer's
+//!   (`command_buffer/submit.rs`); with no barrier where that work is `Managed` uploads alone
+//!   that the end of the batch before orders (`first_move::Earlier::Ended`), which holds the
+//!   start as it holds the prefix's. Elsewhere (a barrier planned
 //!   there, a caller's image moved first, the encoder run again or not at all) a command buffer of
 //!   barriers writes the first start before the barrier, as without a prefix, and that start is
 //!   read; the prefix's is written after it and never read. A Metal counter sample buffer's slot
@@ -87,6 +95,13 @@
 //!   us over 200 readings). The reading after it stated 7.6 us and agreed with the next ones within
 //!   0.4 us. A thread preempted between a reading's two values states the time it lost: on an RX
 //!   7900 XTX (RADV) under a full parallel suite, two readings in turn stated about 70 us each.
+//! - **Announced where the least of them states more.** A pair whose least deviation is still
+//!   above [`SETTLED`] places the times (inside the command buffer's life, below) within that
+//!   deviation of the moments the GPU wrote them, the duration between them exact: the RX 7900 XTX
+//!   under full parallel suites stated 93 and 125 us after four readings. The first read of such a
+//!   command buffer's GPU times counts it (`WorkCounts::loosely_calibrated_gpu_times`), and the
+//!   device announces it once (`Degradation::LooselyCalibratedGpuTimes`), the deviation in the
+//!   notice ([`Placement::read`]).
 //! - **Checked against the command buffer's life.** A time the pair places is the GPU's, and the
 //!   GPU ran the work between the first batch's submission (the kernel start) and the moment the
 //!   completion turn saw it complete. A pair that places the start before that start, or the
@@ -105,11 +120,42 @@
 //! - **None without timestamps.** A queue family whose `timestampValidBits` is 0 writes none: the
 //!   times are refused (`Unsupported`, `Feature::GpuTimes`). So are a command buffer's that found
 //!   no slot free.
+//! - **Unwritten timestamps are dropped work.** The completion turn reads them once the command
+//!   buffer's queue passed its last batch, whose signal's first scope holds "all commands that
+//!   occur earlier in submission order" (Semaphore Signaling), both writes among them, and "a
+//!   query is made available by the operation of ... vkCmdWriteTimestamp" (Queries). One read
+//!   unavailable was never written: the driver dropped the work and reported no error. Linux's
+//!   amdgpu did so on a Radeon 780M (RADV of Mesa 26.2.6, Linux 7.3.3): it ended a job of 3.2 s
+//!   past its timeout (2 s by default), the command buffer queued behind it on the same `VkQueue`
+//!   never ran, its semaphore signalled, and the device went on. RADV reports a loss only where
+//!   the kernel refuses a submission, and its `VK_KHR_device_fault` only GPUVM faults and shader
+//!   aborts. The command buffer
+//!   fails as Metal's victim of a GPU recovery (`GpuRecoveryVictim`, its GPU times 0), counted
+//!   (`WorkCounts::unrun_command_buffers`). The start read is always one its run writes, and the
+//!   barriers' command buffers write both whatever its encoders did, so work that ran never reads
+//!   so. Where the reset rides in the work (an adopted device's), a dropped command buffer's
+//!   queries keep the last holding's values and it completes; so does one with no timestamps.
 //! - **Kernel times** are the host times at which the scheduler began submitting the command
-//!   buffer's first batch and finished submitting its last. They are kept apart from the command
+//!   buffer's first batch and called the driver's submission of its last (`vkQueueSubmit`; or held
+//!   it for one submission with later ones). The end is the call's start, never its return: a
+//!   driver may run the work, and its timestamps place its end, before the call returns (an RTX
+//!   3090's returned 57 to 64 ms after its work ran, `tests/completion.rs`), and so may lavapipe's
+//!   while a loaded host keeps the scheduler's thread from running once the call returned (one
+//!   `GPUEndTime` before its `kernelEndTime` in a replay beside the test suites); Metal's
+//!   `GPUEndTime` is never earlier than its `kernelEndTime`. They are kept apart from the command
 //!   buffer's state ([`KernelTimes`]), which the scheduler holds while it records the batch's
 //!   own command buffers and submits it: a read waits for no submission in
-//!   progress and for no GPU work, as Metal's reads wait for none.
+//!   progress and for no GPU work, as Metal's reads wait for none. The start shows only once the
+//!   end is known ([`KernelTimes::shown_start`]): no read sees a start without an end, while the
+//!   last batch is submitted, nor while it waits for an event and the batches before the wait
+//!   were submitted. Metal shows neither before both, so (the M3 Max under macOS 27.0.1): of
+//!   3,900 to 240,000 reads of each command buffer that waited for nothing, from its commit
+//!   until it completed, and 4.6 to 4.7 million of each one that waited 200 ms for an `MTLEvent`
+//!   or an `MTLSharedEvent` (after a blit encoder, before one, or alone), no read of the start
+//!   and then the end answered a start and no end; the waiting ones read both 0 until 50 to 160
+//!   us after the signal. Metal's start there is the time it began scheduling the command
+//!   buffer, 13 to 39 us after its commit, whatever it waits for first: the runtime's, where the
+//!   first batch waits for the event, is that batch's submission, after the signal.
 //! - **No encoder, no timestamps**. A command buffer that encoded nothing and waits for no event or
 //!   semaphore takes no slot and writes no timestamps. Its GPU start and end are both where its
 //!   queue reached it: its kernel end time, or the GPU end of the queue's command buffer before it
@@ -125,10 +171,19 @@
 //! - **From the host, where the device is told to** (`DeviceOptions::gpu_times_from_host`,
 //!   `RawDevice::gpu_times_from_host`; off by default), **or where its driver's timestamps wait
 //!   for every queue's** (`DriverFact::TimestampsWaitForEveryQueue`: MoltenVK 1.4.1 on Apple's
-//!   GPUs, whatever the options say). No command buffer writes timestamps. One with work answers as
-//!   its GPU start its kernel end time, or its queue's latest GPU end before it where later, and as
-//!   its GPU end the host time the runtime saw it complete (never before the start): a window its
-//!   GPU work ran in. The device announces it once, at the first such answer
+//!   GPUs, whatever the options say). No command buffer writes timestamps for its own times (where
+//!   only the options say so, a rate-mapped pass recorded in pieces and a host step's probe still
+//!   time theirs, `rate_mapped_pass.rs`). One with work answers as
+//!   its GPU start the host time the scheduler called the first driver's submission that carried
+//!   its work ([`KernelTimes::first_submitted`]: its kernel end time where one submission carried
+//!   it all), or its queue's latest GPU end before it where later, and as its GPU end the host time
+//!   the runtime saw it complete (never before the start): a window its GPU work ran in. Metal's
+//!   `GPUStartTime` and `GPUEndTime` span the whole command buffer's GPU work, so one whose batches
+//!   went as several submissions (after a wait for an event the host signals, or before an
+//!   execution of commands the GPU may write, which its host step records:
+//!   `command_buffer/batches.rs`) starts at its first, where its first batch's work could begin,
+//!   not at its kernel end, the call of its last. The device announces it once, at the first such
+//!   answer
 //!   (`Degradation::GpuTimesFromHost`). A device whose queue family writes no timestamps answers so
 //!   too, instead of refusing.
 //!
@@ -139,7 +194,11 @@
 //!   2. **Inside the command buffer's life.** Its commit <= `kernelStartTime` <= `kernelEndTime`
 //!      <= `GPUStartTime` <= `GPUEndTime` <= the moment its completion is observable: the end is
 //!      read in the completion turn before the command buffer's status becomes `Completed`
-//!      and before its completed handlers run, and the start is never later than the end.
+//!      and before its completed handlers run, and the start is never later than the end. One
+//!      whose work went as several submissions starts between its `kernelStartTime` and its
+//!      `kernelEndTime`, at its first submission, before its last: a kernel end after the GPU
+//!      start, which Metal answered for plain fills on the M3 Max under macOS 27.0.1 too
+//!      (`runtime_lane::gpu_times`'s `LATE_KERNEL_END`).
 //!   3. **A serial queue.** In a queue's commit order, which is the order its command buffers
 //!      complete and are placed in (`command_buffer/completion.rs`), each one's GPU start is at
 //!      or after the GPU end of the one before it, so starts and ends only move forward and no
@@ -162,15 +221,17 @@
 //! moves a time by nanoseconds to microseconds, within what the calibration states for itself on
 //! the devices measured.
 
+use super::degradation::Degradation;
 use super::device::lock;
+use super::encoder_times::{EncoderTimes, Timed};
 use super::exit_guard::{self, Call};
 use super::release;
 use super::work_counts::Counters;
 use ash::vk;
 use std::collections::BTreeSet;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The longest a device's calibration pair serves the completions after it.
@@ -209,7 +270,8 @@ const _: () = assert!(PLAIN * SLOTS <= SAMPLE_BUFFER_TIMESTAMPS);
 
 /// The host time now, in seconds of the clock the runtime's GPU and kernel times count (the
 /// module documentation): `CLOCK_UPTIME_RAW` on macOS, which `mach_absolute_time` and
-/// `CACurrentMediaTime` count, and `CLOCK_MONOTONIC_RAW` elsewhere on Unix.
+/// `CACurrentMediaTime` count, `CLOCK_MONOTONIC_RAW` elsewhere on Unix, and the performance
+/// counter (`QueryPerformanceCounter`) on Windows.
 pub fn host_time() -> f64 {
     host_nanos() as f64 / 1e9
 }
@@ -220,13 +282,37 @@ pub(crate) fn host_nanos() -> u64 {
     {
         read_clock(BASE).unwrap_or(0)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::sync::OnceLock;
-        use std::time::Instant;
-        static START: OnceLock<Instant> = OnceLock::new();
-        START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+        read_counter().and_then(counter_nanos).unwrap_or(0)
     }
+}
+
+/// The performance counter now, in its ticks (`QueryPerformanceCounter`).
+#[cfg(windows)]
+fn read_counter() -> Option<u64> {
+    use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
+    let mut ticks = 0i64;
+    // SAFETY: `ticks` is a valid value for the call to fill.
+    let read = unsafe { QueryPerformanceCounter(&mut ticks) };
+    (read != 0).then(|| u64::try_from(ticks).ok()).flatten()
+}
+
+/// `ticks` of the performance counter in nanoseconds, at its frequency
+/// (`QueryPerformanceFrequency`, fixed at boot and read once).
+#[cfg(windows)]
+fn counter_nanos(ticks: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
+    static FREQUENCY: OnceLock<Option<u64>> = OnceLock::new();
+    let frequency = FREQUENCY.get_or_init(|| {
+        let mut frequency = 0i64;
+        // SAFETY: `frequency` is a valid value for the call to fill.
+        let read = unsafe { QueryPerformanceFrequency(&mut frequency) };
+        let frequency = (read != 0).then(|| u64::try_from(frequency).ok()).flatten();
+        frequency.filter(|&frequency| frequency > 0)
+    });
+    let nanos = u128::from(ticks) * 1_000_000_000 / u128::from((*frequency)?);
+    u64::try_from(nanos).ok()
 }
 
 /// The host's clock.
@@ -262,8 +348,8 @@ fn domain_clock(domain: vk::TimeDomainKHR) -> Option<libc::clockid_t> {
 }
 
 /// The host time domain a device's calibration uses, from those it offers: the host's clock
-/// where offered, else `CLOCK_MONOTONIC_RAW`, else `CLOCK_MONOTONIC`. `None` without the
-/// device's own domain or a host domain the runtime can read.
+/// where offered, else `CLOCK_MONOTONIC_RAW`, else `CLOCK_MONOTONIC`; on Windows the performance
+/// counter's. `None` without the device's own domain or a host domain the runtime can read.
 pub(crate) fn host_domain(offered: &[vk::TimeDomainKHR]) -> Option<vk::TimeDomainKHR> {
     if !offered.contains(&vk::TimeDomainKHR::DEVICE) {
         return None;
@@ -281,9 +367,10 @@ pub(crate) fn host_domain(offered: &[vk::TimeDomainKHR]) -> Option<vk::TimeDomai
             .chain(preferred)
             .find(|domain| offered.contains(domain))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        None
+        let counter = vk::TimeDomainKHR::QUERY_PERFORMANCE_COUNTER;
+        offered.contains(&counter).then_some(counter)
     }
 }
 
@@ -336,11 +423,56 @@ pub(crate) struct Life {
 pub(crate) enum Placement {
     /// By the device's calibration pair.
     Calibrated,
+    /// By the device's calibration pair, inside its life, where the pair stated a `deviation`
+    /// above [`SETTLED`] though it was read again: each time lies within that many nanoseconds
+    /// of the moment the GPU wrote it (the module docs).
+    Loose { deviation: u64 },
     /// By its completion: the device had no pair as it completed.
     Uncalibrated,
     /// By its completion: the pair placed a time outside its life by `by` nanoseconds, more than
     /// the pair's stated `deviation` and the clocks' drift allow (the module docs).
     Disagreed { by: u64, deviation: u64 },
+}
+
+impl Placement {
+    /// What the first read of a command buffer's GPU times placed so announces on a device of
+    /// `clock`: the kind and the notice's reason, `None` for Metal's answer (the module docs).
+    /// A loose placement is counted in `counts` (`WorkCounts::loosely_calibrated_gpu_times`).
+    pub(crate) fn read(self, clock: &GpuClock, counts: &Counters) -> Option<(Degradation, String)> {
+        let (kind, reason) = match self {
+            Placement::Calibrated => return None,
+            Placement::Loose { deviation } => {
+                counts.loosely_calibrated();
+                let reason = format!(
+                    "the device's calibration pair stated a deviation of {deviation} ns, the least \
+                     of its readings ({READINGS} at most), more than the {SETTLED} ns a settled \
+                     reading keeps to: each time lies within that much of the moment the GPU \
+                     wrote it"
+                );
+                (Degradation::LooselyCalibratedGpuTimes, reason)
+            }
+            Placement::Uncalibrated if clock.calibration.is_some() => (
+                Degradation::UncalibratedGpuTimes,
+                "the device's calibrated timestamps could not be read as it completed".to_owned(),
+            ),
+            Placement::Uncalibrated => (
+                Degradation::UncalibratedGpuTimes,
+                "the device calibrates its timestamps against no host clock the runtime reads"
+                    .to_owned(),
+            ),
+            Placement::Disagreed { by, deviation } => (
+                Degradation::UncalibratedGpuTimes,
+                format!(
+                    "the device's calibration placed them {by} ns outside the command buffer's \
+                     life, between its first submission and its completion, where it stated a \
+                     deviation of {deviation} ns: its timestamps count on another clock than its \
+                     calibrated one"
+                ),
+            ),
+        };
+        let stamps = format!("{}-bit timestamps of {} ns", clock.valid_bits, clock.period);
+        Some((kind, format!("{reason} ({stamps})")))
+    }
 }
 
 /// Of the readings `read` gives, the one of the smallest deviation, and how many `read` was
@@ -399,8 +531,9 @@ impl GpuClock {
     /// The host times, in nanoseconds of the host's clock, of a command buffer's timestamps
     /// `start` and `end`, and how they were placed: by `reading`'s pair where they lie inside the
     /// command buffer's `life` within the reading's deviation and the clocks' drift since it
-    /// ([`DRIFT_PPM`]); else, and without a reading, ending where `life` ends, the host time its
-    /// completion was seen, and starting their duration before (the module docs).
+    /// ([`DRIFT_PPM`]), loosely where that deviation is above [`SETTLED`]; else, and without a
+    /// reading, ending where `life` ends, the host time its completion was seen, and starting
+    /// their duration before (the module docs).
     pub(crate) fn span(
         &self,
         reading: Option<Reading>,
@@ -428,7 +561,10 @@ impl GpuClock {
             let by = early.max(late);
             return (by_completion, Placement::Disagreed { by, deviation });
         }
-        (placed, Placement::Calibrated)
+        match deviation > SETTLED {
+            true => (placed, Placement::Loose { deviation }),
+            false => (placed, Placement::Calibrated),
+        }
     }
 
     /// The nanoseconds from timestamp `start` to `end`.
@@ -532,6 +668,13 @@ pub(crate) struct Timing {
     /// docs).
     host_reset: bool,
     pools: Mutex<Pools>,
+    /// Its command buffers note when their first batch became their queue's head and when the
+    /// submission of their last batch returned (`METAL2VULKAN_QUEUE_TIMES`, a default-off
+    /// diagnostic): [`KernelTimes::became_head`], [`KernelTimes::returned_at`].
+    queue_times: AtomicBool,
+    /// Its encoders' times (`METAL2VULKAN_ENCODER_TIMES`, a default-off diagnostic:
+    /// `encoder_times.rs`).
+    encoders: EncoderTimes,
 }
 
 /// A device's timestamp pools, made as its command buffers in flight need them, and the most it
@@ -680,8 +823,8 @@ impl Drop for Slot {
 impl Timing {
     /// The timing of a device whose runtime queue family has `valid_bits` timestamp bits, ticking
     /// every `period` nanoseconds, calibrated by `calibration` where it has one ([`calibrated`]).
-    /// With `from_host`, it answers GPU times from the host and writes no timestamps (the module
-    /// docs), for that reason. With `scarce_pools`
+    /// With `from_host`, it answers GPU times from the host and writes no timestamps for command
+    /// buffers' own times (the module docs), for that reason. With `scarce_pools`
     /// (`DriverFact::TimestampPoolsAreCounterSampleBuffers`) it makes one timestamp pool at most,
     /// else as many as its command buffers in flight need until the device refuses one. With
     /// `prefixed`, a slot also holds the start its command buffer's first encoder writes
@@ -707,7 +850,37 @@ impl Timing {
                 (false, true) => Pools::new(None, PREFIXED),
                 (false, false) => Pools::new(None, PLAIN),
             }),
+            queue_times: AtomicBool::new(queue_times_asked()),
+            // Where its queue family writes timestamps, its slots are reset on the host, and its
+            // pools are not Metal's counter sample buffers nor its timestamps waits for every
+            // queue's (`encoder_times.rs`).
+            encoders: EncoderTimes::new(
+                valid_bits > 0
+                    && host_reset
+                    && !scarce_pools
+                    && from_host != Some(FromHost::Driver),
+            ),
         }
+    }
+
+    /// Its encoders' times (`encoder_times.rs`).
+    pub(crate) fn encoders(&self) -> &EncoderTimes {
+        &self.encoders
+    }
+
+    /// Whether its command buffers note queue times (`METAL2VULKAN_QUEUE_TIMES`): when their
+    /// first batch became their queue's head and when the submission of their last batch
+    /// returned; and the submitting thread's CPU time across each submission
+    /// (`WorkCounts::batch_submit_cpu_nanos`).
+    pub(crate) fn queue_times(&self) -> bool {
+        self.queue_times.load(Ordering::Relaxed)
+    }
+
+    /// A device test's: its command buffers note queue times from now on, whatever the
+    /// process's environment.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn note_queue_times(&self) {
+        self.queue_times.store(true, Ordering::Relaxed);
     }
 
     /// Whether its slots hold the start a command buffer's first encoder writes as it opens (the
@@ -755,7 +928,8 @@ impl Timing {
         lock(&self.pools).slots()
     }
 
-    /// Release the device's timestamp pools, at its teardown, inside its section.
+    /// Release the device's timestamp pools, its encoder times' among them, at its teardown,
+    /// inside its section.
     ///
     /// # Safety
     ///
@@ -765,6 +939,8 @@ impl Timing {
             // SAFETY: the caller's.
             unsafe { release::object(device, queries) };
         }
+        // SAFETY: the caller's.
+        unsafe { self.encoders.release(device) };
     }
 
     /// The device's clock, where its queue family writes timestamps.
@@ -772,8 +948,8 @@ impl Timing {
         self.clock.as_ref()
     }
 
-    /// Whether the device answers GPU times from the host, writing no timestamps (the module
-    /// docs).
+    /// Whether the device answers GPU times from the host, writing no timestamps for command
+    /// buffers' own times (the module docs).
     pub(crate) fn answers_from_host(&self) -> bool {
         self.from_host.is_some()
     }
@@ -873,9 +1049,17 @@ impl Calibration {
                 deviation: deviation.saturating_add(around),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            None
+            // The performance counter's ticks, as Vulkan gives that domain's value, onto the
+            // host's clock: the same counter, in nanoseconds.
+            Some(Reading {
+                pair: Pair {
+                    ticks: values[0],
+                    host: counter_nanos(values[1])?,
+                },
+                deviation,
+            })
         }
     }
 }
@@ -932,14 +1116,31 @@ unsafe fn calibration(
     })
 }
 
+/// Whether the process asked for queue times (`METAL2VULKAN_QUEUE_TIMES`, a default-off
+/// diagnostic): read once.
+fn queue_times_asked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(metal2vulkan::env_vars::queue_times)
+}
+
 /// A command buffer's kernel times, in nanoseconds of the host's clock, 0 until known: apart
-/// from its state, so a read waits for no submission in progress (the module docs).
+/// from its state, so a read waits for no submission in progress (the module docs). The start is
+/// shown with the end alone ([`shown_start`](Self::shown_start)), as Metal shows them.
 #[derive(Debug, Default)]
 pub(crate) struct KernelTimes {
     /// The scheduler began submitting its first batch.
     start: AtomicU64,
-    /// The scheduler finished submitting its last batch.
+    /// The scheduler called the driver's submission of its last batch.
     end: AtomicU64,
+    /// The scheduler called the first driver's submission that carried a batch of it (a group's,
+    /// where the batch waited in one, `command_buffer/group.rs`).
+    first: AtomicU64,
+    /// Its first batch became the first of its queue's batches the scheduler had not taken,
+    /// where the device notes queue times ([`Timing::queue_times`]).
+    head: AtomicU64,
+    /// The driver's submission that carried its last batch returned, where the device notes
+    /// queue times.
+    returned: AtomicU64,
 }
 
 impl KernelTimes {
@@ -948,19 +1149,78 @@ impl KernelTimes {
         self.start.store(host_nanos(), Ordering::Release);
     }
 
-    /// The scheduler finished submitting the last batch at host time `at`.
+    /// The scheduler called the driver's submission of the last batch at host time `at`, or
+    /// held it for a later one (the module docs).
     pub(crate) fn end_at(&self, at: u64) {
         self.end.store(at, Ordering::Release);
     }
 
-    /// When the scheduler began submitting the first batch; 0 before.
+    /// The scheduler called a driver's submission that carried a batch at host time `at`: kept
+    /// where it is the first.
+    pub(crate) fn submitted_at(&self, at: u64) {
+        let _ = (self.first).compare_exchange(0, at, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The earliest host time its GPU work can have begun at, as the scheduler saw it: the call of
+    /// the first driver's submission that carried a batch of it, where that came before its kernel
+    /// end (its work went as more than one submission), else its kernel end (one submission, or
+    /// its last batch held for a group's: the module docs; or made `Scheduled` behind a host step
+    /// before any batch of it went, `scheduler/mod.rs`, a time its work began after); 0 before.
+    pub(crate) fn first_submitted(&self) -> u64 {
+        let end = self.end();
+        match self.first.load(Ordering::Acquire) {
+            0 => end,
+            first => first.min(end),
+        }
+    }
+
+    /// When the scheduler began submitting the first batch, whether or not it finished
+    /// submitting the last: the scheduler's own reads; 0 before.
     pub(crate) fn start(&self) -> u64 {
         self.start.load(Ordering::Acquire)
     }
 
-    /// When the scheduler finished submitting the last batch; 0 before.
+    /// When the scheduler began submitting the first batch, as `kernelStartTime` shows it: 0
+    /// until the end is known too, so that no read sees a start without an end, in either order
+    /// of the two reads (the module docs). The start is stored before the end on every path
+    /// ([`begin`](Self::begin) before [`end_at`](Self::end_at)), so the end's acquire load orders
+    /// the start's after it: a start shown means a later read of the end sees it, and an end seen
+    /// means a later read of the start shows it.
+    pub(crate) fn shown_start(&self) -> u64 {
+        match self.end.load(Ordering::Acquire) {
+            0 => 0,
+            _ => self.start(),
+        }
+    }
+
+    /// When the scheduler called the driver's submission of the last batch; 0 before.
     pub(crate) fn end(&self) -> u64 {
         self.end.load(Ordering::Acquire)
+    }
+
+    /// Its first batch is its queue's head in the scheduler's order now: noted once, where `on`
+    /// ([`Timing::queue_times`]); a batch put back at its place keeps the first time.
+    pub(crate) fn became_head(&self, on: bool) {
+        if on && self.head.load(Ordering::Relaxed) == 0 {
+            self.head.store(host_nanos(), Ordering::Relaxed);
+        }
+    }
+
+    /// The submission that carried its last batch returned at host time `at`.
+    pub(crate) fn returned_at(&self, at: u64) {
+        self.returned.store(at, Ordering::Relaxed);
+    }
+
+    /// When its first batch became its queue's head; 0 before, and where the device notes no
+    /// queue times.
+    pub(crate) fn head(&self) -> u64 {
+        self.head.load(Ordering::Relaxed)
+    }
+
+    /// When the submission that carried its last batch returned; 0 before, and where the device
+    /// notes no queue times.
+    pub(crate) fn returned(&self) -> u64 {
+        self.returned.load(Ordering::Relaxed)
     }
 }
 
@@ -985,6 +1245,13 @@ pub(crate) struct Times {
     /// Its GPU start and end where it wrote no timestamps: placed among its queue's command
     /// buffers by the completion turn as it completed.
     pub(crate) placed: Option<(u64, u64)>,
+    /// When the submission was called of its first batch whose `VkQueue` waits on the GPU for
+    /// work of another `VkQueue`'s the host had not seen complete: from then on its `VkQueue`
+    /// holds it, so its long mark counts from then (`queue_share.rs`).
+    pub(crate) waited_across: Option<u64>,
+    /// Its ended encoders' times, where its device times its encoders, until its completion reads
+    /// them (`encoder_times.rs`).
+    pub(crate) encoders: Vec<Timed>,
 }
 
 /// What a command buffer's timestamps gave.
@@ -1001,7 +1268,8 @@ pub(crate) enum Stamped {
     /// Every slot of the device's pools was held at its commit, and no pool more could be made:
     /// it has none.
     NoSlot,
-    /// Read once it completed: its start and end ticks, where the GPU wrote both.
+    /// Read once it completed: its start and end ticks, where the GPU wrote both. `None`, one read
+    /// unavailable, says the driver dropped its work: it fails as Metal's victim (the module docs).
     Read(Option<(u64, u64)>),
     /// The read failed with this result.
     Failed(vk::Result),

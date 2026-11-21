@@ -22,10 +22,17 @@
 // Every public item says what it is and its Metal counterpart: a new undocumented one fails the
 // warnings-denied gates.
 #![warn(missing_docs)]
+// The compiler's proofs of `Send` and `Sync` in this crate (`render/deferral.rs`) walk a render
+// encoder's lowering through the standard library's containers, which take more levels per
+// container than they did: past the default limit of 128 (`recursion_depth_exceeding_limit`). A
+// program's crate keeps the default (`tests/consumer_auto_traits.rs`).
+#![recursion_limit = "256"]
 
 mod address;
 mod address_map;
 mod address_pool;
+mod alias_split;
+mod allocations;
 mod amplification;
 mod apple_only;
 mod argument_encoder;
@@ -35,6 +42,7 @@ mod attachment_stand_in;
 mod attachmentless;
 mod attributes;
 mod batch_order;
+mod begin_ahead;
 mod binary_archive;
 mod binding;
 mod binding_view;
@@ -47,6 +55,7 @@ mod buffer;
 mod buffer_descriptor;
 mod buffer_texture;
 mod capabilities;
+mod check_draw;
 mod chroma_pairs;
 mod churn_counts;
 mod clear_reach;
@@ -55,14 +64,18 @@ mod color_list;
 mod color_reformat;
 mod color_resolve;
 mod command_buffer;
+mod commit_times;
 mod compressed_blit;
 mod compute;
 mod contexts;
 mod copied;
+mod copied_base;
 mod copy_plan;
+mod copy_run;
 mod creation;
 mod deferred;
 mod degradation;
+mod depth_clamp;
 mod depth_copy;
 mod depth_stand_in;
 mod depth_stencil;
@@ -72,7 +85,6 @@ mod derived;
 mod descriptor_arena;
 mod detach;
 mod device;
-#[cfg(unix)]
 mod dirty_pages;
 mod dispatch_execute;
 mod dma_buf;
@@ -84,25 +96,34 @@ mod dynamic_library;
 mod dynamic_state;
 mod enables;
 mod encoder;
+mod encoder_fold;
+mod encoder_times;
+mod encoder_trail;
 mod error;
 mod etc;
 mod event;
 mod event_timeline;
 mod exactness;
 mod execution;
+mod extended_canonical;
 mod families;
 #[doc(hidden)]
 pub use execution::{ExecutedPipeline, Execution};
 mod exit_guard;
-pub use exit_guard::process_exiting;
+pub use exit_guard::{process_exiting, program_instance_made};
 #[doc(hidden)]
 pub use exit_guard::{registrations as exit_registrations, Registrations as ExitRegistrations};
 mod executed_commands;
+#[cfg(unix)]
+mod exported_memory;
+#[cfg(unix)]
+mod exported_semaphore;
 mod fence;
 mod fetch_reach;
 mod fill_value;
 mod fragment_imageblock;
 mod framebuffer_fetch;
+mod free_thread;
 mod freed_memory;
 mod fresh_pages;
 mod fresh_unwritten;
@@ -113,6 +134,8 @@ mod generated_execute;
 mod gpu_execute;
 mod gpu_pools;
 mod gpu_time;
+#[cfg(unix)]
+mod handed_descriptor;
 mod heap;
 mod heap_sets;
 mod host_aliases;
@@ -120,10 +143,9 @@ mod host_backing;
 mod host_bytes;
 mod host_memory;
 mod host_ram;
-#[cfg(unix)]
 mod host_residency;
-#[cfg(unix)]
 mod host_shared_pointers;
+mod idle_sweep;
 mod image_barrier;
 mod image_plan;
 mod in_place;
@@ -135,6 +157,9 @@ mod indirect_dispatch;
 mod indirect_execute;
 mod interop;
 mod kept_bytes;
+#[cfg(debug_assertions)]
+mod kept_checks;
+mod kept_commands;
 mod key_hash;
 mod library;
 mod linear_attachment;
@@ -145,8 +170,11 @@ mod live_buffers;
 mod loaded;
 mod loader_word;
 mod managed;
+mod managed_copy;
+mod managed_sync;
 mod memory;
 mod memory_log;
+mod merge_scratch;
 mod metal_release;
 mod mipmap;
 mod mipmap_filter;
@@ -158,6 +186,9 @@ mod nan_clear;
 mod neutral;
 mod noted_apart;
 mod owned_kernel;
+mod pass_log;
+mod pass_runs;
+mod pending_audit;
 mod pending_dispatch;
 mod pipeline;
 mod pixel_format_info;
@@ -166,10 +197,15 @@ mod private_properties;
 mod program_objects;
 mod pvrtc;
 mod queue;
+mod queue_share;
+mod queue_switch_check;
+mod queue_turns;
+mod queue_wait;
 mod range;
 mod rate_map;
 mod rate_mapped_pass;
 mod read_only_view;
+mod read_twin;
 mod reader_sizes;
 mod rebind;
 mod recorder;
@@ -182,6 +218,7 @@ mod render_state;
 mod render_target;
 mod render_values;
 mod replay;
+mod repro;
 mod residency;
 mod resolve;
 mod resource;
@@ -199,26 +236,42 @@ mod shader_cache;
 mod shadow;
 mod shadow_copy_back;
 mod shadow_copy_in;
+mod shadow_log;
 mod shadow_merge;
+mod shadow_splice;
+mod shadow_standing;
 mod shadow_stencil;
+mod shards;
 mod sharing;
+mod slow_submissions;
 mod sorted_chunks;
 mod spares;
 mod sparse;
 mod stencil_copy;
+mod step_aside;
 mod storage_placeholder;
+mod store_out;
+mod submit_check;
+mod submit_failure;
 mod tessellation;
 mod texture;
 mod texture_descriptor;
+mod texture_placement;
+mod this_thread;
 mod tile_pass;
+mod tiling_check;
 mod tracker;
 mod trails;
 mod two_planes;
+mod uniform_texels;
 mod unique_identifier;
+mod unshared_hold;
 mod upload;
 mod used_resources;
 mod values;
 mod versioned;
+mod view_check;
+mod view_placement;
 mod view_plan;
 mod visibility;
 mod warm;
@@ -230,6 +283,7 @@ mod ycbcr_device;
 
 #[cfg(test)]
 mod tests;
+mod write_routes;
 mod written_commands;
 
 pub use address::{AddressPlacement, AddressRange, GpuAddress, PlacementConflict, RangeToken};
@@ -242,9 +296,9 @@ pub use attributes::PurgeableState;
 pub use binary_archive::{BinaryArchive, BinaryArchiveDescriptor};
 pub use blit::BlitCommandEncoder;
 pub use buffer::Buffer;
-pub use buffer_descriptor::{BufferContents, BufferDescriptor};
+pub use buffer_descriptor::{BufferContents, BufferDescriptor, MemoryExport};
 pub use buffer_texture::IoSurfacePlane;
-pub use capabilities::{DeviceProperties, Query};
+pub use capabilities::{DeviceProperties, MacClass, Query};
 pub use churn_counts::{ObjectChurn, ShadowKeeps};
 pub use command_buffer::checks::{Submission, SubmissionCheck};
 pub use command_buffer::{CommandBuffer, CommitFailure, FailedEncoders, Handler};
@@ -254,13 +308,16 @@ pub use degradation::{Degradation, DegradationCategory, DegradeNotice};
 pub use degradation::{MisplacedNotice, NoticePlace};
 pub use depth_stencil::DepthStencilState;
 pub use device::{
-    DebugMessage, Device, DeviceHandles, DeviceKind, DeviceOptions, LayerSetting,
+    DebugMessage, Device, DeviceHandles, DeviceKind, DeviceOptions, ExtraQueue, LayerSetting,
     LayerSettingValue, MessageKind, MessageSeverity, MessageSink, PhysicalDeviceIdentity,
-    RawDevice,
+    QueueLimits, RawDevice, ReservedQueue,
 };
 pub use dirty_pages::{DirtyPages, DirtyStamp};
 #[cfg(unix)]
-pub use dma_buf::{DmaBufChunk, DmaBufRequest, DmaBufSource};
+pub use dma_buf::{
+    DmaBufChunk, DmaBufRequest, DmaBufRunsSource, DmaBufSource, DmaBufStandingRefusal,
+    SharedDmaBufImport,
+};
 pub use dynamic_library::DynamicLibrary;
 pub use error::DynamicLibraryError;
 pub use error::ExtensionFeature;
@@ -268,12 +325,14 @@ pub use error::FailureOrigin;
 pub use error::InstanceExtensionRequired;
 pub use error::MetalError;
 pub use error::Nil;
+pub use error::NotInPlace;
 pub use error::Unproven;
 pub use error::{
-    ArchivedPipeline, BinaryArchiveError, BinaryArchiveMiss, CommandBufferError, DeadlockCause,
-    DriverSetting, EncoderCall, Error, InstanceApiVersion, Invalid, LoaderNotFound, MemoryKind,
-    MeshRecordsOverflow, Problem, RuntimeGap, SamplerLimit, ShaderCacheError,
-    TessellationRecordsOverflow, TimedOut, VkResultCode,
+    ArchivedPipeline, BinaryArchiveError, BinaryArchiveMiss, CommandBufferError, CopyQueueProblem,
+    DeadlockCause, DeviceRefused, DriverSetting, EncoderCall, Error, IndirectRule,
+    InstanceApiVersion, Invalid, LoaderNotFound, MemoryKind, MeshRecordsOverflow, Problem,
+    RuntimeGap, SamplerLimit, ShaderCacheError, SyncFileProblem, TessellationRecordsOverflow,
+    TimedOut, VkResultCode,
 };
 pub use error::{FailedPipeline, FailedState, PipelineCreationCause};
 pub use event::{
@@ -283,6 +342,8 @@ pub use exactness::Exactness;
 pub use executed_commands::{
     ExecutedCommand, ExecutedCommands, ExecutedCommandsHandler, RecordsRead,
 };
+#[cfg(unix)]
+pub use exported_memory::ExportedMemory;
 pub use families::{
     FamilyRow, FeatureRow, FormatCapabilities, FormatCapability, FormatRow, Framework, GpuFamily,
     LimitRow, Refusal, RowAudit, RowState,
@@ -300,10 +361,11 @@ pub use host_ram::{HostRam, HostRamUse};
 pub use indirect_command_buffer::{
     EncodedComputeCommand, EncodedRenderCommand, IndirectBufferBinding, IndirectCommand,
     IndirectCommandBuffer, IndirectCommandBufferDescriptor, IndirectCommandBufferProblem,
-    IndirectCommandCheck, IndirectCommandCheckNeeds, IndirectComputeCommand, IndirectDispatch,
-    IndirectDraw, IndirectRenderCommand, NIL_PATCH_BUFFER_ADDRESS,
+    IndirectCommandCheck, IndirectCommandCheckNeeds, IndirectComputeCommand, IndirectComputeSet,
+    IndirectDispatch, IndirectDraw, IndirectRenderCommand, IndirectRenderSet,
+    NIL_PATCH_BUFFER_ADDRESS,
 };
-pub use interop::SemaphoreProblem;
+pub use interop::{SemaphoreProblem, VkEventSignal, VkEventWait, VkHostMemory};
 pub use library::{Function, FunctionDescriptor, Library};
 pub use linear_plan::BufferTextureProblem;
 pub use metal2vulkan::device::DriverFact;
@@ -312,7 +374,7 @@ pub use mipmap_plan::MipmapProblem;
 #[doc(hidden)]
 pub use pipeline::budget::{set_making_budget_for_measurement, MakingBudgetStarted};
 #[doc(hidden)]
-pub use pipeline::objects::makes_layouts_past_support;
+pub use pipeline::objects::{binds_unordered_interlocked_buffers, makes_layouts_past_support};
 pub use pipeline::{
     BinaryFunctionProblem, BinaryFunctionStage, RenderPipelineFunctionsDescriptor,
     RequiredThreadsProblem,
@@ -349,14 +411,20 @@ pub use sparse::encoder::ResourceStateCommandEncoder;
 pub use sparse::{SparsePageSize, SparseProblem, SparseTextureRegionAlignmentMode};
 pub use texture::{SharedTextureHandle, Texture, VkImageLayouts, WrappedImageProblem};
 pub use texture_descriptor::{TextureDescriptor, TextureProblem, TextureSwizzleChannels};
+pub use texture_placement::{
+    InPlaceAccess, InPlaceRefusal, InPlaceRowEnds, TexturePlacement, TextureShadowReason,
+};
+pub use tiling_check::{TilingCost, TilingVerdict};
 pub use used_resources::{EncoderKind, EndedEncoder, UsedResources};
 pub use values::{
     CommandBufferStatus, Coordinate2D, CpuCacheMode, HazardTrackingMode, Origin, Region,
     ResourceOptions, Size, StorageMode,
 };
+pub use view_check::{ViewCosts, ViewVerdict};
+pub use view_placement::{ViewPlacement, ViewShadowReason};
 pub use view_plan::ViewProblem;
-pub use visibility::{VisibilityProblem, VisibilityResultMode};
+pub use visibility::{VisibilityProblem, VisibilityResultMode, VisibilityResultType};
 pub use warm::{PipelineRecord, WarmStatistics};
-pub use work_counts::{CopySite, MemoryFrees, WorkCounts};
+pub use work_counts::{CopySite, DeviceCheckWork, MemoryFrees, WorkCounts};
 pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
 pub use ycbcr::{IoSurfaceYCbCr, SurfaceYCbCrMatrix};

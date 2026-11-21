@@ -1,3 +1,14 @@
+# Vendored `crates/metal2vulkan-runtime` from steelbrain/metal2vulkan, pinned by the repo's
+# `android/third_party/reims-vgpu/Cargo.toml` at rev 46e7cc96a284150bdf19b4a6a7890b0a8bc0ef71
+# (branch `development`, the revision UniXNU pins for macOS-on-Adreno740).
+#
+# The patches this copy carries, all marked "Android bring-up" in the source:
+#   1. `DeviceOptions::loader_entry`: create the device through the loader the host opened (Android's
+#      libadrenotools namespace) instead of opening `libvulkan.so` by name, which is the vendor
+#      driver — the whole reason the framebuffer-fetch pipelines were refused.
+#   2. (earlier session) `copied` host buffers, `cfg(target_os = "linux")` -> android wherever the
+#      runtime asks the kernel about pages: upstream now carries most of that itself.
+# Anything else here is upstream's, unmodified.
 [package]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
@@ -6,18 +17,35 @@ rust-version = "1.98"
 license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
 authors = ["Anees Iqbal <hello@aneesiqbal.ai>"]
 description = "The Metal API on Vulkan: Metal's objects and calls run on a Vulkan device through ash"
+readme = "README.md"
 repository = "https://github.com/steelbrain/metal2vulkan"
-homepage = "https://github.com/steelbrain/metal2vulkan"
+documentation = "https://docs.rs/metal2vulkan-runtime"
+keywords = ["metal", "vulkan", "gpu", "graphics"]
+categories = ["graphics", "api-bindings"]
 autobins = false
 autoexamples = false
-autotests = false
 
 [lib]
 name = "metal2vulkan_runtime"
 path = "src/lib.rs"
 
 [dependencies]
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "219f01365dc4c8eb346816c405b5b17403793764", features = ["ash"] }
-ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
-libc = "0.2"
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "46e7cc96a284150bdf19b4a6a7890b0a8bc0ef71", features = ["ash", "serde"] }
+ash = { version = "0.38", features = ["std", "loaded"] }
 sha2 = { version = "0.11", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[workspace]

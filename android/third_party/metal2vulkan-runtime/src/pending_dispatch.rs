@@ -16,27 +16,30 @@
 //! - **When it records.** `commit` records it where its pipelines are made by then; otherwise
 //!   the scheduler's host step records it once they are made (`scheduler`), its batch held in
 //!   its queue's order meanwhile, with no wait for the GPU: the batches committed after it on its
-//!   queue complete after it, as Metal's do, and a batch of another queue waits for it only
-//!   where the two share a resource one of them writes (`scheduler/order.rs`).
+//!   queue complete after it, as Metal's do, and a batch of another queue committed after it
+//!   waits for it only where the two share a fence: one that writes a resource it uses, or uses
+//!   one it writes, goes first and it after, as an x86 Mac's GPU may take a later commit of
+//!   another queue first (`scheduler/order.rs`, **Held batches give way**), but for a batch of a
+//!   queue made for copies, which waits for it there as for any conflict (**But not to a queue
+//!   made for copies**).
 //! - **A failed making.** A making that failed, or that its state's release stopped
 //!   (`piece_holds.rs`), is made again by the recording, as a caller after a failed making does
 //!   (`making.rs`), on the scheduler's thread; where that fails too, the command buffer completes
 //!   with `CommandBufferError::PipelineCreation`, its batch and those after it unrun, and
 //!   `CommandBuffer::failed_pipeline` names the dispatch: its encoder's place and its order among
 //!   the encoder's dispatches, the state, its variant and specialization, and the driver's error.
-//! - **A making past its bound.** Under `PipelineWaitPolicy::Bounded` (the default) the recording
-//!   waits for a making until its command buffer's bound at most, its commit plus the policy's
-//!   `pipeline_commit_wait` (4.5 s by default), as a draw's does (`render/pending.rs`): a dispatch
-//!   whose making is still in flight then records its barrier and no dispatch, so writes nothing,
-//!   the command buffer running on without error. `CommandBuffer::dropped_draw` names the first
-//!   such command with the error `VK_TIMEOUT`; counted,
-//!   `WorkCounts::dispatches_dropped_still_making`; announced `dispatch-dropped-still-making`.
-//!   Under `PipelineWaitPolicy::Exact` it waits until each is made.
+//! - **However long the making takes.** Under either `PipelineWaitPolicy` the batch waits for
+//!   the dispatch's makings until they are made, past its command buffer's bound
+//!   (`CommandBuffer::making_deadline`) too (`Segment::steps_after_pipelines`): a dispatch
+//!   writes what Metal's writes, its command buffer completing later, as on a slower GPU, and
+//!   never runs without its pipeline. Only its queue's line waits for it, as above; the
+//!   program's calls return as before (`commit` records it only where it is made, and waits for
+//!   no making).
 
-use super::binding::{self, PushWrite, SetWrite};
+use super::binding::{self, PushWrite, PushedSetZero, SetWrite};
 use super::command_buffer::CommandBuffer;
 use super::encoder::{EncoderCore, RecordedSegment};
-use super::error::{vulkan, Error, FailedPipeline, FailedState};
+use super::error::{Error, FailedPipeline, FailedState};
 use super::indirect_dispatch::FlatPreprocess;
 use super::pipeline::{ComputePipelineState, RawPipeline, RegionKey, RegionPipeline, Variant};
 use super::resource::ResourceKey;
@@ -70,63 +73,92 @@ pub(super) struct Recording {
 }
 
 impl Recording {
-    /// Record the dispatch's commands into `command_buffer` with `pipelines`, its regions'.
+    /// Record the dispatch's commands into `command_buffer` with `pipelines`, its regions',
+    /// through `held`, what the encoder's dispatches recorded at its compute bind point that
+    /// still holds there (`binding::PushedSetZero`): a region binds its pipeline only where
+    /// another is bound, and the first pushes only the writes of set 0 that differ from those set
+    /// 0 holds, none where none does; where `stale`, the driver's pushed descriptors going stale
+    /// across a pipeline bind (`RuntimeDriverDefect::PushedDescriptorsStaleAfterPipelineBinds`),
+    /// each region that binds its pipeline pushes at least one write after the bind. The writes
+    /// its pushes carried.
     ///
     /// # Safety
     ///
     /// `command_buffer` is recording outside a render pass, by this caller alone; every object
     /// recorded is live until it completes, and `pipelines` are made with the variant's layout,
-    /// one per region.
+    /// one per region. `held` is what `command_buffer`'s compute bind point holds: what the
+    /// commands recorded into it since `held` was empty recorded there.
     pub(super) unsafe fn record(
         &self,
         raw: &Vk,
         command_buffer: vk::CommandBuffer,
         pipelines: &[Arc<RawPipeline>],
-    ) {
+        (held, stale): (&mut PushedSetZero, bool),
+    ) -> u64 {
+        let push = raw.push_descriptor().filter(|_| !self.pushed.is_empty());
+        let mut carried = 0;
         // SAFETY: the caller's contract; the gates lie in the command buffer's arena.
         unsafe {
             if let Some(preprocess) = &self.preprocess {
+                // Its own pipeline and push constants, at the compute bind point.
+                held.forget();
                 preprocess.record(raw, command_buffer, self.gates.first());
             }
-            match raw.push_descriptor().filter(|_| !self.pushed.is_empty()) {
-                Some(push) => binding::push_set(
-                    push,
-                    command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.layout,
-                    &self.pushed,
-                ),
-                None => {
-                    if let Some(set) = self.set {
-                        raw.cmd_bind_descriptor_sets(
-                            command_buffer,
-                            vk::PipelineBindPoint::COMPUTE,
-                            self.layout,
-                            0,
-                            &[set],
-                            &self.offsets,
-                        );
-                    }
-                }
-            }
-            if let Some(heap) = self.heap {
-                raw.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.layout,
-                    1,
-                    &[heap],
-                    &[],
-                );
-            }
-            for (index, ((groups, push), pipeline)) in
+            held.records_with(self.layout);
+            for (index, ((groups, constants), pipeline)) in
                 self.regions.iter().zip(pipelines).enumerate()
             {
                 if index > 0 {
                     Barrier::between_dispatches().record(raw, command_buffer);
                 }
-                raw.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline.raw);
-                for (stages, offset, bytes) in push {
+                let bound = held.binds(pipeline.raw);
+                if bound {
+                    raw.cmd_bind_pipeline(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline.raw,
+                    );
+                }
+                match push {
+                    Some(push) if index == 0 || (bound && stale) => {
+                        let writes = held.carry(self.layout, &self.pushed, stale);
+                        if !writes.is_empty() {
+                            binding::push_set(
+                                push,
+                                command_buffer,
+                                vk::PipelineBindPoint::COMPUTE,
+                                self.layout,
+                                writes,
+                            );
+                        }
+                        carried += writes.len() as u64;
+                    }
+                    None if index == 0 => {
+                        if let Some(set) = self.set {
+                            raw.cmd_bind_descriptor_sets(
+                                command_buffer,
+                                vk::PipelineBindPoint::COMPUTE,
+                                self.layout,
+                                0,
+                                &[set],
+                                &self.offsets,
+                            );
+                            held.set_bound();
+                        }
+                    }
+                    _ => {}
+                }
+                if let (0, Some(heap)) = (index, self.heap) {
+                    raw.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.layout,
+                        1,
+                        &[heap],
+                        &[],
+                    );
+                }
+                for (stages, offset, bytes) in constants {
                     raw.cmd_push_constants(command_buffer, self.layout, *stages, *offset, bytes);
                 }
                 match (&self.preprocess, self.gates.get(index)) {
@@ -143,6 +175,7 @@ impl Recording {
                 }
             }
         }
+        carried
     }
 }
 
@@ -210,13 +243,10 @@ impl PendingDispatch {
         EncoderUses::new(false).finish()
     }
 
-    /// Its regions' `VkPipeline`s, waiting for each making until `command_buffer`'s bound at
-    /// most, where it has one: one whose making failed made again here. Where that fails,
-    /// `command_buffer` fails so (`CommandBuffer::fail_pipeline`). `None` where a making is still
-    /// in flight at the bound: the dispatch is dropped (`CommandBuffer::drop_late_dispatch`, the
-    /// module docs).
-    fn made(&self, command_buffer: &CommandBuffer) -> Result<Option<Vec<Arc<RawPipeline>>>, Error> {
-        let deadline = command_buffer.making_deadline();
+    /// Its regions' `VkPipeline`s, waiting for each making until it is made, which its batch's
+    /// host step runs only after (`Segment::steps_after_pipelines`): one whose making failed made again here.
+    /// Where that fails, `command_buffer` fails so (`CommandBuffer::fail_pipeline`).
+    fn made(&self, command_buffer: &CommandBuffer) -> Result<Vec<Arc<RawPipeline>>, Error> {
         let failed = |key: &RegionKey, error| FailedPipeline {
             encoder: self.encoder,
             draw: self.dispatch,
@@ -230,18 +260,7 @@ impl PendingDispatch {
             let outcome = match pipeline {
                 RegionPipeline::Made(pipeline) => Ok(Arc::clone(pipeline)),
                 RegionPipeline::Making(pending) => {
-                    let waited = match deadline {
-                        Some(deadline) => pending.wait_until(deadline),
-                        None => Some(pending.wait()),
-                    };
-                    let Some(waited) = waited else {
-                        // Still being made at the bound: the dispatch runs nothing, and a later
-                        // command buffer dispatches with the pipeline once it is made.
-                        let late = failed(key, vulkan(vk::Result::TIMEOUT));
-                        command_buffer.drop_late_dispatch(late, false);
-                        return Ok(None);
-                    };
-                    waited.or_else(|_| self.variant.make_region(key))
+                    (pending.wait()).or_else(|_| self.variant.make_region(key))
                 }
             };
             match outcome {
@@ -252,7 +271,7 @@ impl PendingDispatch {
                 }
             }
         }
-        Ok(Some(made))
+        Ok(made)
     }
 
     /// Its segment of `command_buffer`, recorded once its pipelines are made: its barrier, then
@@ -272,28 +291,28 @@ impl PendingDispatch {
     /// failed fails the command buffer as it does where the dispatch records.
     pub(super) fn record(&self, command_buffer: &CommandBuffer) -> Result<RecordedSegment, Error> {
         let pipelines = self.made(command_buffer)?;
-        if let (Some(creation), Some(pipelines)) = (&self.creation, &pipelines) {
+        if let Some(creation) = &self.creation {
             creation.get_or_init(|| pipelines.iter().map(|made| made.created_in).collect());
         }
         if command_buffer.encoder_rebound(self.encoder) {
             return Ok(EncoderCore::unrecorded_segment());
         }
         let (barrier, recording, made) = (self.barrier, &self.recording, &pipelines);
+        let stale = command_buffer.device().shared().pushes_after_pipeline_binds;
         let record = |raw: &Vk, cb: vk::CommandBuffer| {
             // SAFETY: the segment's command buffer is recording outside a render pass, by this
-            // call alone; what the dispatch records was retained at the dispatch, its pipelines
-            // with the segment, and they are its variant's, one per region. A dropped dispatch
-            // (none) records its barrier alone, which the encoder's later commands count on.
+            // call alone, which begins its compute bind point empty; what the dispatch records
+            // was retained at the dispatch, its pipelines with the segment, and they are its
+            // variant's, one per region.
             unsafe {
                 if let Some(barrier) = barrier {
                     barrier.record(raw, cb);
                 }
-                if let Some(made) = made {
-                    recording.record(raw, cb, made);
-                }
+                let held = &mut PushedSetZero::default();
+                recording.record(raw, cb, made, (held, stale));
             }
         };
-        let retained = pipelines.clone().unwrap_or_default();
+        let retained = pipelines.clone();
         EncoderCore::untracked_segment(command_buffer, record, Box::new(retained))
     }
 }

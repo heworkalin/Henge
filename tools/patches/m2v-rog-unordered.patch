@@ -1,0 +1,23 @@
+--- a/crates/metal2vulkan/src/lower/fragment/rog.rs
++++ b/crates/metal2vulkan/src/lower/fragment/rog.rs
+@@ -96,6 +96,20 @@
+ /// form, a group on a color input or on a color output of an attachment the function reads
+ /// ([module docs](self)).
+ pub(super) fn declared(cx: &SelectCx<'_>) -> bool {
++    // HENGE (Android bring-up, opt-in): `REIMS_ROG_UNORDERED=1` runs every raster order group's
++    // accesses unordered where the device has no fragment interlock of either kind. Metal orders a
++    // group's accesses between the fragments covering one pixel; without the interlock that order
++    // is not kept, so two fragments covering one pixel may interleave the reads and the writes a
++    // group names. A group over a color output alone, or one whose read a render target's own order
++    // already covers, observes nothing; one ordering a read and a write across fragments may see
++    // torn values. Where the device has no interlock (Adreno through Turnip: Mesa implements no
++    // `VK_EXT_fragment_shader_interlock`) this is the only way such a pipeline runs at all; it is
++    // the same unordered reading the color-input path takes and records as
++    // `PrecisionNote::UnorderedFetchWithinDraw`, which this path does not record. Off by default:
++    // without the variable the refusal stands, as upstream has it.
++    if std::env::var_os("REIMS_ROG_UNORDERED").is_some_and(|v| v != "0") {
++        return false;
++    }
+     let e = cx.entry;
+     let used = &crate::lower::users::params_used(cx.body);
+     let params = || e.ep.params.iter().filter(move |b| used.contains(&b.param));

@@ -13,12 +13,16 @@
 //!    threadgroup memory length that is not a multiple of 16 is taken (the binder rounds every
 //!    length up to 16, as Metal does). `set_imageblock_size` is checked where Metal checks it, at
 //!    the call.
-//! 2. The tables become a `bind::BindState`; the state's memo gives the plan of its shape, on the
-//!    variant the dispatch runs on (compiled when first needed), and `instantiate_dispatch` the
-//!    command's regions, bytes, and push holes.
-//! 3. [`binding`](super::binding) gives the descriptors, uploads, and push bytes; the variant
-//!    gives set 0 and one `VkPipeline` per region specialization, and the command buffer set 1,
-//!    the heap, which its dispatches on the variant share ([`heap_sets`](super::heap_sets)).
+//! 2. The tables become a `bind::BindState`, brought in place from the one the encoder's last
+//!    dispatch of the same pipeline state bound, where the encoder set it aside, else from its
+//!    last dispatch's (`compute/live.rs`); the pipeline state's kept plans give the plan of its
+//!    shape, on the variant the dispatch runs on (compiled when first needed), and
+//!    `instantiate_dispatch` the command's regions, bytes, and push holes.
+//! 3. [`binding`] gives the descriptors, uploads, and push bytes (an encoder's own dispatch
+//!    through the views, sampler descriptions and host pages its binds kept,
+//!    `binding::BindMemo`); the variant gives set 0 and one `VkPipeline` per region
+//!    specialization, and the command buffer set 1, the heap, which its dispatches on the variant
+//!    share ([`heap_sets`]).
 //! 4. Only then is anything recorded, through the tracker's per-command entry
 //!    ([`EncoderCore::command`]) with the buffers the dispatch reads and writes: a serial encoder
 //!    is an ordered one, so a dispatch gets the barrier its uses need after the encoder's earlier
@@ -43,6 +47,20 @@
 //! there on its folded variant of the call's threadgroup size, behind the same preprocess; any
 //! other dispatch's arguments are copied there, and a host step records it as the direct dispatch
 //! they state once the work before it completed (`indirect_dispatch`).
+//!
+//! A dispatch of an inert kernel (`ComputePipelineState::inert`: its module holds no loop and
+//! writes nothing but its invocations' own and its threadgroups' memory) records no Vulkan
+//! dispatch, direct, indirect or an indirect command buffer's alike (`record`): nothing it does
+//! outlasts it, so nothing later reads it, and the runtime samples no counter that would count its
+//! threads (`RuntimeGap::CounterSampleBuffers`). Everything else of a dispatch's steps 1 to 3
+//! stays: it is checked and planned as any, and the command buffer uses what it binds, as Metal's
+//! does (`EncoderCore::name_uses`). Its uses are named, so the commit copies in the ranges
+//! `did_modify_range` noted of the `Managed` buffers it binds and its batch makes their fills and
+//! first work, where a program that dispatches an empty kernel over its buffers to upload them
+//! ahead of its timed work wants them; and a detached or rebound buffer among them fails the
+//! command buffer. Its uses take no hazard tracking and note no write. The encoder's barriers,
+//! fences and the command buffer's events and completion stay as they are
+//! (`WorkCounts::dispatches_skipped_inert`).
 
 use super::address_map::{self, SamplerMaps};
 use super::argument_table::{check_index, ArgumentTable, Stamp};
@@ -53,7 +71,8 @@ use super::deferred::Deferred;
 use super::degradation::{BoundFormats, CompiledPipeline, Degradation};
 use super::device::Device;
 use super::encoder::{EncoderCore, Replayed};
-use super::error::{internal, invalid, Error, Problem, RuntimeGap};
+use super::encoder_fold::Joining;
+use super::error::{internal, invalid, Error, IndirectRule, Problem, RuntimeGap};
 use super::execution::{ExecutedPipeline, Execution};
 use super::fetch_reach;
 use super::function_table::VisibleFunctionTable;
@@ -67,23 +86,22 @@ use super::indirect_dispatch::{
     STAGE_IN_REGION_BYTES,
 };
 use super::indirect_execute::{self, Execute, ExecutionRange};
+use super::live_bind::ValueKinds;
 use super::pending_dispatch::{PendingDispatch, Recording};
 use super::pipeline::{
-    flat_dispatch, BufferForms, ComputePipelineState, Planned, RawPipeline, RegionKey,
-    RegionPipeline, Variant, VariantObjects,
+    flat_dispatch, BufferForms, ComputePipelineState, Direct, GridClass, Planned, RawPipeline,
+    RegionKey, RegionPipeline, Variant, VariantObjects,
 };
 use super::predication::{self, Captures, Event};
 use super::pvrtc::degrade_unreadable;
 use super::replay::{CallLog, ComputeCall, Replay, Resource, SamplersWithLodClamps};
 use super::residency::Residency;
 use super::resource::ResourceRef;
-use super::sampler::SamplerState;
+use super::sampler::{ArgumentSamplers, SamplerState};
 use super::shadow;
 use super::texture::Texture;
-use super::tracker::Barrier;
 use super::used_resources::EncoderKind;
 use super::values::{Region, Size};
-use super::written_commands::Writers;
 use ash::vk;
 use metal2vulkan::bind::{
     BindShape, BindState, BindingPlan, Dispatch, DispatchCommands, FlatIndirect, HeapPlacement,
@@ -92,10 +110,19 @@ use metal2vulkan::bind::{
 use metal2vulkan::error::{BindError, RuntimeDriverDefect};
 use metal2vulkan::metal::{BarrierScope, DispatchType, RenderStages, ResourceUsage};
 use metal2vulkan::pipeline::Stage;
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+mod live;
+
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) use live::SET_ASIDE_BYTES;
+use live::{Across, LiveDispatch};
+pub(crate) use live::{Parked, Parking, SpareLiveDispatches};
 
 /// Entries of a compute encoder's threadgroup memory table.
 pub(super) const THREADGROUP_SLOTS: u32 = 31;
@@ -152,7 +179,17 @@ pub(super) fn imageblock_size(width: u64, height: u64) -> Result<ImageblockSize,
 /// is released), as Metal holds what an encoder was handed: one a later call replaced or unbound
 /// before any dispatch used it, and one bound after the last dispatch, too.
 pub struct ComputeCommandEncoder {
-    core: EncoderCore,
+    /// Its state, in a box of its own: the encoder moves, from its open to its end, as a pointer
+    /// to it (`tests::encoder_moves`).
+    body: Box<Body>,
+}
+
+/// A compute encoder's state, which the encoder holds in a box ([`ComputeCommandEncoder`]).
+struct Body {
+    /// In a box of its own (`EncoderCore::boxed`), which its end empties and gives the device back
+    /// for the next encoder (`encoder::SpareCores`): the core goes from its open to its end as a
+    /// pointer to it.
+    core: Box<EncoderCore>,
     dispatch_type: DispatchType,
     pipeline: Option<ComputePipelineState>,
     table: ArgumentTable,
@@ -166,18 +203,17 @@ pub struct ComputeCommandEncoder {
     /// of `stage_in_region` until the next `setStageInRegion:`.
     indirect_stage_in: Option<(Buffer, u64)>,
     residency: Residency,
-    /// The indirect command buffers it made resident for writing (`written_commands.rs`).
-    writers: Writers,
     /// The bodies of the predicated loops it opened and has not closed (`predication.rs`).
     captures: Captures,
-    /// Its calls so far, where the device had a buffer over host pages as it opened
-    /// (`replay.rs`): `None` where it logs nothing, or no longer.
+    /// Its calls so far (`replay.rs`): `None` where it logs no longer.
     log: Option<CallLog<ComputeCall>>,
     /// Its dispatches encoded so far: the next one's order among them, which one whose
     /// pipelines are being made keeps for its failure (`FailedPipeline::draw`).
     dispatches: usize,
-    /// What its last dispatch settled ([`DispatchMemo`]).
-    memo: DispatchMemo,
+    /// Its bind state as its last dispatch that settled bound it, with what that one settled
+    /// (`compute/live.rs`, [`DispatchMemo`]): in the box the device's spares hand on from one
+    /// encoder to the next (`SpareLiveDispatches`).
+    live: Box<LiveDispatch>,
     /// The residency's generation as a command last noted the heaps of what it made resident
     /// (`command_encoded`): no command notes them again before it changes.
     heaps_noted: Option<u64>,
@@ -199,7 +235,7 @@ pub(super) struct EncoderState {
 impl std::fmt::Debug for ComputeCommandEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComputeCommandEncoder")
-            .field("dispatch_type", &self.dispatch_type)
+            .field("dispatch_type", &self.body.dispatch_type)
             .finish()
     }
 }
@@ -247,25 +283,62 @@ impl CommandBuffer {
         call: &'static str,
         dispatch_type: DispatchType,
     ) -> Result<ComputeCommandEncoder, Error> {
-        // Metal's process ends here under some protection options (`command_buffer/protection.rs`).
-        self.refuse_protected_encoder(call)?;
-        let core = EncoderCore::open(
+        let _for = self.notices_for();
+        // Refused where Metal's process ends here under some protection options
+        // (`command_buffer/protection.rs`), as the core opens. It joins the group of compute and
+        // blit encoders before it, recording into their `VkCommandBuffer`, where it may
+        // (`encoder_fold.rs`); and it logs its calls (`replay.rs`), which encode it again at a
+        // rebind of a buffer over host pages it named, or at a commit whose failure fails some of
+        // its group's encoders and not it.
+        let joining = Joining::Compute(dispatch_type);
+        let serial = dispatch_type == DispatchType::Serial;
+        let counts = &self.device().shared().counts;
+        // Under the core's one lock of the state: it joins its command buffer's unit of command
+        // predication, carrying on the loops open across its start, or starts the next; it starts
+        // with the residency the ended encoders left (`State::inheriting`); it takes what the
+        // command buffer's last compute encoder parked (`compute/live.rs`); and it takes a log its
+        // state kept (`spare_states.rs`), where it kept one.
+        // The core is made in the box the command buffer's last compute encoder parked, beside its
+        // bind state (`compute/live.rs`); else in a box of the device's spares, beside one of its
+        // bind states (`EncoderCore::open_placed`).
+        let (mut core, (live, carried, residency, predicated, log)) = EncoderCore::open_placed(
             self,
             call,
             EncoderKind::Compute,
-            dispatch_type == DispatchType::Serial,
+            (serial, Some(joining)),
+            |state| {
+                let carried = state.enter_predication(dispatch_type);
+                let residency = state.inheriting(false, counts);
+                let parked = state.unpark_compute();
+                let log = state.kept_compute_log();
+                (carried, residency, state.predicated, parked, log)
+            },
+            |opened, (carried, residency, predicated, parked, log)| {
+                let (core, live) = match parked {
+                    Some(parked) => {
+                        counts.parked_compute_taken();
+                        let (room, live) = parked.into_parts();
+                        (opened.boxed_in(room), live)
+                    }
+                    None => {
+                        let live = self.device().shared().live_dispatches.take();
+                        (opened.boxed(), live)
+                    }
+                };
+                (core, (live, carried, residency, predicated, log))
+            },
         )?;
-        // It joins its command buffer's unit of command predication, carrying on the loops open
-        // across its start, or starts the next.
-        let carried = self.state().enter_predication(dispatch_type);
-        let mut core = core;
+        // A record of command predication of its unit, or a dispatch it leaves to its host step,
+        // may leave it one the runtime cannot encode again, though its calls before were
+        // encoded: its calls no rebind's publish overlaps (`rebind::CallGate`).
+        core.gate_calls();
         // The laying of a loop open across its start goes on in a command buffer of its own, which
         // the loop's check may submit again (`predication.rs`).
         if !carried.is_empty() && self.state().predication.laying() {
             let raw = core.cut_reusable()?;
             self.state().predication.laid_into(raw);
         }
-        Ok(ComputeCommandEncoder {
+        let body = Box::new(Body {
             core,
             dispatch_type,
             pipeline: None,
@@ -274,15 +347,16 @@ impl CommandBuffer {
             imageblock: ImageblockSize::new(1, 1),
             stage_in_region: None,
             indirect_stage_in: None,
-            residency: self.inherited_residency(false),
-            writers: Writers::default(),
-            captures: Captures::carried(carried),
-            log: (self.device().shared().rebinds.any())
-                .then(|| self.device().shared().scheduler.spare_logs().compute()),
+            residency,
+            captures: Captures::carried(carried, predicated),
+            log: Some(
+                log.unwrap_or_else(|| self.device().shared().scheduler.spare_logs().compute()),
+            ),
             dispatches: 0,
-            memo: DispatchMemo::default(),
+            live,
             heaps_noted: None,
-        })
+        });
+        Ok(ComputeCommandEncoder { body })
     }
 }
 
@@ -294,9 +368,10 @@ impl ComputeCommandEncoder {
         dispatch_type: DispatchType,
         residency: Residency,
     ) -> Result<ComputeCommandEncoder, Error> {
-        let core = EncoderCore::replaying(command_buffer, dispatch_type == DispatchType::Serial)?;
-        Ok(ComputeCommandEncoder {
-            core,
+        let replaying =
+            EncoderCore::replaying(command_buffer, dispatch_type == DispatchType::Serial)?;
+        let body = Box::new(Body {
+            core: replaying.boxed(),
             dispatch_type,
             pipeline: None,
             table: ArgumentTable::compute(),
@@ -305,13 +380,13 @@ impl ComputeCommandEncoder {
             stage_in_region: None,
             indirect_stage_in: None,
             residency,
-            writers: Writers::default(),
             captures: Captures::default(),
             log: None,
             dispatches: 0,
-            memo: DispatchMemo::default(),
+            live: command_buffer.device().shared().live_dispatches.take(),
             heaps_noted: None,
-        })
+        });
+        Ok(ComputeCommandEncoder { body })
     }
 
     /// End an encoder made by [`replaying`](Self::replaying): what it recorded, and what it made
@@ -320,9 +395,17 @@ impl ComputeCommandEncoder {
         // Its unit of command predication takes what it encoded again, as at its end
         // (`predication.rs`).
         self.end_predication()?;
-        self.table.let_go_all(&mut self.core);
-        let replayed = self.core.finish_replay()?;
-        Ok((replayed, Some(self.residency)))
+        self.body.table.let_go_all(&mut self.body.core);
+        let Body {
+            core,
+            residency,
+            live,
+            ..
+        } = *self.body;
+        // Its bind state goes on to the device's next compute encoder (`compute/live.rs`).
+        core.device().shared().live_dispatches.give(live);
+        let replayed = EncoderCore::unboxed(core).finish_replay()?;
+        Ok((replayed, Some(residency)))
     }
 
     /// Log the call `call` makes of the log, before it runs, where the encoder logs
@@ -331,7 +414,7 @@ impl ComputeCommandEncoder {
         &mut self,
         call: impl FnOnce(&mut CallLog<ComputeCall>) -> ComputeCall,
     ) -> Option<usize> {
-        let log = self.log.as_mut()?;
+        let log = self.body.log.as_mut()?;
         let call = call(log);
         let extra = call.extra();
         Some(log.push(call, extra))
@@ -345,9 +428,11 @@ impl ComputeCommandEncoder {
         call: impl FnOnce(&mut CallLog<ComputeCall>) -> ComputeCall,
         run: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        let _call = self.body.core.begin_call();
+        let _for = self.body.core.notices_for();
         let at = self.log(call);
         let ran = run(self);
-        if let (Err(_), Some(at), Some(log)) = (&ran, at, &mut self.log) {
+        if let (Err(_), Some(at), Some(log)) = (&ran, at, &mut self.body.log) {
             log.refuse(at);
         }
         ran
@@ -361,7 +446,7 @@ impl ComputeCommandEncoder {
         result: &Result<bool, Error>,
         call: fn(bool) -> ComputeCall,
     ) {
-        let (Some(at), Some(log)) = (at, &mut self.log) else {
+        let (Some(at), Some(log)) = (at, &mut self.body.log) else {
             return;
         };
         match result {
@@ -374,17 +459,19 @@ impl ComputeCommandEncoder {
     /// command predication (`predication.rs`), whose laying its check submits again and whose
     /// copies encode its own calls again.
     pub(super) fn stop_logging(&mut self) {
-        self.log = None;
+        self.body.log = None;
     }
 }
 
 /// Announce how a recorded dispatch of `kernel` degraded: run as `regions` Vulkan dispatches, or
-/// on the kernel's emulated-simdgroups variant (`emulated`).
+/// on the kernel's emulated-simdgroups variant (`emulated`). On its partial-threadgroups variant
+/// (`partial`) a ragged grid runs its regions at one threadgroup size, so only its group counts
+/// split it.
 fn degrade_dispatch(
     device: &Device,
     kernel: &str,
     dispatch: &Dispatch,
-    regions: usize,
+    (regions, partial): (usize, bool),
     emulated: bool,
 ) {
     let object = || format!("a dispatch of kernel `{kernel}`");
@@ -393,10 +480,11 @@ fn degrade_dispatch(
         device.degrade(Degradation::SplitDispatch, || {
             let reason = match *dispatch {
                 Dispatch::Threads { threads, .. }
-                    if threads
-                        .iter()
-                        .zip(threads_per_group)
-                        .any(|(&n, group)| !n.is_multiple_of(group)) =>
+                    if !partial
+                        && threads
+                            .iter()
+                            .zip(threads_per_group)
+                            .any(|(&n, group)| !n.is_multiple_of(group)) =>
                 {
                     format!(
                         "its grid of {threads:?} threads is not a whole number of threadgroups \
@@ -422,7 +510,7 @@ fn degrade_dispatch(
 impl ComputeCommandEncoder {
     /// `dispatchType`.
     pub fn dispatch_type(&self) -> DispatchType {
-        self.dispatch_type
+        self.body.dispatch_type
     }
 
     /// `setComputePipelineState:`. A state of another device is refused.
@@ -433,10 +521,19 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::PipelineState(state.clone()),
             |this| {
-                this.core
-                    .check_device("set_compute_pipeline_state", state.device())?;
-                this.pipeline = Some(state.clone());
-                this.writers.state_set(state.indirect_command_writes());
+                this.body
+                    .core
+                    .check_device("set_compute_pipeline_state", state.bound_device()?)?;
+                this.body.pipeline = Some(state.clone());
+                if let Some(trail) = this.body.core.trail() {
+                    trail.compute(state);
+                }
+                if let Some(times) = this.body.core.times() {
+                    times.compute(state);
+                }
+                (this.body.core.routes).state_set(state.indirect_command_writes(), || {
+                    vec![state.function_name().to_owned()]
+                });
                 Ok(())
             },
         )
@@ -456,8 +553,9 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::Buffer(buffer.cloned(), offset, index),
             |this| {
-                this.table
-                    .set_buffer(&mut this.core, "set_buffer", buffer, offset, index)
+                this.body
+                    .table
+                    .set_buffer(&mut this.body.core, "set_buffer", buffer, offset, index)
             },
         )
     }
@@ -474,8 +572,13 @@ impl ComputeCommandEncoder {
         self.logged(
             |log| ComputeCall::Buffers(log.buffer_span(buffers), log.word_span(offsets), first),
             |this| {
-                this.table
-                    .set_buffers(&mut this.core, "set_buffers", buffers, offsets, first)
+                this.body.table.set_buffers(
+                    &mut this.body.core,
+                    "set_buffers",
+                    buffers,
+                    offsets,
+                    first,
+                )
             },
         )
     }
@@ -493,19 +596,25 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::BufferOffset(offset, index),
             |this| {
-                this.table
-                    .set_buffer_offset(&mut this.core, "set_buffer_offset", offset, index)
+                this.body.table.set_buffer_offset(
+                    &mut this.body.core,
+                    "set_buffer_offset",
+                    offset,
+                    index,
+                )
             },
         )
     }
 
     /// `setBuffer:offset:attributeStride:atIndex:`: as [`set_buffer`](Self::set_buffer), the
-    /// buffer read at `stride` by a kernel's stage-in layout of `MTLBufferLayoutStrideDynamic`;
-    /// `MTLAttributeStrideStatic` (`u64::MAX`) sets no stride, as `set_buffer` does. Only such a
-    /// layout reads a stride, and one bound without a stride reads at stride 0; a layout of a
-    /// fixed stride reads its own whatever the bind's (as an M4 reads them). A stride past 32 bits
-    /// other than `MTLAttributeStrideStatic` is taken modulo `2^32`, as plain Metal reads it and
-    /// its validation takes it (an M4 and an M3 Max). Refused as `set_buffer` is.
+    /// buffer read at `stride` by a kernel's stage-in layout of `MTLBufferLayoutStrideDynamic`.
+    /// Only such a layout reads a stride, and one bound without a stride (`set_buffer`) reads at
+    /// stride 0; a layout of a fixed stride reads its own whatever the bind's (as an M4 reads
+    /// them). A stride past 32 bits is taken modulo `2^32`, as plain Metal reads it and its
+    /// validation takes it (an M4 and an M3 Max), and `MTLAttributeStrideStatic` (`u64::MAX`) with
+    /// it: such a layout reads the element at the bind offset for the first element and zero for
+    /// every element past it, which lies `2^32 - 1` bytes on, past the buffer, as plain Metal on an
+    /// M3 Max under macOS 27.0.1 answered it. Refused as `set_buffer` is.
     pub fn set_buffer_with_stride(
         &mut self,
         buffer: Option<&Buffer>,
@@ -516,8 +625,8 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::BufferWithStride(buffer.cloned(), offset, stride, index),
             |this| {
-                this.table.set_buffer_with_stride(
-                    &mut this.core,
+                this.body.table.set_buffer_with_stride(
+                    &mut this.body.core,
                     "set_buffer_with_stride",
                     buffer,
                     offset,
@@ -545,8 +654,8 @@ impl ComputeCommandEncoder {
                 ComputeCall::BuffersWithStrides(buffers, offsets, log.word_span(strides), first)
             },
             |this| {
-                this.table.set_buffers_with_strides(
-                    &mut this.core,
+                this.body.table.set_buffers_with_strides(
+                    &mut this.body.core,
                     "set_buffers_with_strides",
                     buffers,
                     offsets,
@@ -559,8 +668,8 @@ impl ComputeCommandEncoder {
 
     /// `setBufferOffset:attributeStride:atIndex:`: as [`set_buffer_offset`](Self::set_buffer_offset),
     /// with the index's stride set as [`set_buffer_with_stride`](Self::set_buffer_with_stride)
-    /// sets it. `set_buffer_offset` clears the stride, as the stride form with
-    /// `MTLAttributeStrideStatic` does. Refused as both are.
+    /// sets it, `MTLAttributeStrideStatic` included. `set_buffer_offset` clears the stride.
+    /// Refused as both are.
     pub fn set_buffer_offset_with_stride(
         &mut self,
         offset: u64,
@@ -570,8 +679,8 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::BufferOffsetWithStride(offset, stride, index),
             |this| {
-                this.table.set_buffer_offset_with_stride(
-                    &mut this.core,
+                this.body.table.set_buffer_offset_with_stride(
+                    &mut this.body.core,
                     "set_buffer_offset_with_stride",
                     offset,
                     stride,
@@ -593,17 +702,18 @@ impl ComputeCommandEncoder {
         self.logged(
             |log| ComputeCall::Bytes(log.byte_span(bytes), index),
             |this| {
-                this.table
-                    .set_bytes(&mut this.core, "set_bytes", bytes, None, index)
+                this.body
+                    .table
+                    .set_bytes(&mut this.body.core, "set_bytes", bytes, None, index)
             },
         )
     }
 
     /// `setBytes:length:attributeStride:atIndex:`: as [`set_bytes`](Self::set_bytes), the
     /// bytes read at `stride`, its low 32 bits, by a kernel's stage-in layout of
-    /// `MTLBufferLayoutStrideDynamic`. At `MTLAttributeStrideStatic` (`u64::MAX`) such a layout is
-    /// refused at the dispatch (`NotImplemented(KernelStageIn)`): an M4 read element 0 of the
-    /// bytes and zeros past it there, which the fetch does not emulate. Refused as `set_bytes` is.
+    /// `MTLBufferLayoutStrideDynamic`, as [`set_buffer_with_stride`](Self::set_buffer_with_stride)
+    /// reads a buffer: at `MTLAttributeStrideStatic` (`u64::MAX`) such a layout reads element 0 of
+    /// the bytes and zero past it, as an M4 and an M3 Max read them. Refused as `set_bytes` is.
     pub fn set_bytes_with_stride(
         &mut self,
         bytes: &[u8],
@@ -613,8 +723,8 @@ impl ComputeCommandEncoder {
         self.logged(
             |log| ComputeCall::BytesWithStride(log.byte_span(bytes), stride, index),
             |this| {
-                this.table.set_bytes(
-                    &mut this.core,
+                this.body.table.set_bytes(
+                    &mut this.body.core,
                     "set_bytes_with_stride",
                     bytes,
                     Some(stride),
@@ -637,8 +747,8 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::FunctionTable(table.cloned(), index),
             |this| {
-                this.table.set_function_tables(
-                    &mut this.core,
+                this.body.table.set_function_tables(
+                    &mut this.body.core,
                     "set_visible_function_table",
                     &[table],
                     index,
@@ -663,8 +773,8 @@ impl ComputeCommandEncoder {
                 )
             },
             |this| {
-                this.table.set_function_tables(
-                    &mut this.core,
+                this.body.table.set_function_tables(
+                    &mut this.body.core,
                     "set_visible_function_tables",
                     tables,
                     first,
@@ -680,8 +790,9 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::Texture(texture.cloned(), index),
             |this| {
-                this.table
-                    .set_textures(&mut this.core, "set_texture", &[texture], index)
+                this.body
+                    .table
+                    .set_textures(&mut this.body.core, "set_texture", &[texture], index)
             },
         )
     }
@@ -692,8 +803,9 @@ impl ComputeCommandEncoder {
         self.logged(
             |log| ComputeCall::Textures(log.texture_span(textures), first),
             |this| {
-                this.table
-                    .set_textures(&mut this.core, "set_textures", textures, first)
+                this.body
+                    .table
+                    .set_textures(&mut this.body.core, "set_textures", textures, first)
             },
         )
     }
@@ -708,8 +820,8 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::Sampler(sampler.cloned(), index),
             |this| {
-                this.table.set_samplers(
-                    &mut this.core,
+                this.body.table.set_samplers(
+                    &mut this.body.core,
                     "set_sampler_state",
                     &[sampler],
                     None,
@@ -734,8 +846,13 @@ impl ComputeCommandEncoder {
                 )
             },
             |this| {
-                this.table
-                    .set_samplers(&mut this.core, "set_sampler_states", samplers, None, first)
+                this.body.table.set_samplers(
+                    &mut this.body.core,
+                    "set_sampler_states",
+                    samplers,
+                    None,
+                    first,
+                )
             },
         )
     }
@@ -762,8 +879,8 @@ impl ComputeCommandEncoder {
                 )
             },
             |this| {
-                this.table.set_samplers(
-                    &mut this.core,
+                this.body.table.set_samplers(
+                    &mut this.body.core,
                     "set_sampler_state_with_lod_clamps",
                     &[sampler],
                     Some((&[lod_min_clamp], &[lod_max_clamp])),
@@ -794,8 +911,8 @@ impl ComputeCommandEncoder {
                 }))
             },
             |this| {
-                this.table.set_samplers(
-                    &mut this.core,
+                this.body.table.set_samplers(
+                    &mut this.body.core,
                     "set_sampler_states_with_lod_clamps",
                     samplers,
                     Some((lod_min_clamps, lod_max_clamps)),
@@ -815,7 +932,7 @@ impl ComputeCommandEncoder {
             |this| {
                 const CALL: &str = "set_threadgroup_memory_length";
                 check_index(CALL, index, THREADGROUP_SLOTS)?;
-                this.threadgroup_lengths.insert(index, length);
+                this.body.threadgroup_lengths.insert(index, length);
                 Ok(())
             },
         )
@@ -835,7 +952,7 @@ impl ComputeCommandEncoder {
         self.logged(
             |_| ComputeCall::ImageblockSize(width, height),
             |this| {
-                this.imageblock = imageblock_size(width, height)
+                this.body.imageblock = imageblock_size(width, height)
                     .map_err(|p| invalid("set_imageblock_size", p))?;
                 Ok(())
             },
@@ -854,8 +971,8 @@ impl ComputeCommandEncoder {
             |this| {
                 let Region { origin, size } = region;
                 let origin = Size::new(origin.x, origin.y, origin.z).truncated();
-                this.stage_in_region = Some(StageInRegion::new(origin, size.truncated()));
-                this.indirect_stage_in = None;
+                this.body.stage_in_region = Some(StageInRegion::new(origin, size.truncated()));
+                this.body.indirect_stage_in = None;
                 Ok(())
             },
         )
@@ -886,15 +1003,17 @@ impl ComputeCommandEncoder {
             |_| ComputeCall::StageInRegionIndirect(indirect_buffer.clone(), indirect_buffer_offset),
             |this| {
                 const CALL: &str = "set_stage_in_region_indirect";
-                this.core.check_device(CALL, indirect_buffer.device())?;
+                this.body
+                    .core
+                    .check_device(CALL, indirect_buffer.generation())?;
                 let offset = indirect_dispatch::arguments_offset(
                     CALL,
                     (indirect_buffer.length(), indirect_buffer.copy_reach()),
                     indirect_buffer_offset,
                     STAGE_IN_REGION_BYTES,
                 )?;
-                this.indirect_stage_in = Some((indirect_buffer.clone(), offset));
-                this.stage_in_region = None;
+                this.body.indirect_stage_in = Some((indirect_buffer.clone(), offset));
+                this.body.stage_in_region = None;
                 Ok(())
             },
         )
@@ -902,8 +1021,13 @@ impl ComputeCommandEncoder {
 
     /// `dispatchThreadgroups:threadsPerThreadgroup:`. A threadgroup Metal runs nothing for (its
     /// size 0 or above the state's maximum, the module docs) records nothing; a count axis past
-    /// 32 bits is taken modulo `2^32`, and one that is 0 runs nothing. Refused: no pipeline state
-    /// set (plain Metal faults).
+    /// 32 bits is taken modulo `2^32`, and one that is 0 runs nothing. A dispatch of an inert
+    /// kernel (no loop, and no write but to its threads' own and its threadgroups' memory) records
+    /// no Vulkan dispatch: what it computes ends with it, and Metal's counter sampling, which
+    /// could count its threads, is the runtime's gap (`RuntimeGap::CounterSampleBuffers`). The
+    /// command buffer still uses what it binds, as Metal's does (the `Managed` buffers' copies in
+    /// among it), and the encoder's barriers and fences stay as they are. Refused: no pipeline
+    /// state set (plain Metal faults).
     pub fn dispatch_threadgroups(&mut self, groups: Size, threads: Size) -> Result<(), Error> {
         self.logged(
             |_| ComputeCall::Threadgroups(groups, threads),
@@ -1051,12 +1175,16 @@ impl ComputeCommandEncoder {
     ) -> Result<(), Error> {
         self.sync_heaps();
         let reads = self
+            .body
             .pipeline
             .as_ref()
             .is_some_and(ComputePipelineState::reads_texture_handles);
         self.dispatch_indirect_resident(call, buffer, offset, arguments)?;
         self.command_encoded(reads);
-        self.dispatches += 1;
+        self.body.dispatches += 1;
+        if let Some(times) = self.body.core.times() {
+            times.worked();
+        }
         Ok(())
     }
 
@@ -1068,10 +1196,10 @@ impl ComputeCommandEncoder {
         offset: u64,
         arguments: Arguments,
     ) -> Result<(), Error> {
-        let Some(pipeline) = self.pipeline.clone() else {
+        let Some(pipeline) = self.body.pipeline.clone() else {
             return Err(invalid(call, Problem::NoPipelineState));
         };
-        self.core.check_device(call, buffer.device())?;
+        self.body.core.check_device(call, buffer.generation())?;
         let offset = indirect_dispatch::arguments_offset(
             call,
             (buffer.length(), buffer.copy_reach()),
@@ -1083,11 +1211,11 @@ impl ComputeCommandEncoder {
         }
         let tables = DispatchTables {
             pipeline: &pipeline,
-            table: &self.table,
-            threadgroup_lengths: &self.threadgroup_lengths,
-            imageblock: self.imageblock,
-            stage_in_region: self.stage_in_region,
-            residency: &self.residency,
+            table: &self.body.table,
+            threadgroup_lengths: &self.body.threadgroup_lengths,
+            imageblock: self.body.imageblock,
+            stage_in_region: self.body.stage_in_region,
+            residency: &self.body.residency,
             forms: BufferForms::Bound,
         };
         let flat = FlatCall {
@@ -1095,33 +1223,46 @@ impl ComputeCommandEncoder {
             offset,
             arguments,
         };
-        if self.indirect_stage_in.is_none()
+        if self.body.indirect_stage_in.is_none()
             && record(
-                &mut self.core,
+                &mut self.body.core,
                 &tables,
                 call,
                 Counts::Flat(flat),
-                (Some(self.dispatches), None),
+                Some((self.body.dispatches, &mut *self.body.live)),
             )?
         {
             return Ok(());
         }
-        let copy =
-            indirect_dispatch::copy_arguments(&mut self.core, buffer, offset, arguments.bytes())?;
+        let copy = indirect_dispatch::copy_arguments(
+            &mut self.body.core,
+            buffer,
+            offset,
+            arguments.bytes(),
+        )?;
         self.defer_dispatch(call, pipeline, HostDispatch::Indirect { arguments, copy })
     }
 
     /// Leave `dispatch` of `pipeline` to its host step, with the encoder's tables now and a copy
     /// of its indirect stage-in region where one is set (`indirect_dispatch.rs`).
+    ///
+    /// The dispatch uses what its tables bind from its call, as a recorded one does: the encoder
+    /// retains them now (`ArgumentTable::retain`), keeping their keys and holding each buffer over
+    /// host pages among them, which its commit keeps until the command buffer completes
+    /// (`steps_hold`), as the host step resolves them as it records. So a rebind of one from this
+    /// call on is refused (`RebindProblem::EncodedUses`), never failing the step's recording at its
+    /// submission (`EncodedUseRebound`): the hold is taken in this call, which no rebind's publish
+    /// overlaps (`rebind::CallGate`).
     fn defer_dispatch(
         &mut self,
         call: &'static str,
         pipeline: ComputePipelineState,
         dispatch: HostDispatch,
     ) -> Result<(), Error> {
-        let stage_in_copy = match &self.indirect_stage_in {
+        self.body.table.retain(&mut self.body.core);
+        let stage_in_copy = match &self.body.indirect_stage_in {
             Some((buffer, offset)) => Some(indirect_dispatch::copy_arguments(
-                &mut self.core,
+                &mut self.body.core,
                 buffer,
                 *offset,
                 STAGE_IN_REGION_BYTES,
@@ -1129,22 +1270,24 @@ impl ComputeCommandEncoder {
             None => None,
         };
         let gate = self
+            .body
             .core
             .command_buffer()
             .state()
             .predication_mut()
             .host_gate();
-        self.core
+        self.body
+            .core
             .defer(Deferred::Dispatch(Arc::new(ArgumentDispatch {
                 call,
                 dispatch,
                 stage_in_copy,
                 pipeline,
-                table: self.table.clone(),
-                threadgroup_lengths: self.threadgroup_lengths.clone(),
-                imageblock: self.imageblock,
-                stage_in_region: self.stage_in_region,
-                ordered: self.dispatch_type == DispatchType::Serial,
+                table: self.body.table.clone(),
+                threadgroup_lengths: self.body.threadgroup_lengths.clone(),
+                imageblock: self.body.imageblock,
+                stage_in_region: self.body.stage_in_region,
+                ordered: self.body.dispatch_type == DispatchType::Serial,
                 gate,
             })))
     }
@@ -1152,15 +1295,18 @@ impl ComputeCommandEncoder {
     /// `memoryBarrierWithScope:`: every write of the encoder's earlier dispatches to the kinds
     /// of resource `scope` names is visible to its later dispatches, however they read it
     /// (storage, uniform, or indirect arguments). One global memory barrier covers buffers and
-    /// textures alike; render targets are not a compute encoder's, so a scope of only
-    /// `RENDER_TARGETS` records nothing. On a serial encoder, which orders its dispatches anyway,
-    /// it adds nothing Metal would not do.
+    /// textures alike, from the shader writes to the shader reads and writes; a later dispatch
+    /// that reads a uniform buffer or indirect arguments takes, before itself, a barrier to those
+    /// accesses too, so no dispatch waits on a cache or a stage it does not use. Render targets
+    /// are not a compute encoder's, so a scope of only `RENDER_TARGETS` records nothing. On a
+    /// serial encoder, which orders its dispatches anyway, it adds nothing Metal would not do.
     pub fn memory_barrier_with_scope(&mut self, scope: BarrierScope) {
+        let _for = self.body.core.notices_for();
         self.log(|_| ComputeCall::BarrierWithScope(scope));
         if !scope.intersects(BarrierScope::BUFFERS.union(BarrierScope::TEXTURES)) {
             return;
         }
-        self.core.barrier(Barrier::between_dispatches());
+        self.body.core.memory_barrier();
         self.capture(|| Event::Barrier);
     }
 
@@ -1202,23 +1348,36 @@ impl ComputeCommandEncoder {
         usage: ResourceUsage,
     ) -> Result<(), Error> {
         for resource in resources {
-            self.core.check_device(call, resource.device())?;
+            self.body.core.check_device(call, resource.device())?;
         }
         if resources.iter().any(ResourceRef::is_memoryless) {
-            self.core.fail_memoryless_use();
+            self.body.core.fail_memoryless_use();
             return Ok(());
         }
+        // A texture's shadow left unmade is made as the encoder makes it resident: its resource
+        // ID reads it from then on (`texture/lazy_shadow.rs`).
+        for resource in resources {
+            if let ResourceRef::Texture(texture) = resource {
+                texture.made_for_use()?;
+            }
+        }
         for &resource in resources {
+            // Its records held where they lie in device-local memory, before any listing of
+            // them reads where they lie (`indirect_command_buffer/home.rs`).
+            if let ResourceRef::IndirectCommandBuffer(icb) = resource {
+                icb.hold_records(&mut self.body.core, usage.contains(ResourceUsage::WRITE));
+            }
             let used = self
+                .body
                 .residency
                 .use_resource(resource, usage, RenderStages::empty());
             if let Some(used) = used {
-                self.core.made_resident(used);
+                self.body.core.made_resident(used);
             }
             if let ResourceRef::IndirectCommandBuffer(icb) = resource {
                 if usage.contains(ResourceUsage::WRITE) {
-                    self.writers.made_writable(icb.written());
-                    self.core.retain(icb.gpu_write());
+                    self.body.core.routes.writable(icb);
+                    self.body.core.retain(icb.gpu_write());
                 }
             }
         }
@@ -1229,8 +1388,10 @@ impl ComputeCommandEncoder {
     /// through an address held in memory, and every texture made in it or over a buffer placed
     /// in it through its resource ID, as Metal's contract makes a heap's resources resident for
     /// reading only (`residency`): the textures that live now, and each made later, from the first
-    /// dispatch encoded after it is made. The heap's whole range is one used resource, ordered as
-    /// the one resource its tracked buffers and textures are.
+    /// dispatch encoded after it is made. As Metal's, it holds the heap, not its textures: one the
+    /// program released, which only command buffers that used the heap hold, is not made resident
+    /// again. The heap's whole range is one used resource, ordered as the one resource its
+    /// tracked buffers and textures are.
     ///
     /// A sparse heap holds no buffer: its live sparse textures are made resident, as
     /// `use_resource` with `READ` makes each.
@@ -1254,11 +1415,11 @@ impl ComputeCommandEncoder {
 
     fn use_heaps_of(&mut self, call: &'static str, heaps: &[&Heap]) -> Result<(), Error> {
         for heap in heaps {
-            self.core.check_device(call, heap.device())?;
+            self.body.core.check_device(call, heap.generation())?;
         }
         for heap in heaps {
-            for used in self.residency.use_heap(heap, RenderStages::empty()) {
-                self.core.made_resident(used);
+            for used in self.body.residency.use_heap(heap, RenderStages::empty()) {
+                self.body.core.made_resident(used);
             }
         }
         Ok(())
@@ -1273,7 +1434,10 @@ impl ComputeCommandEncoder {
     /// buffers as they are now where `icb` inherits them, and the resources the encoder made
     /// resident so far, which its buffers' addresses resolve against: an address in none misses,
     /// reading zero and dropping writes, and the execution report counts it. The encoder's commands
-    /// before run before them and its commands after run after them.
+    /// before run before them and its commands after run after them. Among themselves the commands
+    /// run in no order but where a command's record sets a barrier (`set_barrier`), which orders it
+    /// after every earlier command of the range, whatever the encoder's dispatch type: Metal's
+    /// serial encoder adds a barrier before and after the range alone.
     ///
     /// Refused, changing nothing (`Invalid`): a buffer of another device, a range that ends
     /// past its size (`IndirectCommandBufferProblem::Range`), and, for a range that is not
@@ -1294,8 +1458,9 @@ impl ComputeCommandEncoder {
     /// commands it runs (a runtime extension; Metal has none), which looks for what `needs` names
     /// ([`IndirectCommandCheckNeeds`]; a compute command draws no points): where the commit records
     /// the execution from the CPU's records, or a host step from the records as the GPU and the CPU
-    /// left them (an encoder made `icb` resident for writing, or the execution lies inside a block
-    /// of command predication), it first calls `check` with each command it will record, in order,
+    /// left them (a route that may write `icb`'s records met it,
+    /// `IndirectCommandBuffer::gpu_written`, or the execution lies inside a block of command
+    /// predication), it first calls `check` with each command it will record, in order,
     /// before it records any of them ([`IndirectCommandCheck`]). Where what the records may hold
     /// leaves the check nothing to see, neither calls it, and an execution a host step would record
     /// may run on the GPU alone, as an unchecked one may; a route encoded after the commit that
@@ -1323,9 +1488,11 @@ impl ComputeCommandEncoder {
             |_| ComputeCall::Execute(icb.clone(), range.clone()),
             |this| {
                 const CALL: &str = indirect_execute::CALL;
-                this.core.check_device(CALL, icb.device())?;
+                this.body.core.check_device(CALL, icb.generation())?;
                 if icb.is_render() {
-                    return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+                    return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                        IndirectRule::OtherEncoderKind,
+                    )));
                 }
                 let range = icb.command_range(CALL, range.clone())?;
                 // An empty range runs nothing before the inherited pipeline state is looked at, as
@@ -1355,9 +1522,11 @@ impl ComputeCommandEncoder {
     /// end. A location past the size, or a range past `2^32 - 1`, which Metal's GPU faults on, runs
     /// nothing, and the command buffer's execution report states `ReplayFaults::RANGE`. The
     /// commands run as [`execute_commands_in_buffer`](Self::execute_commands_in_buffer)'s that a
-    /// function may write do: by a host step once the work before them completed, which the device
-    /// announces once (`Degradation::HostReplayedIndirectCommands`; the encoder copies the range
-    /// where it is encoded, behind a barrier from everything before).
+    /// function may write do: by a host step once the work that wrote them and the range completed,
+    /// which the device announces once (`Degradation::HostReplayedIndirectCommands`). The step
+    /// reads the range in place where the host maps the bytes of `range_buffer` the GPU writes (a
+    /// `Shared` buffer, a `Managed` one on unified memory); else the encoder copies it where it is
+    /// encoded, behind a barrier from everything before, and the step reads the copy.
     ///
     /// A range plain Metal takes and the runtime has no exact answer for is its own gap, not
     /// misuse: 8 bytes that run past `range_buffer`, which Metal reads from whatever follows it
@@ -1411,10 +1580,14 @@ impl ComputeCommandEncoder {
             |_| ComputeCall::ExecuteIndirect(icb.clone(), range_buffer.clone(), offset),
             |this| {
                 const CALL: &str = indirect_execute::CALL_INDIRECT;
-                this.core.check_device(CALL, icb.device())?;
-                this.core.check_device(CALL, range_buffer.device())?;
+                this.body.core.check_device(CALL, icb.generation())?;
+                this.body
+                    .core
+                    .check_device(CALL, range_buffer.generation())?;
                 if icb.is_render() {
-                    return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands));
+                    return Err(Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                        IndirectRule::OtherEncoderKind,
+                    )));
                 }
                 indirect_execute::check_range_buffer(range_buffer.length(), offset)?;
                 let pipeline = this.inherited_pipeline(CALL, icb)?;
@@ -1423,13 +1596,9 @@ impl ComputeCommandEncoder {
                 if icb.has_no_command_types() {
                     return Ok(());
                 }
-                let copy = indirect_dispatch::copy_arguments(
-                    &mut this.core,
-                    range_buffer,
-                    offset,
-                    indirect_execute::RANGE_BYTES,
-                )?;
-                this.defer_execution(icb, ExecutionRange::Indirect(copy), pipeline, check)?;
+                let range =
+                    indirect_execute::range_from(&mut this.body.core, range_buffer, offset)?;
+                this.defer_execution(icb, range, pipeline, check)?;
                 this.worked();
                 this.capture(|| Event::ExecuteIndirect(icb.clone(), range_buffer.clone(), offset));
                 Ok(())
@@ -1444,7 +1613,7 @@ impl ComputeCommandEncoder {
         call: &'static str,
         icb: &IndirectCommandBuffer,
     ) -> Result<Option<ComputePipelineState>, Error> {
-        match (&self.pipeline, icb.descriptor().inherit_pipeline_state) {
+        match (&self.body.pipeline, icb.descriptor().inherit_pipeline_state) {
             (_, false) => Ok(None),
             (Some(pipeline), true) => Ok(Some(pipeline.clone())),
             (None, true) => Err(invalid(call, Problem::NoPipelineState)),
@@ -1461,13 +1630,24 @@ impl ComputeCommandEncoder {
         pipeline: Option<ComputePipelineState>,
         check: Option<(IndirectCommandCheck, IndirectCommandCheckNeeds)>,
     ) -> Result<(), Error> {
+        if let Some(trail) = self.body.core.trail() {
+            trail.execution(range.given());
+        }
+        icb.hold_records(&mut self.body.core, false);
         self.sync_heaps();
+        // Its commands bind the heap sets as they record, later.
+        self.body
+            .core
+            .command_buffer()
+            .state()
+            .heaps
+            .executes_later();
         // Its commands run the states their records name, where it inherits none.
         if !icb.descriptor().inherit_pipeline_state {
-            self.writers.runs(icb.written().named().writes);
+            self.body.core.routes.executed(icb);
         }
         let table = if icb.descriptor().inherit_buffers {
-            self.table.clone()
+            self.body.table.clone()
         } else {
             ArgumentTable::default()
         };
@@ -1475,8 +1655,8 @@ impl ComputeCommandEncoder {
         // gate the GPU-alone path's preprocess of a fixed range runs from (`gpu_execute.rs`), one
         // invocation per command where the counter is 0.
         let (gate, further, preprocess_gate) = {
-            let device = self.core.device().clone();
-            let mut state = self.core.command_buffer().state();
+            let device = self.body.core.device().clone();
+            let mut state = self.body.core.command_buffer().state();
             let (predication, uploads) = state.predication_and_uploads();
             let gate = predication.host_gate();
             let (further, preprocess_gate) = match (&gate, &range) {
@@ -1490,14 +1670,13 @@ impl ComputeCommandEncoder {
             (gate, further, preprocess_gate)
         };
         if let Some(step) = further {
-            predication::record_further(&mut self.core, &step)?;
+            predication::record_further(&mut self.body.core, &step)?;
         }
-        self.core.defer(Deferred::Execute(Arc::new(Execute {
+        self.body.core.defer(Deferred::Execute(Arc::new(Execute {
             icb: icb.clone(),
             range,
             pipeline,
             table,
-            ordered: self.dispatch_type == DispatchType::Serial,
             gate,
             preprocess_gate,
             check: check.map(|(check, needs)| (Mutex::new(check), needs)),
@@ -1513,9 +1692,7 @@ impl ComputeCommandEncoder {
     /// (`Residency::sync_heaps`), held until the command buffer completes: a command reaches
     /// every texture its heaps hold as it is encoded.
     fn sync_heaps(&mut self) {
-        for used in self.residency.sync_heaps() {
-            self.core.retain(used);
-        }
+        self.body.residency.sync_heaps();
     }
 
     /// Once a command was encoded, note the heaps the encoder used; and where it reads texture
@@ -1523,86 +1700,117 @@ impl ComputeCommandEncoder {
     fn command_encoded(&mut self, reads: bool) {
         // The command, encoded, used the heaps of what the encoder made resident: noted once a
         // change of it, as an earlier command noted those it held then.
-        let generation = self.residency.generation();
-        if self.heaps_noted != Some(generation) {
-            self.core.touch_heaps(self.residency.heaps());
-            self.heaps_noted = Some(generation);
+        let generation = self.body.residency.generation();
+        if self.body.heaps_noted != Some(generation) {
+            self.body.core.touch_heaps(self.body.residency.heaps());
+            self.body.heaps_noted = Some(generation);
         }
         if !reads {
             return;
         }
-        // A texture the kernel's handles reach whose blocks a carrier holds reads as the neutral.
-        let bound = self.table.textures.values();
+        // A texture the kernel's handles reach whose blocks a carrier holds reads as the neutral:
+        // among those made resident, as the encoder keeps the first (`compute/live.rs`).
+        let bound = self.body.table.textures.values();
+        let resident =
+            (self.body.live.unreadable).of(self.body.core.device(), &self.body.residency);
         degrade_unreadable(
-            self.core.device(),
-            self.residency.textures().chain(bound),
+            self.body.core.device(),
+            resident.into_iter().chain(bound),
             "a dispatch",
         );
     }
 
     /// The encoder's core.
     pub(super) fn core(&mut self) -> &mut EncoderCore {
-        &mut self.core
+        &mut self.body.core
     }
 
     /// The encoder's state now, which a predicated loop's copies replay a command with.
     pub(super) fn encoder_state(&self) -> EncoderState {
         EncoderState {
-            pipeline: self.pipeline.clone(),
-            table: self.table.clone(),
-            threadgroup_lengths: self.threadgroup_lengths.clone(),
-            imageblock: self.imageblock,
-            stage_in_region: self.stage_in_region,
-            indirect_stage_in: self.indirect_stage_in.clone(),
+            pipeline: self.body.pipeline.clone(),
+            table: self.body.table.clone(),
+            threadgroup_lengths: self.body.threadgroup_lengths.clone(),
+            imageblock: self.body.imageblock,
+            stage_in_region: self.body.stage_in_region,
+            indirect_stage_in: self.body.indirect_stage_in.clone(),
         }
     }
 
     /// Set the encoder's state back to `state`: what the table it replaces binds is held until
     /// the command buffer completes (`ArgumentTable::let_go_all`).
     pub(super) fn restore_state(&mut self, state: EncoderState) {
-        self.table.let_go_all(&mut self.core);
-        self.pipeline = state.pipeline;
-        self.table = state.table;
-        self.threadgroup_lengths = state.threadgroup_lengths;
-        self.imageblock = state.imageblock;
-        self.stage_in_region = state.stage_in_region;
-        self.indirect_stage_in = state.indirect_stage_in;
+        self.body.table.let_go_all(&mut self.body.core);
+        self.body.pipeline = state.pipeline;
+        self.body.table = state.table;
+        self.body.threadgroup_lengths = state.threadgroup_lengths;
+        self.body.imageblock = state.imageblock;
+        self.body.stage_in_region = state.stage_in_region;
+        self.body.indirect_stage_in = state.indirect_stage_in;
     }
 
     /// The bodies of the predicated loops the encoder has open.
     pub(super) fn captures(&mut self) -> &mut Captures {
-        &mut self.captures
+        &mut self.body.captures
     }
 
     /// What the encoder made resident so far, which a predicated loop carried to its unit's next
     /// encoder replays its commands with (`predication.rs`).
     pub(super) fn residency_now(&self) -> Residency {
-        self.residency.clone()
+        self.body.residency.clone()
     }
 
     /// Make resident here what `residency`, an earlier encoder's of the unit, made resident: a
     /// predicated loop's copy replays that encoder's commands here (`predication.rs`).
     pub(super) fn carry_residency(&mut self, residency: &Residency) {
-        for used in self.residency.carry(residency) {
-            self.core.retain(used);
-        }
+        self.body.residency.carry(residency);
+    }
+
+    /// `label`: the label [`set_label`](Self::set_label) gave it, or `None`, as Metal's is `nil`
+    /// until set.
+    pub fn label(&self) -> Option<String> {
+        self.body.core.command_buffer().open_encoder_label()
+    }
+
+    /// `setLabel:`: label it `label`, which its command buffer's ended encoders keep
+    /// ([`CommandBuffer::ended_encoders`](crate::CommandBuffer::ended_encoders)) and the
+    /// runtime's notices naming the command buffer state, as [`CommandBuffer::set_label`](crate::CommandBuffer::set_label)'s.
+    pub fn set_label(&mut self, label: &str) {
+        self.body.core.command_buffer().label_open_encoder(label);
     }
 
     /// `endEncoding`. What it binds is held until the command buffer completes, as Metal holds
     /// what an encoder was handed.
     pub fn end_encoding(mut self) -> Result<(), Error> {
-        // Its unit of command predication takes what it encoded (`predication.rs`).
-        self.end_predication()?;
-        self.table.let_go_all(&mut self.core);
-        // Its log, which its command buffer keeps where a rebind may need it (`replay.rs`).
-        let replay = self.log.map(|log| Replay::Compute {
-            dispatch_type: self.dispatch_type,
+        let _call = self.body.core.begin_call();
+        let _for = self.body.core.notices_for();
+        // Its unit of command predication takes what it encoded (`predication.rs`): as its core
+        // ends, under the one lock that takes, where its command buffer has no record.
+        let unit_work = self.body.captures.unpredicated_work();
+        if unit_work.is_none() {
+            self.end_predication()?;
+        }
+        self.body.table.let_go_all(&mut self.body.core);
+        let Body {
+            core,
+            dispatch_type,
+            residency,
             log,
-        });
-        // What it made resident joins its command buffer's (`residency.rs`), and is its own
-        // (`CommandBuffer::ended_encoders`).
-        self.core
-            .end_with_replay(EncoderKind::Compute, Some(self.residency), replay)
+            live,
+            ..
+        } = *self.body;
+        // Its log, which its command buffer keeps where a rebind may need it (`replay.rs`).
+        let replay = log.map(|log| Replay::Compute { dispatch_type, log });
+        // Its core's box, emptied as the core ends, and its bind state go on to its command
+        // buffer's next compute encoder (`compute/live.rs`). What it made resident joins its
+        // command buffer's (`residency.rs`), and is its own (`CommandBuffer::ended_encoders`).
+        EncoderCore::end_with_replay(
+            core,
+            EncoderKind::Compute,
+            (Some(residency), Some(Parking::new(live))),
+            replay,
+            unit_work,
+        )
     }
 
     /// The threadgroup size `threads` of a dispatch in `call` with the pipeline state set, or
@@ -1620,7 +1828,7 @@ impl ComputeCommandEncoder {
     ///
     /// Refused: no pipeline state set (plain Metal faults).
     fn threadgroup(&self, call: &'static str, threads: Size) -> Result<Option<[u32; 3]>, Error> {
-        let Some(pipeline) = &self.pipeline else {
+        let Some(pipeline) = &self.body.pipeline else {
             return Err(invalid(call, Problem::NoPipelineState));
         };
         let total = threads.wrapping_volume();
@@ -1643,10 +1851,13 @@ impl ComputeCommandEncoder {
     /// nothing (`CommandBufferError::InvalidResource`, an M3 Max under macOS 27.0.1), so the
     /// encoder fails it and the dispatch records nothing (`EncoderCore::fail_memoryless_use`).
     fn fails_on_memoryless(&mut self) -> bool {
-        let uses = (self.pipeline.as_ref())
-            .is_some_and(|state| self.table.uses_memoryless(state.interface(), Stage::Kernel));
+        let uses = (self.body.pipeline.as_ref()).is_some_and(|state| {
+            self.body
+                .table
+                .uses_memoryless(state.interface(), Stage::Kernel)
+        });
         if uses {
-            self.core.fail_memoryless_use();
+            self.body.core.fail_memoryless_use();
         }
         uses
     }
@@ -1656,39 +1867,43 @@ impl ComputeCommandEncoder {
     fn dispatch(&mut self, call: &'static str, dispatch: Dispatch) -> Result<(), Error> {
         self.sync_heaps();
         let reads = self
+            .body
             .pipeline
             .as_ref()
             .is_some_and(ComputePipelineState::reads_texture_handles);
         self.dispatch_resident(call, dispatch)?;
         self.command_encoded(reads);
-        self.dispatches += 1;
+        self.body.dispatches += 1;
+        if let Some(times) = self.body.core.times() {
+            times.worked();
+        }
         Ok(())
     }
 
     /// [`dispatch`](Self::dispatch) with the heaps' textures resident.
     fn dispatch_resident(&mut self, call: &'static str, dispatch: Dispatch) -> Result<(), Error> {
-        let Some(pipeline) = &self.pipeline else {
+        let Some(pipeline) = &self.body.pipeline else {
             return Err(invalid(call, Problem::NoPipelineState));
         };
-        if self.indirect_stage_in.is_some() {
+        if self.body.indirect_stage_in.is_some() {
             let pipeline = pipeline.clone();
             return self.defer_dispatch(call, pipeline, HostDispatch::Direct(dispatch));
         }
         let tables = DispatchTables {
             pipeline,
-            table: &self.table,
-            threadgroup_lengths: &self.threadgroup_lengths,
-            imageblock: self.imageblock,
-            stage_in_region: self.stage_in_region,
-            residency: &self.residency,
+            table: &self.body.table,
+            threadgroup_lengths: &self.body.threadgroup_lengths,
+            imageblock: self.body.imageblock,
+            stage_in_region: self.body.stage_in_region,
+            residency: &self.body.residency,
             forms: BufferForms::Bound,
         };
         record(
-            &mut self.core,
+            &mut self.body.core,
             &tables,
             call,
             Counts::Direct(dispatch),
-            (Some(self.dispatches), Some(&mut self.memo)),
+            Some((self.body.dispatches, &mut *self.body.live)),
         )
         .map(drop)
     }
@@ -1739,11 +1954,14 @@ impl DispatchTables<'_> {
         let mut state = BindState::default();
         state.stages.insert(Stage::Kernel, table);
         state.view_base_alignment = views.alignment();
+        state.uniform_views_at_residual = views.at_residual();
         if self.pipeline.imageblock_cell_bytes().is_some() {
             state.imageblock_size = self.imageblock;
         }
         state.stage_in_region = self.stage_in_region;
         state.used_resources = self.residency.used_resources();
+        state.used_in_token_order = true;
+        state.resident_apart = true;
         state.argument_samplers = heap_sets::listed(argument_samplers);
         state.function_tables = function_tables
             .iter()
@@ -1784,7 +2002,7 @@ pub(super) fn record_dispatch(
     call: &'static str,
     dispatch: Dispatch,
 ) -> Result<(), Error> {
-    record(core, tables, call, Counts::Direct(dispatch), (None, None)).map(drop)
+    record(core, tables, call, Counts::Direct(dispatch), None).map(drop)
 }
 
 /// Where a recorded dispatch's group counts come from.
@@ -1808,7 +2026,7 @@ fn settle_indirect(
     if let Some(indirect) = call.indirect(pipeline) {
         let local = indirect.threads_per_threadgroup;
         let flat = flat_dispatch(local);
-        if let Some((variant, plan)) = pipeline.settle_flat(shape, local, &flat)? {
+        if let Some((variant, plan)) = pipeline.settle_flat(shape, local, &flat, false)? {
             return Ok(Some((variant, plan, indirect)));
         }
     }
@@ -1827,9 +2045,24 @@ fn settle_indirect(
 /// of the interior and ragged-edge regions a split plans — Metal's own one dispatch, on one
 /// `VkPipeline`, with no barrier between regions and no `Degradation::SplitDispatch`.
 ///
+/// So a grid narrower than one threadgroup on an axis, which the split runs as one region of the
+/// grid's own size, a `VkPipeline` of each width, takes the flat form's one `VkPipeline` of the
+/// call's size too: on a guest's run on an RX 7900 XTX, a kernel dispatched at 64 such widths
+/// made 185,566 `VkPipeline`s in 45 s while its variant kept 32 (`pipeline::REGION_PIPELINES`).
+///
+/// A kernel that observes its partition through its simdgroups alone
+/// (`KernelFacts::partition_simdgroups`: a simdgroup barrier, function or lane builtin, and nothing
+/// of its threadgroup) runs a one-row grid in threadgroups of one row on the flat variant of the
+/// call's threadgroups (`VariantKey::call_threadgroups`): its workgroups are Metal's threadgroups,
+/// its simdgroups Metal's, the last one's lanes past the grid returned before the body. So a
+/// kernel compiled once does not compile a second `VkPipeline` for its ragged edge.
+///
 /// `None`, so the dispatch keeps its exact split, where its grid is already a whole number of
-/// threadgroups on every axis (the split is one region, which the flat form cannot better), where
-/// the kernel observes its threadgroup partition or the device reaches no memory by device address
+/// threadgroups on every axis (the split is one region of the call's size, which the flat form
+/// cannot better) or is empty, where the kernel observes its threadgroup partition (through its
+/// simdgroups alone, where the grid or its threadgroups are not one row, or where the module would
+/// hold a workgroup barrier or emulate its simdgroups) or the device
+/// reaches no memory by device address
 /// (the compile layer's refusal, which the state remembers), where the flat form cannot cover the
 /// grid within the device's `maxComputeWorkGroupCount`, or in the large-buffer form, whose key
 /// `settle_flat` does not take.
@@ -1840,8 +2073,7 @@ fn flat_direct(
     forms: BufferForms,
 ) -> Result<Option<(Arc<Variant>, Arc<BindingPlan>)>, Error> {
     let Dispatch::Threads {
-        threads,
-        threads_per_group,
+        threads_per_group, ..
     } = *dispatch
     else {
         return Ok(None);
@@ -1850,23 +2082,129 @@ fn flat_direct(
         return Ok(None);
     }
     // The split's regions per axis: its interior where whole threadgroups fill it, and an edge of
-    // the remainder. More than one region in all is what the flat form replaces with one.
-    let pieces = |i: usize| -> u32 {
-        let (full, rem) = match threads_per_group[i] {
-            0 => return 0,
-            l => (threads[i] / l, threads[i] % l),
-        };
-        u32::from(full > 0) + u32::from(rem > 0)
-    };
-    if (0..3).map(pieces).product::<u32>() <= 1 {
+    // the remainder, of a local size of its own. A remainder on any axis, the edge alone where the
+    // grid is narrower than one threadgroup, is what the flat form replaces with its one region.
+    // The grid's class says so (`GridClass`), as a later dispatch of the class asks of it.
+    let Some(class) = GridClass::of(dispatch).filter(|class| !class.whole()) else {
         return Ok(None);
+    };
+    // The variant of any threadgroups, else, for one row in threadgroups of one row, the call's.
+    let mut settled = pipeline.settle_flat(shape, threads_per_group, dispatch, false);
+    if class.one_row() && matches!(settled, Ok(None)) {
+        settled = pipeline.settle_flat(shape, threads_per_group, dispatch, true);
     }
-    match pipeline.settle_flat(shape, threads_per_group, dispatch) {
+    match settled {
         Ok(settled) => Ok(settled),
         // A grid the flat form cannot cover within the device's group-count limits: the split
         // covers it exactly, region by region.
         Err(Error::Bind(BindError::Unsupported(_))) | Err(Error::Unsupported(_)) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// The partial-threadgroups variant (`VariantKey::partial_threadgroups`) a direct
+/// `dispatchThreads:` runs on where no flat variant does, with its plan for `shape`: the
+/// threadgroups its threads fill, rounded up, at the call's threadgroup size, one Vulkan dispatch
+/// per chunk of group counts, the last threadgroup along an axis answering Metal's partial
+/// threadgroup's threads (`lower::dispatch`'s partial threadgroups of a kernel), in place of the
+/// interior and edge regions a split plans, each edge a `VkPipeline` of its remainder's size. So a
+/// kernel that observes its threadgroup partition runs every ragged grid of a threadgroup size on
+/// one `VkPipeline` beside its state's, and with no `Degradation::SplitDispatch` where its group
+/// counts fit the device's.
+///
+/// **A large kernel's whole grids.** A kernel whose base module holds `compile_memory`'s
+/// `COUNTED_WORDS` (65,536) SPIR-V words or more runs its whole grids there too, every thread live
+/// (`ComputePipelineState::whole_on_partial`): a `dispatchThreads:` of a whole number of
+/// threadgroups and a `dispatchThreadgroups:`, where its ragged grids of the same form run on the
+/// variant (no flat variant runs them, [`flat_direct`]). So one `VkPipeline` of a threadgroup size
+/// runs all its direct dispatches, where the plain pipeline's for its whole grids would be a second
+/// driver compile of the module: on a guest's run on an RX 7900 XTX, the plain pipeline's compile
+/// of a kernel of 2,415,531 words was 26.9 s of a 39.8 s warm pass. Its cost on the GPU, measured
+/// once on the same GPU (RADV) over 1,048,576 threads in threadgroups of 64, the fastest of three
+/// command buffers of eight dispatches each: 0.997 to 1.020 times the plain pipeline's time over
+/// four straight-line kernels, three of 40,000 fused multiply-adds (behind a threadgroup barrier
+/// and a simdgroup sum, a threadgroup barrier alone, or neither) and a light one, their words the
+/// plain pipeline's. A smaller kernel's whole grids keep the plain pipeline and its speed: its
+/// compile is cheap. Both forms give the same answers, so no switch chooses between them.
+///
+/// `None`, so the dispatch keeps its exact split or its plain pipeline, where its grid is empty or,
+/// but for such a kernel, a whole number of threadgroups, in the large-buffer form, where the
+/// variant would emulate its simdgroups (`ComputePipelineState::settle_partial`), where the
+/// compile layer refuses the kernel the variant, which the state remembers, or where the device's
+/// limits cannot hold its threadgroups.
+fn partial_direct(
+    pipeline: &ComputePipelineState,
+    shape: &BindShape,
+    dispatch: &Dispatch,
+    forms: BufferForms,
+) -> Result<Option<(Arc<Variant>, Arc<BindingPlan>)>, Error> {
+    if forms != BufferForms::Bound {
+        return Ok(None);
+    }
+    // An empty grid takes none; the grid's class (`GridClass`) chooses as a later dispatch of the
+    // class asks of it.
+    let (local, class) = match (*dispatch, GridClass::of(dispatch)) {
+        (
+            Dispatch::Threads {
+                threads_per_group, ..
+            }
+            | Dispatch::Threadgroups {
+                threads_per_group, ..
+            },
+            Some(class),
+        ) => (threads_per_group, class),
+        _ => return Ok(None),
+    };
+    // A grid of one row in threadgroups of one row, which the call's flat variant runs for a
+    // kernel that observes its partition through its simdgroups alone (`flat_direct`).
+    if class.whole() && !pipeline.whole_on_partial(class.one_row()) {
+        return Ok(None);
+    }
+    match pipeline.settle_partial(shape, local, dispatch) {
+        Ok(settled) => Ok(settled),
+        // Threadgroups the device's limits cannot hold: the split's own refusal answers.
+        Err(Error::Bind(BindError::Unsupported(_))) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `dispatch` is a direct dispatch of whole threadgroups: a `dispatchThreadgroups:`, or a
+/// `dispatchThreads:` whose grid is a whole number of threadgroups on every axis.
+fn whole_grid(dispatch: &Dispatch) -> bool {
+    match *dispatch {
+        Dispatch::Threadgroups { .. } => true,
+        Dispatch::Threads {
+            threads,
+            threads_per_group,
+        } => (0..3).all(|i| threads[i].is_multiple_of(threads_per_group[i])),
+        _ => false,
+    }
+}
+
+/// The variant a direct dispatch of a bind state of `shape` in `forms` runs on, and its plan for
+/// `shape`: its flat variant where it takes one ([`flat_direct`]), else its partial-threadgroups
+/// variant where it takes one ([`partial_direct`]), else `ComputePipelineState::settle`'s. A program's dispatch plans so ([`plan_now`]), and so does a
+/// warm pass's dispatch of a record (`pipeline/dispatch_record.rs`), so both ask for the same
+/// variant and its regions' keys. A program's dispatch, of the bind state and bound formats
+/// `bound`, in the bound form, then takes that variant's unit-axes variant where its plan offers
+/// one and it is made (`ComputePipelineState::unit_axes`); a warm pass makes that one beside it.
+pub(crate) fn settle_direct(
+    pipeline: &ComputePipelineState,
+    shape: &BindShape,
+    dispatch: &Dispatch,
+    forms: BufferForms,
+    bound: Option<(&BindState, BoundFormats<'_>)>,
+) -> Result<Direct, Error> {
+    let settled = match flat_direct(pipeline, shape, dispatch, forms)? {
+        Some(flat) => flat,
+        None => match partial_direct(pipeline, shape, dispatch, forms)? {
+            Some(partial) => partial,
+            None => pipeline.settle(shape, dispatch, forms)?,
+        },
+    };
+    match (bound, forms) {
+        (Some(bound), BufferForms::Bound) => pipeline.unit_axes(settled, (shape, dispatch), bound),
+        _ => Ok(Direct::of(settled)),
     }
 }
 
@@ -1881,36 +2219,41 @@ fn apart_samplers(device: &Device, objects: &VariantObjects) -> bool {
             .contains(&RuntimeDriverDefect::ImmutableSamplersLostAfterCopies)
 }
 
-/// What a dispatch settles before it binds ([`settle_dispatch`]): the device's sampler states it
-/// lists (less those at IDs no set-1 sampler array of the variant holds, `unlisted` saying so:
-/// `heap_sets::fit_samplers`), the visible-function tables its state made, its runtime samplers'
-/// address-mode maps, its bind state, and what it planned: the state's shape, and the variant it
-/// runs on with its plan, for `planned.dispatch`.
+/// What a dispatch settles before it binds ([`settle_dispatch`], [`settle_live`]): the device's
+/// sampler states it lists (less those at IDs no set-1 sampler array of the variant holds,
+/// `unlisted` saying so: `heap_sets::fit_samplers`), where it took them
+/// (`sampler::ArgumentSamplers`), the visible-function tables its state made,
+/// its runtime samplers' address-mode maps, and what it planned: the state's shape, and the variant
+/// it runs on with its plan, for `planned.dispatch`. Its bind state is apart: the encoder's kept one
+/// (`compute/live.rs`), or one of its own.
 pub(super) struct SettledDispatch {
-    argument_samplers: Vec<SamplerState>,
+    /// `None` where it took none: an encoder's dispatch whose kept state lists every live state
+    /// at the count of their slots' changes that holds, of a variant with no set-1 arrays, or an
+    /// entry parked in its command buffer ([`DispatchMemo::unlist_samplers`]).
+    argument_samplers: Option<Vec<SamplerState>>,
     function_tables: Vec<VisibleFunctionTable>,
     unlisted: Option<(u64, u64)>,
     sampler_maps: SamplerMaps,
-    state: BindState,
     planned: Arc<Planned>,
 }
 
 /// A flat indirect call and its preprocess's description (`indirect_dispatch.rs`).
 type Flat<'a> = Option<(FlatCall<'a>, FlatIndirect)>;
 
-/// What a dispatch of `tables`, of `direct` group counts or of a flat indirect call (`gpu`),
-/// settles ([`SettledDispatch`]) with `function_tables`, its state's, and `samplers`, the
-/// device's sampler states: the flat call's preprocess description beside it, and `None` where
+/// What a dispatch of `tables` that keeps no bind state (an indirect command's, a host step's),
+/// of `direct` group counts or of a flat indirect call (`gpu`), settles ([`SettledDispatch`])
+/// with `function_tables`, its state's, and `samplers`, the device's sampler states, and the bind
+/// state it settled, made whole: the flat call's preprocess description beside it, and `None` where
 /// the GPU path does not take an indirect dispatch (`indirect_dispatch.rs`). A direct dispatch
-/// whose bind state has the shape the state's last direct dispatch planned, of the same dispatch
-/// and buffer forms, takes what that one planned ([`Planned`]); one that plans keeps what it
-/// planned for the next.
+/// whose bind state has the shape one its pipeline state planned lately for the same dispatch and
+/// buffer forms, compared in place (`ComputePipelineState::planned_of`), takes what that one
+/// planned ([`Planned`]); one that plans keeps what it planned for the next.
 fn settle_dispatch<'a>(
     tables: &DispatchTables<'_>,
     (direct, gpu): (Option<Dispatch>, Option<FlatCall<'a>>),
     function_tables: Vec<VisibleFunctionTable>,
     samplers: Vec<SamplerState>,
-) -> Result<Option<(SettledDispatch, Flat<'a>)>, Error> {
+) -> Result<Option<(BindState, SettledDispatch, Flat<'a>)>, Error> {
     let pipeline = tables.pipeline;
     // The device's sampler states, less those at IDs no set-1 sampler array of the variant
     // holds (each array has the variant's heap capacity of elements): a degradation where
@@ -1919,79 +2262,194 @@ fn settle_dispatch<'a>(
     let mut unlisted = None;
     // Its runtime samplers' address modes as the textures they sample map them.
     let sampler_maps = tables.sampler_maps()?;
-    let last = match direct {
-        Some(dispatch) => pipeline
-            .planned()
-            .filter(|last| last.dispatch == dispatch && last.forms == tables.forms),
-        None => None,
-    };
     let (state, planned, as_before, flat) = loop {
         let mut state = tables.bind_state(&argument_samplers, &function_tables);
         sampler_maps.apply(&mut state);
-        let last = last.as_ref().filter(|last| state.has_shape(&last.shape));
-        let (planned, as_before, flat) = match (last, direct, gpu) {
-            (Some(last), ..) => (Arc::clone(last), true, None),
-            (None, Some(dispatch), _) => {
-                let shape = state.shape();
-                let flat = flat_direct(pipeline, &shape, &dispatch, tables.forms)?;
-                let (variant, plan) = match flat {
-                    Some(flat) => flat,
-                    None => pipeline.settle(&shape, &dispatch, tables.forms)?,
-                };
-                let planned = Planned {
-                    shape: Arc::new(shape),
-                    dispatch,
-                    forms: tables.forms,
-                    variant,
-                    plan,
-                    made: OnceLock::new(),
-                };
-                (Arc::new(planned), false, None)
+        let last = direct.and_then(|dispatch| pipeline.planned_of(&state, &dispatch, tables.forms));
+        let (planned, as_before, flat) = match last {
+            Some(last) => (last, true, None),
+            None => {
+                let shape = Arc::new(state.shape());
+                let bound = (&state, tables);
+                match plan_now(pipeline, tables.forms, shape, (direct, gpu), bound)? {
+                    Some((planned, flat)) => (planned, false, flat),
+                    None => return Ok(None),
+                }
             }
-            (None, None, Some(gpu)) => {
-                let shape = state.shape();
-                let Some((variant, plan, indirect)) = settle_indirect(pipeline, gpu, &shape)?
-                else {
-                    return Ok(None);
-                };
-                let planned = Planned {
-                    shape: Arc::new(shape),
-                    dispatch: flat_dispatch(indirect.threads_per_threadgroup),
-                    forms: tables.forms,
-                    variant,
-                    plan,
-                    made: OnceLock::new(),
-                };
-                (Arc::new(planned), false, Some((gpu, indirect)))
-            }
-            (None, None, None) => return Err(internal("a dispatch of no counts")),
         };
         let set = planned.variant.pipeline().layout.sets.get(1);
         if heap_sets::fit_samplers(set, &mut argument_samplers, &mut unlisted) {
             break (state, planned, as_before, flat);
         }
     };
-    match (as_before, direct) {
-        (true, _) => (pipeline.device().shared().counts).dispatch_planned_as_before(),
-        // A flat dispatch's variant and plan are the flat path's: none a direct one takes.
-        (false, Some(_)) => pipeline.keep_planned(Arc::clone(&planned)),
-        (false, None) => {}
-    }
+    planned_as_before(pipeline, &planned, as_before, direct);
     let settled = SettledDispatch {
-        argument_samplers,
+        argument_samplers: Some(argument_samplers),
         function_tables,
         unlisted,
         sampler_maps,
-        state,
         planned,
     };
-    Ok(Some((settled, flat)))
+    Ok(Some((state, settled, flat)))
 }
 
-/// What a compute encoder's last dispatch settled ([`SettledDispatch`]), its commands, and the
-/// `VkPipeline`s its regions found made, kept with what they are a function of: a later dispatch
-/// of the encoder of the same inputs settles, plans and instantiates nothing again, and looks no
-/// pipeline up (`WorkCounts::dispatches_settled_as_before`). Exact:
+/// [`settle_dispatch`] of a compute encoder's own dispatch, through the encoder's kept bind state
+/// `live`, brought in place (`LiveDispatch::refresh`), with the device's sampler states `samplers`
+/// taken only where the dispatch needs them (`sampler::ArgumentSamplers`), at `changed` changes of
+/// their slots: where the kept state lists every live state at that count, of a variant with no
+/// set-1 arrays, it takes none. The state's shape kept where nothing brought in may have changed
+/// it, else found among those the pipeline state planned for lately or made
+/// (`LiveDispatch::shape`), and what it planned for that shape, the very one looked for first
+/// (`ComputePipelineState::planned_for`). Where `refreshed` holds the table's samplers' maps, the
+/// state was brought in place with them and `samplers` already (`LiveDispatch::settled_across`'s
+/// `Across::Refreshed`), which it is not again. Beside what it settled, the count of slot changes
+/// its listing is of: the states', where it took them.
+fn settle_live<'a>(
+    live: &mut LiveDispatch,
+    tables: &DispatchTables<'_>,
+    (direct, gpu): (Option<Dispatch>, Option<FlatCall<'a>>),
+    function_tables: Vec<VisibleFunctionTable>,
+    ((changed, mut samplers), refreshed): ((u64, ArgumentSamplers), Option<SamplerMaps>),
+) -> Result<Option<(SettledDispatch, Flat<'a>, u64)>, Error> {
+    let pipeline = tables.pipeline;
+    let device = pipeline.generation();
+    let counts = device.shared().counts.thread();
+    let mut unlisted = None;
+    let (sampler_maps, mut in_place) = match refreshed {
+        Some(maps) => (maps, true),
+        None => (tables.sampler_maps()?, false),
+    };
+    let (planned, as_before, flat) = loop {
+        if !in_place {
+            let listing = (changed, &mut samplers);
+            live.refresh(tables, &sampler_maps, listing, &function_tables, counts);
+        }
+        in_place = false;
+        let shape = live.shape(counts, |state| pipeline.planned_shape(state));
+        let last =
+            direct.and_then(|dispatch| pipeline.planned_for(&shape, &dispatch, tables.forms));
+        let (planned, as_before, flat) = match last {
+            Some(last) => (last, true, None),
+            None => {
+                let bound = (&*live.state, tables);
+                match plan_now(pipeline, tables.forms, shape, (direct, gpu), bound)? {
+                    Some((planned, flat)) => (planned, false, flat),
+                    None => return Ok(None),
+                }
+            }
+        };
+        let set = planned.variant.pipeline().layout.sets.get(1);
+        if samplers.fit(set, &mut unlisted) {
+            break (planned, as_before, flat);
+        }
+        // A variant of set-1 arrays writes the listed states' elements: it takes the states,
+        // listed again against them (alike, where the kept listing is current).
+        samplers.take(device);
+    };
+    planned_as_before(pipeline, &planned, as_before, direct);
+    let listed = samplers.taken_at().unwrap_or(changed);
+    let settled = SettledDispatch {
+        argument_samplers: samplers.into_states(),
+        function_tables,
+        unlisted,
+        sampler_maps,
+        planned,
+    };
+    Ok(Some((settled, flat, listed)))
+}
+
+/// What a dispatch of a bind state of `shape` in `forms` plans now, of `direct` group counts or of
+/// a flat indirect call (`gpu`): the direct dispatch's variant as [`settle_direct`] settles it for
+/// the bind state `bound`'s, binding what `bound`'s tables bind; the indirect one's flat or folded
+/// variant, with its preprocess description, or `None` where neither takes it, which then takes
+/// its host step.
+fn plan_now<'a>(
+    pipeline: &ComputePipelineState,
+    forms: BufferForms,
+    shape: Arc<BindShape>,
+    (direct, gpu): (Option<Dispatch>, Option<FlatCall<'a>>),
+    (state, tables): (&BindState, &DispatchTables<'_>),
+) -> Result<Option<(Arc<Planned>, Flat<'a>)>, Error> {
+    match (direct, gpu) {
+        (Some(dispatch), _) => {
+            // What the dispatch binds, as its specialized notices name it.
+            let stages = [(Stage::Kernel, tables.table)];
+            let bound = binding::Tables::new(&stages).with_residency(tables.residency);
+            let formats: BoundFormats<'_> = &|slot| bound.bound_format(slot);
+            let settled =
+                settle_direct(pipeline, &shape, &dispatch, forms, Some((state, formats)))?;
+            // Every region of the call's threadgroup size, so the grid's class names the variant
+            // and plan (`GridClass`): not a ragged grid's exact split.
+            let key = settled.variant.key();
+            let grids = GridClass::of(&dispatch).filter(|class| {
+                forms == BufferForms::Bound
+                    && (key.flat_grid || key.partial_threadgroups || class.whole())
+            });
+            let planned = Planned {
+                key: shape.key_beside_used(),
+                shape,
+                dispatch,
+                forms,
+                grids,
+                variant: settled.variant,
+                plan: settled.plan,
+                meanwhile: settled.meanwhile,
+                made: OnceLock::new(),
+                twins: binding::TwinProofs::default(),
+            };
+            Ok(Some((Arc::new(planned), None)))
+        }
+        (None, Some(gpu)) => {
+            let Some((variant, plan, indirect)) = settle_indirect(pipeline, gpu, &shape)? else {
+                return Ok(None);
+            };
+            let planned = Planned {
+                key: shape.key_beside_used(),
+                shape,
+                dispatch: flat_dispatch(indirect.threads_per_threadgroup),
+                forms,
+                grids: None,
+                variant,
+                plan,
+                meanwhile: false,
+                made: OnceLock::new(),
+                twins: binding::TwinProofs::default(),
+            };
+            Ok(Some((Arc::new(planned), Some((gpu, indirect)))))
+        }
+        (None, None) => Err(internal("a dispatch of no counts")),
+    }
+}
+
+/// Count a direct dispatch that took what its pipeline state planned before (`as_before`), for
+/// another grid of its class where it was (`Planned::grids`), or keep what one planned now for
+/// the next, but where it is for now alone (`Planned::meanwhile`); a flat dispatch's variant and
+/// plan are the flat path's, none a direct one takes.
+fn planned_as_before(
+    pipeline: &ComputePipelineState,
+    planned: &Arc<Planned>,
+    as_before: bool,
+    direct: Option<Dispatch>,
+) {
+    match (as_before, direct) {
+        (true, direct) => {
+            let counts = (pipeline.generation().shared().counts).thread();
+            counts.dispatch_planned_as_before();
+            if direct.is_some_and(|dispatch| dispatch != planned.dispatch) {
+                counts.dispatch_planned_across_grids();
+            }
+        }
+        (false, Some(_)) if !planned.meanwhile => pipeline.keep_planned(Arc::clone(planned)),
+        (false, _) => {}
+    }
+}
+
+/// What a compute encoder's last dispatch that settled settled ([`SettledDispatch`]), its
+/// commands, and the `VkPipeline`s its regions found made, kept with what they are a function of
+/// beside the encoder's kept bind state, which that dispatch brought in place and binds
+/// (`compute/live.rs`): a later dispatch of the encoder of the same inputs settles, plans and
+/// instantiates nothing again, brings no state in place and looks no pipeline up
+/// (`WorkCounts::dispatches_settled_as_before`). Exact:
 ///
 /// - **The bind state** is a function of the pipeline state (its interface, view base alignment
 ///   and imageblock among it), of what the table binds (its stamp: every call that may change it
@@ -2003,25 +2461,37 @@ fn settle_dispatch<'a>(
 ///   what a used resource states of it beyond that, its buffers' addresses, which only a no-copy
 ///   buffer's move changes, and whether each indirect command buffer holds its ID's slot, which a
 ///   buffer made later with the ID takes: `Residency::holds_slots_as`), of the device's live
-///   sampler states (`Device::sampler_slots_changed`), of the state's visible-function tables
+///   sampler states (`DeviceShared::sampler_slots_changed`), of the state's visible-function tables
 ///   (none: a dispatch of a state that made one takes no memo), and of the sampler maps, which
-///   are the table's and the residency's.
+///   are the table's and the residency's. The kept state is this entry's: a dispatch that brings
+///   it in place keeps its own entry or none (`LiveDispatch::let_go`).
 /// - **The variant and plan** are `ComputePipelineState::settle`'s of the shape, the dispatch and
-///   the buffer forms; **the commands** are the plan's instantiation for the state and the
-///   dispatch, their regions keyed by the variant for the device (`Variant::keyed_regions`).
+///   the buffer forms (the entry keeps the dispatch: what it planned may be of another grid of
+///   its class, `Planned::grids`); **the commands** are the plan's instantiation for the state and
+///   the dispatch, their regions keyed by the variant for the device (`Variant::keyed_regions`).
 /// - **A region's `VkPipeline`** found made is its variant's for the region's key, which its
 ///   making never changes; regions not all made are looked up again at the next dispatch.
+/// - **Another encoder's table.** The entry goes on with the state to the command buffer's next
+///   compute encoder (`compute/live.rs`'s **Parked in its command buffer**), and a dispatch there
+///   whose new table, read, brings in the very state the entry settled (no value of any kind
+///   changed, the samplers' maps the same), with every other input above the same, takes it under
+///   the new table's stamp (`WorkCounts::dispatches_settled_across_encoders`).
 /// - **A dispatch that settles again** (another table, another residency) takes the variant, the
-///   plan and the made `VkPipeline`s of the state's last direct dispatch that planned where its
-///   bind state has that one's shape ([`Planned`], [`settle_dispatch`]): so does one whose
-///   buffers' offsets alone moved, and an encoder's first dispatch of the state.
+///   plan and the made `VkPipeline`s of one of its pipeline state's latest direct dispatches that
+///   planned, where its bind state has that one's shape ([`Planned`], [`settle_live`]): so does one
+///   whose buffers' offsets alone moved, an encoder's first dispatch of the state, and one of
+///   another grid of that one's class where its plan names its variant for the grid
+///   (`pipeline::GridClass`, `WorkCounts::dispatches_planned_across_grids`).
 #[derive(Default)]
-pub(super) struct DispatchMemo(Option<Arc<KeptDispatch>>);
+pub(super) struct DispatchMemo(Option<KeptDispatch>);
 
 /// A [`DispatchMemo`]'s entry and what it was settled under.
 pub(super) struct KeptDispatch {
     /// The pipeline state, held so that no other state is this one while the entry is kept.
     pipeline: ComputePipelineState,
+    /// The dispatch it settled, whose grid its commands run: what it planned may be of another
+    /// grid of its class (`Planned::grids`).
+    dispatch: Dispatch,
     stamp: Stamp,
     threadgroup_lengths: BTreeMap<u32, u32>,
     imageblock: ImageblockSize,
@@ -2029,47 +2499,63 @@ pub(super) struct KeptDispatch {
     forms: BufferForms,
     /// The residency's generation (`Residency::generation`).
     residency: u64,
-    /// `buffer::host_cells_moved` and `Device::sampler_slots_changed` as it was settled.
+    /// `buffer::host_cells_moved` and `DeviceShared::sampler_slots_changed` as it was settled.
     counted: (u64, u64),
     settled: SettledDispatch,
-    commands: OnceLock<DispatchCommands>,
+    /// Its commands: those the encoder's kept state keeps where they are of its planned
+    /// ([`Instantiated`]), else instantiated.
+    commands: OnceLock<Arc<DispatchCommands>>,
     /// Each region's `VkPipeline`, where all were found made.
     made: OnceLock<Vec<Arc<RawPipeline>>>,
 }
 
 impl DispatchMemo {
-    /// The entry, where it is of a dispatch of `tables` and `dispatch` at `counted` moves and
-    /// sampler slot changes.
-    fn find(
+    /// Whether the entry is of a dispatch of `tables` and `dispatch` at `counted` moves and
+    /// sampler slot changes, `state` the kept bind state it settled.
+    fn holds(
         &self,
+        state: &BindState,
         tables: &DispatchTables<'_>,
         dispatch: &Dispatch,
         counted: (u64, u64),
-    ) -> Option<Arc<KeptDispatch>> {
-        let kept = self.0.as_ref()?;
-        let same = kept.pipeline == *tables.pipeline
-            && kept.stamp == tables.table.stamp()
-            && kept.settled.planned.dispatch == *dispatch
-            && kept.counted == counted
-            && kept.forms == tables.forms
-            && kept.imageblock == tables.imageblock
-            && kept.stage_in_region == tables.stage_in_region
-            && kept.threadgroup_lengths == *tables.threadgroup_lengths
-            && kept.residency == tables.residency.generation()
-            && (tables.residency).holds_slots_as(&kept.settled.state.used_resources);
-        same.then(|| Arc::clone(kept))
+    ) -> bool {
+        (self.0.as_ref()).is_some_and(|kept| kept.stamp == tables.table.stamp())
+            && self.holds_but_stamp(state, tables, dispatch, counted)
     }
 
-    /// Keep `settled`, a dispatch of `tables` at `counted` moves and sampler slot changes, in
-    /// place of the entry.
+    /// [`holds`](Self::holds) in every input but the table's stamp: a table of another encoder
+    /// of the command buffer (`LiveDispatch::settled_across`).
+    fn holds_but_stamp(
+        &self,
+        state: &BindState,
+        tables: &DispatchTables<'_>,
+        dispatch: &Dispatch,
+        counted: (u64, u64),
+    ) -> bool {
+        self.0.as_ref().is_some_and(|kept| {
+            kept.pipeline == *tables.pipeline
+                && kept.dispatch == *dispatch
+                && kept.counted == counted
+                && kept.forms == tables.forms
+                && kept.imageblock == tables.imageblock
+                && kept.stage_in_region == tables.stage_in_region
+                && kept.threadgroup_lengths == *tables.threadgroup_lengths
+                && kept.residency == tables.residency.generation()
+                && (tables.residency).holds_slots_as(&state.used_resources)
+        })
+    }
+
+    /// Keep `settled`, a dispatch of `tables` and `dispatch` at `counted` moves and sampler slot
+    /// changes, in place of the entry.
     fn keep(
         &mut self,
-        tables: &DispatchTables<'_>,
+        (tables, dispatch): (&DispatchTables<'_>, Dispatch),
         counted: (u64, u64),
         settled: SettledDispatch,
-    ) -> Arc<KeptDispatch> {
-        let kept = Arc::new(KeptDispatch {
+    ) {
+        self.0 = Some(KeptDispatch {
             pipeline: tables.pipeline.clone(),
+            dispatch,
             stamp: tables.table.stamp(),
             threadgroup_lengths: tables.threadgroup_lengths.clone(),
             imageblock: tables.imageblock,
@@ -2081,25 +2567,174 @@ impl DispatchMemo {
             commands: OnceLock::new(),
             made: OnceLock::new(),
         });
-        self.0 = Some(Arc::clone(&kept));
-        kept
+    }
+
+    /// The entry, where one is kept.
+    fn entry(&self) -> Option<&KeptDispatch> {
+        self.0.as_ref()
+    }
+
+    /// The entry goes on under `stamp`, the stamp of a table that brings in the very state it
+    /// settled (`LiveDispatch::settled_across`), its sampler states listed again where its
+    /// parking let them go ([`unlist_samplers`](Self::unlist_samplers)) and its variant has set-1
+    /// arrays, which write their elements: `samplers`, taken from `device` where they were not,
+    /// at the count of sampler slot changes the entry was settled at, so the very states it
+    /// listed (`DeviceShared::sampler_slots_changed`).
+    fn restamp(&mut self, stamp: Stamp, (samplers, device): (&mut ArgumentSamplers, &Device)) {
+        if let Some(kept) = &mut self.0 {
+            kept.stamp = stamp;
+            let settled = &mut kept.settled;
+            let arrays = settled
+                .planned
+                .variant
+                .pipeline()
+                .layout
+                .sets
+                .get(1)
+                .is_some();
+            if arrays && settled.argument_samplers.is_none() {
+                settled.argument_samplers = Some(samplers.take(device).clone());
+            }
+        }
+    }
+
+    /// Let go of the device's sampler states the entry listed, as its encoder's state parks in its
+    /// command buffer, which holds none of them (`compute/live.rs`'s `Parked`): a dispatch that
+    /// takes the entry lists them again ([`restamp`](Self::restamp)), at the same count of
+    /// sampler slot changes, which every other use of the entry compares first.
+    fn unlist_samplers(&mut self) {
+        if let Some(kept) = &mut self.0 {
+            kept.settled.argument_samplers = None;
+        }
+    }
+}
+
+/// The commands a compute encoder's last direct dispatch that instantiated made (its regions keyed
+/// for the device: `Variant::keyed_regions`), kept with the encoder's bind state
+/// (`compute/live.rs`), whose kept state goes on to the next compute encoder: a later
+/// dispatch, of the encoder or a later one, of the same grid that takes the very [`Planned`] that
+/// one took takes them while the state binds the values they read, instantiating nothing
+/// (`WorkCounts::dispatches_instantiated_as_before`). Exact:
+///
+/// - **What they are a function of.** `BindingPlan::instantiate_dispatch` of the plan, for the
+///   bind state and the dispatch, keyed by the variant for the device. The planned names the
+///   plan and the variant, and the shape they were settled for, which is the state's
+///   (`settle_live`); the entry keeps the dispatch, as the planned may serve other grids of its
+///   class (`Planned::grids`); the device is the state's, as a kept state is its device's
+///   (`SpareLiveDispatches`).
+/// - **The planned, by identity.** The entry holds it weakly: while the entry lasts, no other
+///   planned lies where it lay, so one there is the very one. It holds none alive, nor anything
+///   else (the commands are values).
+/// - **The state, by the kinds of values that changed.** Each bringing of the state in place
+///   notes the kinds of its values it changed (`live_bind::ValueKinds`: the bindings of each slot
+///   class, and every other field), and a kind the plan's commands may read lets the entry go
+///   (`BindingPlan::dispatch_reads`: every field and buffer binding; texture bindings only where
+///   the plan reads a texel buffer, a texture's in-place planes or a handle table's member bound
+///   at a slot; sampler bindings never). Within one planned the shape is one, so a kind the plan
+///   does not read changed only in values its commands do not read: a program that binds two
+///   textures of one shape in turn, an encoder for each dispatch, keeps them. Checked in builds
+///   with debug assertions, where each dispatch that takes them instantiates again and compares.
+/// - **Their storage, kept where the entry goes.** Commands no longer of the state stay as the
+///   storage the next direct dispatch's instantiation writes over
+///   (`BindingPlan::instantiate_dispatch_into`, `WorkCounts::dispatches_instantiated_in_place`)
+///   where nothing else holds them (the memo's entry they were taken into goes before: a dispatch
+///   that instantiates settled anew), so a program that binds a buffer at another offset at each
+///   dispatch, an encoder for each, makes its commands' lists once. Exact: the method sets every
+///   field as `instantiate_dispatch` does, which builds with debug assertions instantiate again
+///   to compare.
+#[derive(Default)]
+pub(super) struct Instantiated(Option<KeptCommands>);
+
+/// An [`Instantiated`]'s entry: its commands, and what they are of, where they still are.
+struct KeptCommands {
+    /// `None` where a value they may read moved since: the commands are then storage alone.
+    of: Option<CommandsOf>,
+    commands: Arc<DispatchCommands>,
+}
+
+/// What a [`KeptCommands`]' commands are of.
+struct CommandsOf {
+    planned: Weak<Planned>,
+    /// The dispatch they run: what it planned may be of another grid of its class
+    /// (`Planned::grids`).
+    dispatch: Dispatch,
+    /// The kinds of the state's values the commands may read.
+    reads: ValueKinds,
+}
+
+impl CommandsOf {
+    fn new(planned: &Arc<Planned>, dispatch: Dispatch) -> CommandsOf {
+        CommandsOf {
+            planned: Arc::downgrade(planned),
+            dispatch,
+            reads: ValueKinds::dispatch_reads(&planned.plan),
+        }
+    }
+}
+
+impl Instantiated {
+    /// The commands kept, where they are of `planned` and `dispatch`.
+    fn of(&self, planned: &Arc<Planned>, dispatch: &Dispatch) -> Option<&Arc<DispatchCommands>> {
+        let kept = self.0.as_ref()?;
+        let of = kept.of.as_ref()?;
+        let same = std::ptr::eq(of.planned.as_ptr(), Arc::as_ptr(planned));
+        (same && of.dispatch == *dispatch).then_some(&kept.commands)
+    }
+
+    /// The commands of a direct dispatch of `planned` and `dispatch`, kept in place of the
+    /// entry's: `over` writes them over the kept commands' storage where nothing else holds it
+    /// (with whether it did), else `fresh` makes them.
+    fn instantiate(
+        &mut self,
+        (planned, dispatch): (&Arc<Planned>, Dispatch),
+        fresh: impl FnOnce() -> Result<DispatchCommands, Error>,
+        over: impl FnOnce(&mut DispatchCommands) -> Result<(), Error>,
+    ) -> Result<(Arc<DispatchCommands>, bool), Error> {
+        if let Some(kept) = &mut self.0 {
+            if let Some(commands) = Arc::get_mut(&mut kept.commands) {
+                // Of nothing while they are written, and after an error.
+                kept.of = None;
+                over(commands)?;
+                kept.of = Some(CommandsOf::new(planned, dispatch));
+                return Ok((Arc::clone(&kept.commands), true));
+            }
+        }
+        let commands = Arc::new(fresh()?);
+        self.0 = Some(KeptCommands {
+            of: Some(CommandsOf::new(planned, dispatch)),
+            commands: Arc::clone(&commands),
+        });
+        Ok((commands, false))
+    }
+
+    /// The state's values of the kinds `moved` names changed: the commands are of nothing where
+    /// they may read one, and are kept as storage alone.
+    fn moved(&mut self, moved: ValueKinds) {
+        if let Some(kept) = &mut self.0 {
+            if (kept.of.as_ref()).is_some_and(|of| of.reads.meets(moved)) {
+                kept.of = None;
+            }
+        }
     }
 }
 
 /// Plan, bind, and record the dispatch of `counts` with `tables` into `core` (the module's steps
 /// 2 to 4), for Metal's `call`: `Ok(false)`, recording nothing, where the GPU path does not take
 /// an indirect dispatch (`indirect_dispatch.rs`); a direct one is always recorded or refused.
-/// An encoder's own dispatch (`own`, its order among the encoder's dispatches) inside a block of
-/// command predication runs from the gates its unit's step writes (`predication.rs`), and takes
-/// what its last dispatch settled where it has the same inputs (`memo`, [`DispatchMemo`]). And
-/// one whose `VkPipeline`s are not made yet hands their making to the device's pool and records
-/// later (`pending_dispatch.rs`): an execution's or a host step's dispatch waits for them.
+/// An encoder's own dispatch (`own`: its order among the encoder's dispatches, and the encoder's
+/// kept bind state) inside a block of command predication runs from the gates its unit's step
+/// writes (`predication.rs`), binds the kept state brought in place (`compute/live.rs`), and a
+/// direct one takes what its last dispatch settled where it has the same inputs
+/// ([`DispatchMemo`]). And one whose `VkPipeline`s are not made yet hands their making to the
+/// device's pool and records later (`pending_dispatch.rs`): an execution's or a host step's
+/// dispatch waits for them. A dispatch of an inert kernel is planned and its uses made as any,
+/// then named alone, recording nothing, and answers `Ok(true)`, taken (the module docs).
 fn record(
     core: &mut EncoderCore,
     tables: &DispatchTables<'_>,
     call: &'static str,
     counts: Counts<'_>,
-    (own, memo): (Option<usize>, Option<&mut DispatchMemo>),
+    own: Option<(usize, &mut LiveDispatch)>,
 ) -> Result<bool, Error> {
     let pipeline = tables.pipeline;
     let (direct, gpu) = match counts {
@@ -2109,57 +2744,116 @@ fn record(
     // The live visible-function tables the pipeline state made: the encoder's, or an indirect
     // command's own state's.
     let function_tables = pipeline.function_tables();
-    // An encoder's own direct dispatch, of a state that made no table, takes the memo.
-    let memo = match (memo, direct) {
-        (Some(memo), Some(dispatch)) if function_tables.is_empty() => Some((memo, dispatch)),
-        _ => None,
+    let (own, mut live) = match own {
+        Some((own, live)) => (Some(own), Some(live)),
+        None => (None, None),
     };
-    let mut fresh = None;
+    // What a dispatch that takes no memo entry settled, and the bind state one that keeps none
+    // made.
+    let mut settled_here = None;
+    let mut state_here = None;
     let mut flat = None;
-    let kept = match memo {
-        Some((memo, dispatch)) => {
+    // An encoder's own dispatch started from its pipeline state's state set aside
+    // (`compute/live.rs`).
+    let mut from_aside = false;
+    match live.as_deref_mut() {
+        Some(live) => {
+            // It starts from its pipeline state's own bind state, where its encoder set one aside.
+            from_aside = live.select(pipeline);
+            if from_aside {
+                core.counts().dispatch_from_set_aside();
+            }
+            // A direct dispatch, of a state that made no table, takes the memo.
+            let memo = direct.filter(|_| function_tables.is_empty());
             let moved = super::buffer::host_cells_moved();
-            let counted = (moved, core.device().sampler_slots_changed());
-            match memo.find(tables, &dispatch, counted) {
-                Some(kept) => {
-                    core.device().shared().counts.dispatch_settled_as_before();
-                    Some(kept)
+            let changed = core.generation().sampler_slots_changed();
+            let held = memo.is_some_and(|dispatch| {
+                live.memo
+                    .holds(&live.state, tables, &dispatch, (moved, changed))
+            });
+            // The device's sampler states, taken only where the dispatch needs them
+            // (`sampler::ArgumentSamplers`).
+            let mut samplers = ArgumentSamplers::untaken();
+            // Else an entry an earlier compute encoder of the command buffer settled and parked,
+            // where the table, read now, brings in the very state it settled (`compute/live.rs`).
+            let across = match memo.filter(|_| !held) {
+                Some(dispatch) => {
+                    let thread = pipeline.generation().shared().counts.thread();
+                    live.settled_across(
+                        tables,
+                        (&dispatch, (moved, changed)),
+                        &mut samplers,
+                        &function_tables,
+                        thread,
+                    )?
                 }
-                None => {
-                    // The sampler states, with the count of changes they are live at.
-                    let (changed, samplers) = core.device().argument_samplers_at();
-                    let settled =
-                        settle_dispatch(tables, (direct, None), function_tables, samplers)?;
-                    let Some((settled, _)) = settled else {
-                        return Err(internal("a direct dispatch the GPU path does not take"));
-                    };
-                    Some(memo.keep(tables, (moved, changed), settled))
+                None => Across::Missed,
+            };
+            if held {
+                core.counts().dispatch_settled_as_before();
+            } else if let Across::Taken = across {
+                core.counts().dispatch_settled_across_encoders();
+            } else {
+                let refreshed = match across {
+                    Across::Refreshed(maps) => Some(maps),
+                    Across::Taken | Across::Missed => None,
+                };
+                let settling = ((changed, samplers), refreshed);
+                let settled = settle_live(live, tables, (direct, gpu), function_tables, settling);
+                // The kept state is no longer what the memo's entry settled.
+                let Some((settled, flat_call, changed)) = settled.inspect_err(|_| live.let_go())?
+                else {
+                    live.let_go();
+                    return Ok(false);
+                };
+                // What a dispatch settled for now alone is no entry's (`Planned::meanwhile`).
+                match memo.filter(|_| !settled.planned.meanwhile) {
+                    Some(dispatch) => live
+                        .memo
+                        .keep((tables, dispatch), (moved, changed), settled),
+                    None => {
+                        live.let_go();
+                        settled_here = Some(settled);
+                        flat = flat_call;
+                    }
                 }
             }
         }
         None => {
             let samplers = core.device().argument_samplers();
-            let Some((settled, flat_call)) =
+            let Some((state, settled, flat_call)) =
                 settle_dispatch(tables, (direct, gpu), function_tables, samplers)?
             else {
                 return Ok(false);
             };
-            fresh = Some(settled);
+            state_here = Some(state);
+            settled_here = Some(settled);
             flat = flat_call;
-            None
         }
+    }
+    let (kept, kept_state, resident_shadows, (kept_uses, bind_memo, kept_commands)) = match live {
+        Some(live) => {
+            let (state, memo, shadows, (uses, bind_memo, commands)) = live.parts();
+            let kept = (Some(uses), Some(bind_memo), Some(commands));
+            (memo.entry(), Some(state), Some(shadows), kept)
+        }
+        None => (None, None, None, (None, None, None)),
     };
-    let settled = match (&kept, &fresh) {
+    let settled = match (kept, &settled_here) {
         (Some(kept), _) => &kept.settled,
-        (None, Some(fresh)) => fresh,
+        (None, Some(settled)) => settled,
         (None, None) => return Err(internal("a dispatch settled nowhere")),
+    };
+    let state = match (&state_here, kept_state) {
+        (Some(state), _) => state,
+        (None, Some(state)) => state,
+        (None, None) => return Err(internal("a dispatch's bind state nowhere")),
     };
     let SettledDispatch {
         argument_samplers,
         function_tables,
         unlisted,
         sampler_maps,
-        state,
         planned,
     } = settled;
     let Planned {
@@ -2167,30 +2861,100 @@ fn record(
         variant,
         plan,
         dispatch,
+        twins: proofs,
         ..
     } = &**planned;
-    let (unlisted, dispatch) = (*unlisted, *dispatch);
+    // The call's own grid, where what it planned may be of another of its class
+    // (`Planned::grids`); a flat indirect dispatch's, its planned's.
+    let (unlisted, dispatch) = (*unlisted, direct.unwrap_or(*dispatch));
     let interface = &variant.pipeline().interface;
-    core.device().degrade_argument_pixel_samplers(
-        std::slice::from_ref(&variant.pipeline().stage),
-        argument_samplers,
-    );
+    // A notice that names a state of pixel coordinates lists the states, taken here where the
+    // dispatch settled without them.
+    let stages = std::slice::from_ref(&variant.pipeline().stage);
+    if core
+        .device()
+        .argument_pixel_samplers_noted(stages)
+        .is_some()
+    {
+        let mut taken = ArgumentSamplers::untaken();
+        let states = match argument_samplers {
+            Some(states) => states,
+            None => &*taken.take(core.device()),
+        };
+        core.device()
+            .degrade_argument_pixel_samplers(stages, states);
+    }
     tables
         .table
         .check_function_tables(call, Stage::Kernel, interface)?;
     tables.table.check_offsets(call, Stage::Kernel, interface)?;
     let kernel = pipeline.function_name();
     // The commands, their regions keyed (`Variant::keyed_regions`): those the memo's entry holds,
-    // where it holds them.
+    // where it holds them; else those the encoder's kept state keeps of what the dispatch planned
+    // ([`Instantiated`]), else instantiated (and kept there, for a direct dispatch).
     let mut instantiated = None;
-    let commands = match kept.as_ref().and_then(|kept| kept.commands.get()) {
-        Some(commands) => commands,
+    let commands = match kept.and_then(|kept| kept.commands.get()) {
+        Some(commands) => {
+            if from_aside {
+                core.counts().set_aside_commands_kept();
+            }
+            commands
+        }
         None => {
-            let mut commands = plan
-                .instantiate_dispatch(state, &dispatch)
-                .map_err(Error::Bind)?;
-            variant.keyed_regions(core.device(), &mut commands);
-            match &kept {
+            let instantiate = || -> Result<DispatchCommands, Error> {
+                let mut commands = plan
+                    .instantiate_dispatch(state, &dispatch)
+                    .map_err(Error::Bind)?;
+                variant.keyed_regions(core.device(), &mut commands);
+                Ok(commands)
+            };
+            let counts = core.counts();
+            let kept_of = kept_commands.as_deref();
+            let commands = match kept_of.and_then(|kept| kept.of(planned, &dispatch)) {
+                Some(commands) => {
+                    debug_assert!(
+                        instantiate().is_ok_and(|again| again == **commands),
+                        "a dispatch's kept commands that are not those it instantiates"
+                    );
+                    counts.dispatch_instantiated_as_before();
+                    if from_aside {
+                        counts.set_aside_commands_kept();
+                    }
+                    Arc::clone(commands)
+                }
+                None => {
+                    // A direct dispatch's are kept, over the storage of those kept before where
+                    // nothing else holds it.
+                    let commands = match (kept_commands, direct) {
+                        (Some(memo), Some(_)) => {
+                            let over = |commands: &mut DispatchCommands| {
+                                (plan.instantiate_dispatch_into(state, &dispatch, commands))
+                                    .map_err(Error::Bind)?;
+                                variant.keyed_regions(core.device(), commands);
+                                debug_assert!(
+                                    instantiate().is_ok_and(|again| again == *commands),
+                                    "a dispatch's commands written over kept ones that are not \
+                                     those it instantiates"
+                                );
+                                Ok(())
+                            };
+                            let (commands, in_place) =
+                                memo.instantiate((planned, dispatch), instantiate, over)?;
+                            if in_place {
+                                counts.dispatch_instantiated_in_place();
+                            }
+                            commands
+                        }
+                        _ => Arc::new(instantiate()?),
+                    };
+                    counts.dispatch_instantiated();
+                    if from_aside {
+                        counts.set_aside_commands_instantiated();
+                    }
+                    commands
+                }
+            };
+            match kept {
                 Some(kept) => kept.commands.get_or_init(|| commands),
                 None => &*instantiated.insert(commands),
             }
@@ -2239,15 +3003,26 @@ fn record(
     // and sampler tables at the handle tables.
     let compiled = variant.pipeline();
     let heap = heap_sets::heap_elements(&compiled.layout, plan, state)?;
-    let texture_table = heap_sets::texture_table(core.device(), &compiled.layout)?;
-    let sampler_table =
-        heap_sets::sampler_table(core.device(), &compiled.layout, &compiled.dependencies)?;
+    // What the variant's layout binds of the device's tables, worked out once (`heap_sets.rs`).
+    let heap_tables = (variant.objects()).heap_tables(&compiled.layout, &compiled.dependencies);
+    (variant.objects()).bind_sampler_tables(&compiled.layout, &compiled.dependencies);
+    let texture_table = heap_tables.texture_table(core.device())?;
+    let sampler_table = heap_tables.sampler_table(core.device())?;
     let stages = [(Stage::Kernel, tables.table)];
-    let mut bound_tables = binding::Tables::new(&stages)
+    let untwinned = binding::Tables::new(&stages)
         .with_residency(tables.residency)
         .with_texture_table(texture_table.as_ref())
         .with_sampler_table(sampler_table.as_ref())
         .with_sampler_maps(sampler_maps.clone());
+    // The slots the dispatch only reads through read twins (`read_twin.rs`).
+    let cb = core.command_buffer();
+    let roots = commands.root_table.iter().next().is_some();
+    // The plan's proofs, kept with what the dispatch planned (`Planned::twins`).
+    let twins = proofs.slots(cb, (&**plan, &commands.uses, roots), &untwinned);
+    let mut bound_tables = match &twins {
+        Some(twins) => untwinned.with_twins(twins),
+        None => untwinned,
+    };
     // The flat dispatch's preprocess: its scratch holds the region record the variant reads.
     let preprocess = match &flat {
         Some((_, indirect)) => {
@@ -2261,12 +3036,11 @@ fn record(
     // upload (16-aligned, as the variant reads it): the grid in threads is the call's, so nothing
     // on the device writes it.
     if let Some(bytes) = commands.region_record {
-        let device = core.device().clone();
         let record = {
             let mut state = core.command_buffer().state();
             state
                 .uploads
-                .upload_aligned(&device, &bytes, bytes.len() as u64, 16)?
+                .upload_aligned(core.device(), &bytes, bytes.len() as u64, 16)?
         };
         let Some(address) = record.device_address() else {
             return Err(internal(
@@ -2279,7 +3053,10 @@ fn record(
     // function-table array reads in set 0, which has no heap of its own.
     bound_tables = bound_tables.with_function_tables(function_tables);
     if let Some(heap) = &heap {
-        bound_tables = bound_tables.with_heap(argument_samplers, heap);
+        // Taken as the dispatch settled: its variant has set-1 arrays.
+        let states = (argument_samplers.as_deref())
+            .ok_or_else(|| internal("a heap's dispatch without its argument samplers"))?;
+        bound_tables = bound_tables.with_heap(states, heap);
     }
     let pipeline_stage = &variant.pipeline().stage;
     // A flat dispatch's indirect arguments are its preprocess's command, in the command's own
@@ -2293,12 +3070,16 @@ fn record(
         .collect();
     let command = binding::Command {
         descriptor_bytes: &commands.descriptor_bytes,
+        heap_tables: &[],
         descriptor_ranges: &commands.descriptor_ranges,
+        extents: &commands.extents,
         root_tables: commands
             .root_table
             .iter()
             .map(|table| (metal2vulkan::vk::ShaderStageFlags::COMPUTE, table))
             .collect(),
+        // A kernel's artifact states no proof that it stores nothing.
+        root_writes: true,
         push_holes: &commands.push_holes,
         uses: &command_uses,
         blobs: pipeline_stage
@@ -2308,11 +3089,28 @@ fn record(
             .collect(),
         mesh: None,
         tessellation: None,
+        fan_out: None,
     };
-    let mut uses = binding::command_uses(call, plan, &command, &bound_tables, None, None)?;
+    // An encoder's own dispatch makes its uses over the last one's, in their storage
+    // (`LiveDispatch::uses`), those of what the encoder made resident kept where they are the
+    // last dispatch's, as a draw does (`LiveBind::uses`); an indirect command's state makes them
+    // whole.
+    let mut made_whole;
+    let uses = match kept_uses {
+        Some(uses) => {
+            let inputs = (plan, &command, &bound_tables);
+            binding::command_uses_into(call, inputs, (None, None), uses)?;
+            uses
+        }
+        None => {
+            made_whole = binding::command_uses(call, plan, &command, &bound_tables, None, None)?;
+            &mut made_whole
+        }
+    };
     if let Some((call, _)) = &flat {
         uses.push(call.reads());
     }
+    let uses: &binding::CommandUses = uses;
     // A dispatch that names a detached buffer records nothing: its submission fails.
     let named = uses
         .iter()
@@ -2322,23 +3120,38 @@ fn record(
         tables.table.retain(core);
         return Ok(true);
     }
-    let device = core.device().clone();
+    // A dispatch of an inert kernel records nothing; the command buffer uses what it binds, as
+    // Metal's does (the module docs).
+    if pipeline.inert() {
+        core.name_uses(uses, uses.resident());
+        tables.table.retain(core);
+        core.counts().dispatch_skipped_inert();
+        return Ok(true);
+    }
+    // The device through the command buffer's handle, borrowed at each use (`core.device()`): no
+    // handle of its own, whose count every encoding thread's handles share.
     // Inside a block of command predication, each command runs from its gate: the flat path's
-    // preprocess (whose command then stays zero), else each region's dispatch.
+    // preprocess (whose command then stays zero), else each region's dispatch. Their group
+    // counts are listed only for a unit that gates them.
     let gates = match own.is_some() {
         true => {
-            let counts: Vec<[u32; 3]> = match &preprocess {
-                Some(_) => vec![[1, 1, 1]],
-                None => commands
-                    .regions
-                    .iter()
-                    .map(|region| region.group_count)
-                    .collect(),
-            };
             let (further, gates) = {
                 let mut state = core.command_buffer().state();
                 let (predication, uploads) = state.predication_and_uploads();
-                predication.gates(uploads, &device, &counts)?
+                match predication.gates_dispatches() {
+                    true => {
+                        let counts: Vec<[u32; 3]> = match &preprocess {
+                            Some(_) => vec![[1, 1, 1]],
+                            None => commands
+                                .regions
+                                .iter()
+                                .map(|region| region.group_count)
+                                .collect(),
+                        };
+                        predication.gates(uploads, core.device(), &counts)?
+                    }
+                    false => (None, Vec::new()),
+                }
             };
             if let Some(step) = further {
                 predication::record_further(core, &step)?;
@@ -2348,16 +3161,18 @@ fn record(
         false => Vec::new(),
     };
     let mut writes = Vec::new();
+    // An encoder's own dispatch binds through the views, sampler descriptions and host pages its
+    // binds kept (`binding::BindMemo`, `compute/live.rs`).
     let bound = {
         let mut state = core.command_buffer().state();
         binding::bind(
             call,
-            &device,
+            core.device(),
             &mut state,
             plan,
             &command,
             &bound_tables,
-            (None, &mut writes),
+            (bind_memo, &mut writes),
         )?
     };
     let mut push = Vec::with_capacity(commands.regions.len());
@@ -2365,7 +3180,7 @@ fn record(
         let writes = binding::push_writes(region.push_constants.clone(), &bound.holes)?;
         push.push((region.group_count, writes));
     }
-    let objects = std::sync::Arc::clone(variant.objects());
+    let objects = variant.objects();
     // Set 1 the device's (written below, once nothing refuses).
     let (heap_writes, mut writes): (Vec<_>, Vec<_>) =
         writes.into_iter().partition(|write| write.set > 0);
@@ -2380,21 +3195,21 @@ fn record(
     // bakes them records in one of its own, as one being made does.
     // Those the memo's entry holds, else those found made for what the dispatch planned, of its
     // regions' keys ([`Planned`]).
-    let kept_made = (kept.as_ref())
+    let kept_made = kept
         .and_then(|kept| kept.made.get())
         .or_else(|| planned.made_for(commands))
-        .filter(|_| !apart_samplers(&device, &objects));
+        .filter(|_| !apart_samplers(core.device(), objects));
     // Inside a predicated loop's laying, it waits for them too, so the laying, which its check
     // may submit again (`command_buffer/rerun.rs`), is not split for it; but where its variant
     // records in one of its own.
     let laying = core.command_buffer().state().predication_mut().laying();
-    let waits = laying && !apart_samplers(&device, &objects);
+    let waits = laying && !apart_samplers(core.device(), objects);
     let (pipelines, pending) = match (own.filter(|_| !waits), kept_made) {
         (Some(_), Some(made)) => {
-            if let Some(kept) = &kept {
+            if let Some(kept) = kept.filter(|kept| kept.made.get().is_none()) {
                 drop(kept.made.set(made.clone()));
             }
-            (made.clone(), None)
+            (Cow::Borrowed(made.as_slice()), None)
         }
         (Some(dispatch), None) => {
             let begun: Vec<_> = commands
@@ -2412,11 +3227,16 @@ fn record(
                     RegionPipeline::Making(_) => None,
                 })
                 .collect();
+            // A direct dispatch whose pipelines were not all made: the state's to record, for a
+            // later process's warm pass (`pipeline/dispatch_record.rs`).
+            if let (None, Some(direct)) = (&made, &direct) {
+                pipeline.record_dispatch(direct, state);
+            }
             match made {
-                Some(made) if !apart_samplers(&device, &objects) => {
+                Some(made) if !apart_samplers(core.device(), objects) => {
                     // Kept with the entry, which the next dispatch of its inputs takes, and with
                     // what it planned, which the next dispatch of its shape takes.
-                    if let Some(kept) = &kept {
+                    if let Some(kept) = kept {
                         drop(kept.made.set(made.clone()));
                     }
                     // Not a key's residual form, which serves only while its own is made.
@@ -2427,13 +3247,17 @@ fn record(
                         let keys = begun.iter().map(|(key, _)| key.clone()).collect();
                         drop(planned.made.set((keys, made.clone())));
                     }
-                    (made, None)
+                    (Cow::Owned(made), None)
                 }
                 Some(_) => {
-                    device.shared().counts.baked_sampler_dispatch_apart();
-                    (Vec::new(), Some((dispatch, begun)))
+                    core.device()
+                        .shared()
+                        .counts
+                        .thread()
+                        .baked_sampler_dispatch_apart();
+                    (Cow::Owned(Vec::new()), Some((dispatch, begun)))
                 }
-                None => (Vec::new(), Some((dispatch, begun))),
+                None => (Cow::Owned(Vec::new()), Some((dispatch, begun))),
             }
         }
         (None, _) => {
@@ -2441,7 +3265,7 @@ fn record(
             for region in &commands.regions {
                 made.push(variant.region_pipeline(region, formats)?);
             }
-            (made, None)
+            (Cow::Owned(made), None)
         }
     };
     // Set 0: pushed, or the encoder's last set where it holds the same writes, else one from the
@@ -2453,25 +3277,33 @@ fn record(
             binding::SetWrite::pushed(&writes, objects.immutable_pushes()),
         ),
         false => (
-            core.set_zero(&objects, (&mut writes, &mut offsets))?,
+            core.set_zero(objects, (&mut writes, &mut offsets))?,
             Vec::new(),
         ),
     };
-    let textures = tables
-        .table
-        .textures
-        .values()
-        .chain(tables.residency.textures());
-    let shadows = shadow::shadow_uses(textures, &uses);
-    let copies = core.plan_shadows(&shadows, &uses)?;
+    // The shadowed textures the dispatch binds, at the first draw or dispatch of each, its
+    // shadow made now (`shadow_log.rs`).
+    crate::shadow_log::dispatched(core.device(), variant.pipeline(), tables.table);
+    // The resident textures' shadows as the encoder keeps them (`compute/live.rs`).
+    let textures = tables.table.textures.values();
+    let shadows = match resident_shadows {
+        Some(kept) => {
+            shadow::shadow_uses_of(textures, kept.of(core.device(), tables.residency), uses)
+        }
+        None => shadow::shadow_uses(textures.chain(tables.residency.textures()), uses),
+    };
+    let copies = core.plan_shadows(&shadows, uses)?;
     let heap_set = match heap {
-        Some(_) => Some(heap_sets::bind(
-            &device,
-            &objects,
-            &mut core.command_buffer().state().heaps,
-            heap_writes,
-            &uses,
-        )?),
+        Some(_) => Some(
+            heap_sets::bind(
+                core.device(),
+                objects,
+                &mut core.command_buffer().state().heaps,
+                heap_writes,
+                uses,
+            )?
+            .set,
+        ),
         None => None,
     };
     // A dispatch that records later goes on in a new `VkCommandBuffer`, made now.
@@ -2485,8 +3317,11 @@ fn record(
         core.keep_set_zero(written, &writes);
     }
     core.shadow_copies(&copies);
-    if !pushed.is_empty() {
-        device.shared().counts.dispatch_pushing_set_zero();
+    // A dispatch recorded later pushes its set 0 whole, into a segment of its own; one recorded
+    // here, what its push carries (`binding::PushedSetZero`).
+    let pushes = !pushed.is_empty();
+    if pushes && pending.is_some() {
+        (core.device().shared().counts.thread()).dispatch_pushing_set_zero(pushed.len() as u64);
     }
     let recording = Recording {
         layout: objects.layout(),
@@ -2500,12 +3335,13 @@ fn record(
     };
     let stages = vk::PipelineStageFlags2::COMPUTE_SHADER;
     let regions = &commands.regions;
+    (core.device().shared().counts.thread()).dispatch_tracked(uses.len() as u64);
     match pending {
         Some((dispatch, begun, next)) => {
             // Tracked here, as a command recorded here is; its execution recorded here, its
             // creation times set as its segment records.
             let creation = core.records_executions().then(|| Arc::new(OnceLock::new()));
-            if let Some(barrier) = core.command_later(stages, &uses, uses.resident()) {
+            if let Some(barrier) = core.command_later(stages, uses, uses.resident()) {
                 let encoder = core.command_buffer().state().open_encoder_place();
                 let pending = PendingDispatch {
                     variant: Arc::clone(variant),
@@ -2519,7 +3355,7 @@ fn record(
                 };
                 core.pend(next, pending)?;
             }
-            core.shadows_used(&shadows, &uses, &[]);
+            core.shadows_used(&shadows, uses, &[]);
             if let Some(creation) = creation {
                 core.executed(|| {
                     Execution::made_later(
@@ -2531,14 +3367,22 @@ fn record(
             }
         }
         None => {
-            let made = &pipelines;
-            core.command_reaching(stages, &uses, uses.resident(), |raw, command_buffer| {
+            let made = &*pipelines;
+            let stale = core.device().shared().pushes_after_pipeline_binds;
+            let resident = uses.resident();
+            let carried = Cell::new(0);
+            core.command_reaching_pushed(stages, uses, resident, |raw, command_buffer, held| {
                 // SAFETY: the encoder's command buffer is recording outside a render pass;
                 // every object recorded is live until the command buffer completes (retained
-                // below), and the pipelines are the variant's, one per region.
-                unsafe { recording.record(raw, command_buffer, made) }
+                // below), the pipelines are the variant's, one per region, and `held` is what
+                // its compute bind point holds (`EncoderCore::command_reaching_pushed`).
+                let pushed = unsafe { recording.record(raw, command_buffer, made, (held, stale)) };
+                carried.set(carried.get() + pushed);
             });
-            core.shadows_used(&shadows, &uses, &[]);
+            if pushes {
+                (core.device().shared().counts.thread()).dispatch_pushing_set_zero(carried.get());
+            }
+            core.shadows_used(&shadows, uses, &[]);
             core.executed(|| {
                 Execution::new(
                     ExecutedPipeline::Compute(Arc::clone(variant.shared_pipeline())),
@@ -2558,7 +3402,7 @@ fn record(
             .iter()
             .all(|earlier| earlier.specialization != region.specialization)
         {
-            device.degrade_bound_values(
+            core.device().degrade_bound_values(
                 std::slice::from_ref(&variant.pipeline().stage),
                 &region.specialization,
                 &|k| plan.specialized_value(k),
@@ -2566,7 +3410,10 @@ fn record(
             );
         }
     }
-    device.degrade_cross_class(&plan.diagnostics, formats);
+    core.device()
+        .degrade_cross_class(&plan.diagnostics, formats);
+    core.device()
+        .degrade_astc_storage(&plan.diagnostics, formats);
     objects.announce_bound(
         (
             std::slice::from_ref(&variant.pipeline().stage),
@@ -2576,13 +3423,19 @@ fn record(
             .iter()
             .map(|region| (&region.specialization, Some(formats))),
     );
-    core.retain(pipeline.clone());
-    core.retain(objects);
-    core.retain(pipelines);
+    // Held by reference, each once while the encoder held it lately (`retained.rs`): a
+    // dispatch of the objects of the one before it holds none again, nor touches their counts.
+    pipeline.retain_in(core);
+    core.retain_shared_of(objects);
+    for made in pipelines.iter() {
+        core.retain_shared_of(made);
+    }
     tables.table.retain(core);
-    core.retain(bound.samplers);
+    for sampler in bound.samplers {
+        core.retain_shared(sampler);
+    }
     if let Some((call, _)) = &flat {
-        core.retain(call.buffer.clone());
+        core.retain_shared(call.buffer.held());
     }
     // The tables the heap's function-table array may name: their IDs stay theirs until the
     // command buffer completes.
@@ -2590,16 +3443,21 @@ fn record(
         core.retain(function_tables.clone());
     }
     let emulated = variant.emulates_simdgroups();
-    degrade_dispatch(&device, kernel, &dispatch, regions.len(), emulated);
+    let split = (regions.len(), variant.runs_partial_threadgroups());
+    degrade_dispatch(core.device(), kernel, &dispatch, split, emulated);
+    // A large kernel's whole grid on its partial-threadgroups variant ([`partial_direct`]).
+    if variant.runs_partial_threadgroups() && whole_grid(&dispatch) {
+        core.counts().whole_dispatch_on_partial_variant();
+    }
     if let Some(unlisted) = unlisted {
         heap_sets::degrade_unlisted(
-            &device,
+            core.device(),
             unlisted,
             &format!("kernel `{kernel}`'s dispatches"),
         );
         // It runs with the states its sampler arrays hold.
         let mut held = core.command_buffer().state();
-        held.unlisted_argument_sampler(&device);
+        held.unlisted_argument_sampler(core.device());
     }
     Ok(true)
 }

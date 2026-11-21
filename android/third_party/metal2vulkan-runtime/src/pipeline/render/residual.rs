@@ -1,9 +1,8 @@
 //! A draw's key's general form: a draw whose own `VkPipeline` is not made draws at once with its
 //! general form's where that one is made, and its own is made on the device's pool meanwhile,
 //! nothing waiting for it. The general form is the key with each constant that has an arm valid
-//! for every binding at that arm ([`general_form`]); its first such constant was the uniform
-//! views' (the residual form, below), and the texel routes' are the others (the end of these
-//! docs).
+//! for every binding at that arm, at that arm ([`general_form`]): the uniform views' (the residual
+//! form, below) and the unmeasured texel class's (the end of these docs).
 //!
 //! A buffer slot a function reads through a uniform view declares the boolean specialization
 //! `SpecKey::RangeAtBindOffset`. A draw's plan sets it to 1 where the slot's descriptor range starts
@@ -11,9 +10,10 @@
 //! `instantiate::starts_at_bind`), and each read then takes the Metal offset alone, a constant for
 //! a constant member, which a driver can load ahead of the shader (Mesa's ANV pushes such loads);
 //! elsewhere to 0, and each read takes the slot's pushed `SlotBindOffset` residual plus the offset.
-//! A slot bound to nothing takes 0: its residual is 0, so either form reads the same offset of the
-//! same descriptor, and a draw that leaves such slots unbound takes the key the creation made
-//! (`bind::plan::slots::range_at_bind_offset`).
+//! A uniform view bound to nothing takes 0, and a storage view bound to nothing what a bind at
+//! offset 0 takes, the commonest bind (`bind::plan::slots::range_at_bind_offset`): its residual is
+//! 0, so either form reads the same offset of the same descriptor, and a plan of nothing bound (a
+//! creation's prediction) names the key of the command that binds its storage views at offset 0.
 //!
 //! - **The residual form reads what the key reads, at every bind offset.** A key's residual form
 //!   is the key with each of its `RangeAtBindOffset` constants at 0 ([`residual_form`]). The binder
@@ -23,32 +23,48 @@
 //!   form reads byte `m` of. Only at a bind offset at or past the end of the bound buffer is the
 //!   range widened down into it, the residual then not 0, and there either form reads only bytes
 //!   outside the bound buffer.
-//! - **Made at creation.** A state's creation makes its predicted key's general form
-//!   (`predicted.rs`), each uniform-view slot read at its residual, which a draw at any bind offset
-//!   can take; a compute state's creation, its predicted region's residual form
-//!   (`dispatch_making.rs`), which a dispatch at any bind offset can take.
+//! - **Made at creation, both forms.** A state's creation makes its predicted key, each
+//!   uniform-view slot read at its residual and each storage view as a bind at offset 0 reads it,
+//!   and, where that key is not its own general form, the general form beside it, the two made
+//!   together (`predicted.rs`, `RenderVariant::make_at_creation`); a compute state's creation its
+//!   predicted region and that region's residual form alike (`dispatch_making.rs`). The predicted
+//!   key is what the commonest draw or dispatch takes, every storage view bound at offset 0, so it
+//!   makes nothing at its first use; the general form is what one binding a storage view
+//!   elsewhere takes at once while its own is made. Off a profile whose storage views declare the
+//!   key the two are one key, and the creation makes one pipeline.
 //! - **Drawn while the key's own is made.** A draw whose key's `VkPipeline` is neither made nor
 //!   linked at once, and whose general form's is made ([`general_made`]), draws with the general
 //!   form's at once ([`RenderVariant::begin_graphics_pipeline`], and [`general_drawn`] for the
 //!   draws that make their pipelines at once). The key's own making goes to the device's pool,
 //!   where no caller began it, at the rank of a making nothing waits for (`budget::Urgency::Ahead`),
-//!   and a later draw of the key takes it once made. Only that direction: a draw whose key has 0
+//!   and a later draw of the key takes it once made: such a draw keeps nothing to draw again
+//!   (`render/draw_again.rs`), whose draws again would record through the general form's still.
+//!   Only that direction: a draw whose key has 0
 //!   where a made pipeline has 1 waits for its own making, as any draw does. A dispatch or a tile
 //!   dispatch whose region's `VkPipeline` is not made takes its residual form's alike
 //!   (`Variant::begin_region_pipeline`).
 //! - **One form where the bind offset buys nothing** ([`reads_views_at_bind`]). Where the driver
 //!   is not measured to load a uniform read at a constant offset ahead of the shader
-//!   (`DriverFact::ConstantOffsetUniformReadsPreloaded`, which no driver carries today) every
-//!   key is its residual form, because the other form costs each state a second `VkPipeline` at
-//!   its first draw and buys nothing measurable: on MoltenVK a uniform view is a Metal constant
-//!   buffer reached through an argument buffer and the two forms were measured alike, and on
-//!   llvmpipe, RADV and NVIDIA the second form was counted and then timed no faster (the fact's
-//!   own documentation holds the figures). The plans' specializations and the dispatches'
-//!   regions take the residual form before any key is looked up (`RenderVariant::plan`,
-//!   `Variant::keyed_regions`): a state's creation makes the one pipeline its draws at every bind
-//!   offset take. The shapes and plans stay every device's (`argument_table::AtBindViews`): a bind
-//!   offset the view base alignment divides still makes a shape and a plan of its own, whose key
-//!   alone takes the residual form.
+//!   (`DriverFact::ConstantOffsetUniformReadsPreloaded`, which no driver carries today), every
+//!   key's uniform views take their residual form ([`uniform_residual_form`]), because the other
+//!   form costs each state a second `VkPipeline` at its first draw and buys nothing measurable: on
+//!   MoltenVK a uniform view is a Metal constant buffer reached through an argument buffer and the
+//!   two forms were measured alike, and on llvmpipe, RADV and NVIDIA the second form was counted
+//!   and then timed no faster (the fact's own documentation holds the figures). On ANV, Mesa
+//!   26.2.6 on the Iris Xe of RPL-P, it ran slower: `dispatch_chain --binds 4` (a uniform view of
+//!   inline bytes beside three storage views bound at offset 0) took 161.78 us a dispatch with
+//!   the uniform view read at its bind offset and 142.77 us with it read at its residual, and the
+//!   `fixed`, `moved` and `tex` shapes 161.77, 165.23 and 128.29 us against 143.17, 143.04 and
+//!   119.40 us (job m3-max-34275, medians of 7 interleaved rounds). There, where the profile takes
+//!   `DriverWorkaround::PushReadsLengthenThreadPayload`, a storage view declares the key too,
+//!   which a bind at offset 0 sets (`bind::ZERO_OFFSET_CLASS`) and the plan keeps, so a key whose
+//!   views are all storage views bound at offset 0 reads no residual word. The plans'
+//!   specializations and the dispatches' regions take that form before any key is looked up
+//!   (`RenderVariant::plan`, `Variant::keyed_regions`): off that profile a state's creation makes
+//!   the one pipeline its draws at every bind offset take, and on it the two the module's
+//!   **Made at creation, both forms** names. The shapes and plans stay every device's
+//!   (`argument_table::AtBindViews`): a bind offset the view base alignment divides still makes a
+//!   shape and a plan of its own, whose key's uniform views alone take their residual form.
 //! - **Only GPU time moves.** Until the key's making lands, its draws' uniform reads take the
 //!   residual: on ANV, loads where the key's form has pushed constants. `WorkCounts` counts the
 //!   draws and dispatches recorded so (`residual_form_draws`) and the makings begun so
@@ -56,41 +72,41 @@
 //!   Such a making may outlast its draw's command buffer, which does not wait for it
 //!   (`WorkCounts::pipeline_pool_busy` says when the pool holds none).
 //!
-//! **The texel routes' general arms.** On a device that samples through Metal's own texture unit
-//! (MoltenVK), a texture slot a function converts to `half` declares two booleans more, each with
-//! an arm that serves every bound format exactly:
+//! **The texel routes.** On a device that samples through Metal's own texture unit (MoltenVK), a
+//! texture slot a function converts to `half` declares two booleans more:
 //!
-//! - `SpecKey::PlainHalfTexels` at 0 converts each texel by the class routine, the bound class
-//!   read from push data, which for a plain class (`TexelFormat::plain_on_metal_sampler`: every
-//!   class but a YCbCr field on the grid `8192`) rounds the `float` texel to nearest even as the
-//!   plain arm (1) does; the plain arm lets Metal's compiler fold the conversion into the image
-//!   instruction (`lower::texture::half`). A slot bound to nothing, or to a plain class, takes 1,
-//!   and a draw binding a YCbCr field on the grid `8192` takes 0.
 //! - `SpecKey::UnmeasuredTexels` names the bound class to the slot's precision note alone: no
 //!   instruction reads it, so both values run alike, and 0 is its general arm. A slot bound to
 //!   nothing takes 0, and a draw binding a class whose `half` conversion is not measured
 //!   (`TexelFormat::unmeasured_on_metal_sampler`: BC4 to BC7 and the linear ASTC formats among
-//!   them) 1.
+//!   them) 1. A state's creation predicts no texture bound, so such a draw keys apart from the
+//!   predicted key, and its general form is the predicted key itself: the draw takes the pipeline
+//!   the creation made at once while its own is made.
+//! - `SpecKey::PlainHalfTexels` keeps the value the draw's own binding gives it, and is no
+//!   constant of the general form. At 0 each texel converts by the class routine, the bound class
+//!   read from push data, which serves every class; at 1 by the plain arm, which lets Metal's
+//!   compiler fold the conversion into the image instruction (`lower::texture::half`) and serves
+//!   every plain class (`TexelFormat::plain_on_metal_sampler`: every class but a YCbCr field on
+//!   the grid `8192`), rounding the `float` texel to nearest even as the routine does for those.
+//!   A slot bound to nothing, or to a plain class, takes 1, and a draw binding a YCbCr field on
+//!   the grid `8192` takes 0. A creation predicts the plain arm, which every draw of a plain class
+//!   takes, and makes that one pipeline: were 0 the general form, it would make a pipeline of the
+//!   routine's arm too, which a draw of a plain class takes only while its own is still made. A
+//!   draw binding a YCbCr field on the grid `8192` makes its own key, as a draw of any key its
+//!   creation did not predict; on a device whose memory is the host's such a slot reads its planes
+//!   in place, in a variant of its own (`VariantKey::ycbcr_in_place`), which no creation predicts
+//!   either.
 //!
-//! A state's creation predicts no texture bound, so a draw of the predicted variant binding a
-//! class of either kind keys apart from the predicted key: with that key alone made, such a draw
-//! would make a pipeline of its own at the draw, a compile its command buffer waits for (and past
-//! its bound drops the draw, `PipelineWaitPolicy::Bounded`). So a state's creation makes its
-//! predicted key's general form, which every draw of that variant can take, and hands its
-//! predicted key itself, where it differs (its texture slots' `PlainHalfTexels` at 1, as unbound
-//! slots take), to the pool right after, at the rank nothing waits for: a draw binding a plain,
-//! measured class takes it once made, and every other draw of the variant takes the general form
-//! at once while its own is made (`predicted.rs`). The cost: such a creation makes two pipelines,
-//! the second on the pool, nothing waiting for it; and GPU time, until a draw's own key lands, of
-//! the class routine at each `half` conversion of an image instruction's texel in place of the
-//! device's own conversion.
+//! A draw that takes its key's general form runs the instructions its own key runs but for the
+//! residual's reads in place of the bind offset's: an unmeasured class's draw runs its own key's.
 //!
 //! Constants with no arm that serves every binding stay as before, each value a pipeline of its
-//! own: `SpecKey::SamplerState` (each sampler word a sampling emulation of its own) and
+//! own: `SpecKey::PlainHalfTexels` (above), `SpecKey::SamplerState` (each sampler word a sampling
+//! emulation of its own), `SpecKey::NearestPixelSampler` (a nearest pixel sampler's sample at its
+//! texel's centre, which the other arm's quotient does not read exactly) and
 //! `SpecKey::BicubicTexels` (how Metal's bicubic filter treats each format's texels).
 //!
 //! [`general_form`]: RenderVariant::general_form
-//! [`residual_form`]: RenderVariant::residual_form
 //! [`reads_views_at_bind`]: reads_views_at_bind
 //! [`general_made`]: RenderVariant::general_made
 //! [`general_drawn`]: RenderVariant::general_drawn
@@ -103,30 +119,14 @@ use crate::pipeline::objects::RawPipeline;
 use crate::render_target::RenderPassObject;
 use metal2vulkan::cache::SpecializationKey;
 use metal2vulkan::device::DriverFact;
-use metal2vulkan::pipeline::{SpecConstant, SpecKey};
+use metal2vulkan::pipeline::{PipelineInterface, SlotInterface, SlotRef, SpecConstant, SpecKey};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 impl RenderVariant {
-    /// `specialization` with each of the variant's `SpecKey::RangeAtBindOffset` constants at 0,
-    /// its residual form (the module docs); `None` where every one of them is 0 there already. A
-    /// constant `specialization` gives no entry takes the module's default, 0.
-    pub(crate) fn residual_form(
-        &self,
-        specialization: &SpecializationKey,
-    ) -> Option<SpecializationKey> {
-        let constants = self
-            .pipeline
-            .stages
-            .iter()
-            .flat_map(|module| &module.specialization.constants);
-        residual_form(constants, specialization)
-    }
-
     /// `specialization` with each of the variant's constants that has an arm serving every binding
-    /// at that arm, its general form (the module docs): `SpecKey::RangeAtBindOffset`,
-    /// `SpecKey::PlainHalfTexels` and `SpecKey::UnmeasuredTexels` at 0; `None` where every one of
-    /// them is there already.
+    /// at that arm, its general form (the module docs): `SpecKey::RangeAtBindOffset` and
+    /// `SpecKey::UnmeasuredTexels` at 0; `None` where every one of them is there already.
     pub(crate) fn general_form(
         &self,
         specialization: &SpecializationKey,
@@ -140,6 +140,22 @@ impl RenderVariant {
         general_form(constants, specialization)
     }
 
+    /// `specialization` with each of the variant's `SpecKey::RangeAtBindOffset` constants of a slot
+    /// it reads through a uniform view at 0, the key a plan takes where the device reads its
+    /// uniform views at their residuals ([`uniform_residual_form`]); `None` where every one of
+    /// them is 0 there already.
+    pub(crate) fn uniform_residual_form(
+        &self,
+        specialization: &SpecializationKey,
+    ) -> Option<SpecializationKey> {
+        let constants = self
+            .pipeline
+            .stages
+            .iter()
+            .flat_map(|module| &module.specialization.constants);
+        uniform_residual_form(constants, &self.pipeline.interface, specialization)
+    }
+
     /// `key` with its specialization's general form ([`general_form`](Self::general_form)), where
     /// `key` is not its own general form.
     pub(crate) fn general_key(&self, key: &GraphicsKey) -> Option<GraphicsKey> {
@@ -151,6 +167,7 @@ impl RenderVariant {
             strides: key.strides.clone(),
             fixed: key.fixed,
             sample_positions: key.sample_positions.clone(),
+            feedback_loop: key.feedback_loop,
         })
     }
 
@@ -183,11 +200,13 @@ impl RenderVariant {
             Begun::Yours(ticket) => {
                 match self.make_drawn(device, key, compatible, (state, formats), ticket) {
                     DrawPipeline::Made(made) => return Some((made, true)),
-                    DrawPipeline::Making(_) => device.shared().counts.residual_form_making(),
+                    DrawPipeline::Making(_) => {
+                        device.shared().counts.thread().residual_form_making()
+                    }
                 }
             }
         }
-        device.shared().counts.residual_form_drawn();
+        device.shared().counts.thread().residual_form_drawn();
         Some((drawn, false))
     }
 }
@@ -199,9 +218,84 @@ pub(crate) fn residual_form<'a>(
     constants: impl Iterator<Item = &'a SpecConstant> + Clone,
     specialization: &SpecializationKey,
 ) -> Option<SpecializationKey> {
+    let constants = constants.map(|constant| (constant.id, constant.key));
+    residual_form_of(constants, |_| true, specialization)
+}
+
+/// `specialization` with each `SpecKey::RangeAtBindOffset` constant of `constants` (a pipeline's
+/// stages') whose slot `interface` (the pipeline's) reads through a uniform view at 0, the key a
+/// plan takes where the device reads its uniform views at their residuals (the module docs);
+/// `None` where every one of them is 0 there already. A storage view's constant, which only a
+/// profile taking `DriverWorkaround::PushReadsLengthenThreadPayload` declares, keeps its value: its
+/// bind at offset 0 reads no residual word there. Where no storage view declares the key this is
+/// [`residual_form`].
+pub(crate) fn uniform_residual_form<'a>(
+    constants: impl Iterator<Item = &'a SpecConstant> + Clone,
+    interface: &PipelineInterface,
+    specialization: &SpecializationKey,
+) -> Option<SpecializationKey> {
+    let uniform = |slot| {
+        matches!(interface.slots.get(&slot),
+            Some(SlotInterface::Buffer(b)) if b.form.uniform_view())
+    };
+    let constants = constants.map(|constant| (constant.id, constant.key));
+    residual_form_of(constants, uniform, specialization)
+}
+
+/// The IDs of `constants`' `SpecKey::RangeAtBindOffset` constants whose slot `interface` reads
+/// through a uniform view: those [`uniform_residual_form`] zeroes, listed once for a pipeline so
+/// each of its keys takes that form in place ([`residual_in_place`]).
+pub(crate) fn uniform_residual_ids<'a>(
+    constants: impl Iterator<Item = &'a SpecConstant>,
+    interface: &PipelineInterface,
+) -> Vec<u32> {
+    let uniform = |slot| {
+        matches!(interface.slots.get(&slot),
+            Some(SlotInterface::Buffer(b)) if b.form.uniform_view())
+    };
+    residual_ids(
+        constants.map(|constant| (constant.id, constant.key)),
+        uniform,
+    )
+}
+
+/// The IDs of `constants`' (each its ID and its meaning) `SpecKey::RangeAtBindOffset` constants
+/// whose slot `views` holds: those [`residual_form_of`] zeroes.
+pub(crate) fn residual_ids(
+    constants: impl Iterator<Item = (u32, SpecKey)>,
+    views: impl Fn(SlotRef) -> bool,
+) -> Vec<u32> {
+    constants
+        .filter(|&(_, key)| matches!(key, SpecKey::RangeAtBindOffset(slot) if views(slot)))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// `specialization` with the value of each constant `ids` names at 0, written in its own bytes:
+/// [`residual_form_of`]'s key where `ids` are [`residual_ids`]' of the same constants and views,
+/// and `specialization` as it was where that answers `None`, with no key made.
+pub(crate) fn residual_in_place(specialization: &mut SpecializationKey, ids: &[u32]) {
+    let SpecializationKey { data, entries, .. } = specialization;
+    for entry in entries.iter().filter(|e| ids.contains(&e.constant_id)) {
+        let at = entry.offset as usize;
+        if let Some(bytes) = data.get_mut(at..at + entry.size as usize) {
+            bytes.fill(0);
+        }
+    }
+}
+
+/// `specialization` with each `SpecKey::RangeAtBindOffset` constant of `constants` (a pipeline's
+/// stages', each its ID and its meaning) whose slot `views` holds at 0; `None` where every one of
+/// them is 0 there already. A constant `specialization` gives no entry takes the module's
+/// default, 0.
+pub(crate) fn residual_form_of(
+    constants: impl Iterator<Item = (u32, SpecKey)> + Clone,
+    views: impl Fn(SlotRef) -> bool,
+    specialization: &SpecializationKey,
+) -> Option<SpecializationKey> {
     let at_bind = |id: u32| {
-        constants.clone().any(|constant| {
-            constant.id == id && matches!(constant.key, SpecKey::RangeAtBindOffset(_))
+        constants.clone().any(|(at, key)| {
+            at == id && matches!(key, SpecKey::RangeAtBindOffset(slot) if views(slot))
         })
     };
     zeroed(specialization, at_bind)
@@ -209,10 +303,10 @@ pub(crate) fn residual_form<'a>(
 
 /// `specialization` with each constant of `constants` (a pipeline's stages', each its ID and its
 /// meaning) that has an arm serving every binding at that arm (the module docs):
-/// `SpecKey::RangeAtBindOffset` (the residual form's), `SpecKey::PlainHalfTexels` and
-/// `SpecKey::UnmeasuredTexels`, each at 0; `None` where every one of them is 0 there already. A
-/// constant `specialization` gives no entry takes the module's default: 0 for the first and last,
-/// and a plan gives every `PlainHalfTexels` its value.
+/// `SpecKey::RangeAtBindOffset` (the residual form's) and `SpecKey::UnmeasuredTexels`, each at 0;
+/// `None` where every one of them is 0 there already. A constant `specialization` gives no entry
+/// takes the module's default, 0. `SpecKey::PlainHalfTexels` keeps its value: its plain arm
+/// serves only the plain classes.
 pub(crate) fn general_form(
     constants: impl Iterator<Item = (u32, SpecKey)> + Clone,
     specialization: &SpecializationKey,
@@ -222,9 +316,7 @@ pub(crate) fn general_form(
             at == id
                 && matches!(
                     key,
-                    SpecKey::RangeAtBindOffset(_)
-                        | SpecKey::PlainHalfTexels(_)
-                        | SpecKey::UnmeasuredTexels(_)
+                    SpecKey::RangeAtBindOffset(_) | SpecKey::UnmeasuredTexels(_)
                 )
         })
     };
@@ -255,15 +347,18 @@ fn zeroed(
 
 /// Whether `device` reads a uniform view at its bind offset alone where the view's range starts
 /// there (`SpecKey::RangeAtBindOffset` 1), a `VkPipeline` of its own beside the residual form's
-/// (the module docs); where not, every key is its residual form, and a state's pipelines are the
-/// residual form's alone.
+/// (the module docs); where not, every key's uniform views take their residual form
+/// ([`uniform_residual_form`]).
 ///
 /// The question is the driver's, and it is the driver fact that answers it, never the driver's
 /// name: a driver that loads a uniform read at a constant offset ahead of the shader
 /// ([`DriverFact::ConstantOffsetUniformReadsPreloaded`]) is one where the second form earns the
-/// second pipeline. No driver is measured with the fact, so every device reads its views at their
-/// residuals today; the fact's own documentation holds what was measured where, and a driver
-/// measured with it takes the other form with no change here.
+/// second pipeline. No driver is measured with the fact, so every device reads its uniform views
+/// at their residuals today, ANV on the Iris Xe of RPL-P too, where the other form was measured
+/// slower (the module docs); the fact's own documentation holds what was measured where, and a
+/// driver measured with it takes the other form with no change here. A storage view's key, which
+/// only a profile taking `DriverWorkaround::PushReadsLengthenThreadPayload` declares, is not this
+/// question's: its plan keeps it on every device.
 pub(crate) fn reads_views_at_bind(device: &crate::Device) -> bool {
     views_read_at_bind(&device.properties().driver_facts)
 }

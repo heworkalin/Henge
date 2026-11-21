@@ -298,22 +298,26 @@ impl Device {
     }
 
     /// The device's read-only zero buffer of `bytes` bytes, made at its first use and kept for
-    /// the device's lifetime ([`Neutrals::zeros`]).
+    /// the device's lifetime ([`Neutrals::zeros`]): made under the neutrals' lock, as the other
+    /// neutrals are, so threads that first ask for one length at once make one buffer.
     ///
     /// Only a **read-only** binding may be served from it: every draw and dispatch of the device
     /// binds the one buffer, so a shader that could store through the binding would be writing
     /// zeros another command reads. A Vulkan uniform-buffer descriptor is read-only by
-    /// construction, which is the binding `binding::descriptor` serves from here; a writable one
-    /// keeps its own region, as before.
+    /// construction, as is a uniform texel buffer (a uniform view's texel form, viewed through a
+    /// view made for each bind: `uniform_texels.rs`), which are the bindings
+    /// `binding::descriptor` serves from here; a writable one keeps its own region, as before.
     pub(super) fn neutral_zero_buffer(&self, bytes: u64) -> Result<vk::Buffer, Error> {
         let shared = self.shared();
-        if let Some(zeros) = lock(&shared.textures.neutrals).zeros.get(&bytes) {
+        let mut neutrals = lock(&shared.textures.neutrals);
+        if let Some(zeros) = neutrals.zeros.get(&bytes) {
             return Ok(zeros.buffer);
         }
         let zeros = self.new_neutral_zeros(bytes)?;
-        let mut neutrals = lock(&shared.textures.neutrals);
+        let buffer = zeros.buffer;
         neutrals.zeros_made += 1;
-        Ok(neutrals.zeros.entry(bytes).or_insert(zeros).buffer)
+        neutrals.zeros.insert(bytes, zeros);
+        Ok(buffer)
     }
 
     /// How many zero buffers the device has made: one per length its plans ask for, however many
@@ -329,11 +333,13 @@ impl Device {
     fn new_neutral_zeros(&self, bytes: u64) -> Result<Arc<NeutralZeros>, Error> {
         let shared = self.shared();
         let raw_device = shared.vk();
-        let info = shared.sharing().buffer(
-            vk::BufferCreateInfo::default()
-                .size(bytes)
-                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST),
-        );
+        let info = shared
+            .sharing()
+            .buffer(vk::BufferCreateInfo::default().size(bytes).usage(
+                vk::BufferUsageFlags::UNIFORM_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            ));
         // SAFETY: the device is live and `info` valid.
         let buffer = unsafe { crate::creation::buffer(raw_device, &info) }.map_err(vulkan)?;
         // SAFETY: `buffer` is a live buffer of this device.

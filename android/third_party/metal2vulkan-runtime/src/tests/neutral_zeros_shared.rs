@@ -55,14 +55,23 @@
 //! whole. It is gone -- a chunk is made without a clear -- and `tests::upload_chunk_zeros` is
 //! where that is held.
 //!
+//! # First asks at once
+//!
+//! Threads that first ask for one length at the same moment share one buffer: the device makes it
+//! under its neutrals' lock. Made outside it, each racing thread made a buffer of its own and all
+//! but one were dropped unreleased, a `VkBuffer` and its memory leaked until the device was
+//! destroyed (the validation layer's `VUID-vkDestroyDevice-device-05137` on lavapipe, in
+//! `runtime_lane::cache::makings_on_several_threads_each_read_their_own_cache`).
+//!
 //! What none of it covers: a draw or dispatch whose read-only slot is unbound **and** whose
 //! length differs from `zero_buffer_bytes` on this device, since one device offers one length; and
 //! the fully-bound case, which binds no neutral at all and whose per-draw work was already one
 //! `vkCmdDraw` and nothing else.
 
 use crate::{
-    Device, DeviceKind, DeviceOptions, LoadAction, PipelineOptions, RenderPassDescriptor,
-    RenderPipelineState, ResourceOptions, ShaderCacheOptions, StoreAction, TextureDescriptor,
+    ComputePipelineState, Device, DeviceKind, DeviceOptions, LoadAction, PipelineOptions,
+    RenderPassDescriptor, RenderPipelineState, ResourceOptions, ShaderCacheOptions, StoreAction,
+    TextureDescriptor,
 };
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
@@ -108,9 +117,43 @@ fn device(cache: &Path) -> Device {
     Device::system_default_with(&options).unwrap()
 }
 
+/// Eight threads, released together, each first ask the device for a zero buffer of one length,
+/// a new length a round: each round makes one buffer, which every thread is handed.
+#[test]
+fn threads_that_first_ask_at_once_share_one_zero_buffer() {
+    const THREADS: usize = 8;
+    const ROUNDS: u64 = 16;
+    let scratch = Scratch::new();
+    let device = device(&scratch.0);
+    let made_before = device.neutral_zeros_made();
+    for round in 0..ROUNDS {
+        let bytes = 256 * (round + 1);
+        let start = std::sync::Barrier::new(THREADS);
+        let buffers: Vec<_> = std::thread::scope(|scope| {
+            let asks: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        device.neutral_zero_buffer(bytes).unwrap()
+                    })
+                })
+                .collect();
+            asks.into_iter().map(|ask| ask.join().unwrap()).collect()
+        });
+        assert!(
+            buffers.iter().all(|&buffer| buffer == buffers[0]),
+            "round {round}: the threads were handed different zero buffers of {bytes} bytes"
+        );
+        assert_eq!(
+            device.neutral_zeros_made() - made_before,
+            round + 1,
+            "round {round}: zero buffers made"
+        );
+    }
+}
+
 fn state(device: &Device, fragment: &str) -> RenderPipelineState {
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/engine/tob_renders.ll");
+    let ll = metal2vulkan_devtools::engine_dir().join("tob_renders.ll");
     let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
     let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
     let library = device.new_library_with_compile_library(library);
@@ -238,17 +281,7 @@ fn dispatched(dispatches: usize, unbound: u64) -> (u64, crate::WorkCounts, crate
     let scratch = Scratch::new();
     let device = device(&scratch.0);
     let queue = device.new_command_queue().unwrap();
-    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll");
-    let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
-    let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
-    let function = device
-        .new_library_with_compile_library(library)
-        .new_function_with_name("scale_and_offset")
-        .unwrap();
-    let state = device
-        .new_compute_pipeline_state_with_function(&function, &PipelineOptions::default())
-        .unwrap();
+    let state = scale_and_offset(&device);
     let buffer = device.new_buffer(1024, ResourceOptions::shared()).unwrap();
     let command_buffer = queue.command_buffer().unwrap();
     let mut encoder = command_buffer.compute_command_encoder().unwrap();
@@ -272,6 +305,20 @@ fn dispatched(dispatches: usize, unbound: u64) -> (u64, crate::WorkCounts, crate
     assert_eq!(command_buffer.error(), None, "the dispatches ran");
     let after = device.work_counts();
     (device.neutral_zeros_made(), before, after)
+}
+
+/// The compute pipeline state of the examples fixture's `scale_and_offset` ([`dispatched`]).
+fn scale_and_offset(device: &Device) -> ComputePipelineState {
+    let ll = metal2vulkan_devtools::fixtures_dir().join("examples/runtime_examples.ll");
+    let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
+    let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
+    let function = device
+        .new_library_with_compile_library(library)
+        .new_function_with_name("scale_and_offset")
+        .unwrap();
+    device
+        .new_compute_pipeline_state_with_function(&function, &PipelineOptions::default())
+        .unwrap()
 }
 
 /// A kernel's unbound `constant` slot is a read-only binding: the dispatches share the device's
@@ -359,4 +406,117 @@ fn a_written_slots_neutral_is_not_shared() {
          {eight} more, which is not one region each: a written slot's neutral must not be shared \
          between commands"
     );
+}
+
+/// Command buffers of [`STEADY`] dispatches each with the kernel's written `device` slot unbound,
+/// one after another on one device, make no `VkBuffer` once the first completed: each dispatch's
+/// own region is a dedicated 64 KiB chunk of its command buffer's upload arena, past half its
+/// largest chunk (`upload.rs`), and the chunks park as the command buffer completes, every one of
+/// them within the recycler's bounds (`recycle.rs`), so the next command buffer's regions take
+/// parked chunks (`buffers_recycled`, at least one a dispatch) where a count bound of 64 left 192
+/// to make again. Each region still holds zeros of its own: [`a_written_slots_neutral_is_not_shared`]
+/// holds that.
+///
+/// A parked chunk goes once parked for the bounds' time: a command buffer whose encoding ends past
+/// it after the last one's chunks parked (a host too loaded to encode 256 dispatches in a second)
+/// may make chunks again, so such a try runs again, at most [`TRIES`] times.
+///
+/// It prints the dispatches' host time per dispatch, encoded and completed, against the same
+/// dispatches with every slot bound: the cost of the written slot's region in steady state.
+#[test]
+fn steady_dispatches_with_a_written_slot_unbound_make_no_vk_buffer() {
+    const STEADY: u64 = 256;
+    const FRAMES: usize = 4;
+    const TRIES: usize = 3;
+    let scratch = Scratch::new();
+    let device = device(&scratch.0);
+    let queue = device.new_command_queue().unwrap();
+    let state = scale_and_offset(&device);
+    let buffer = device.new_buffer(1024, ResourceOptions::shared()).unwrap();
+    let per = |time: std::time::Duration| time.as_secs_f64() * 1e6 / STEADY as f64;
+    // One command buffer of the dispatches, buffer index `unbound` left unset (3: every slot
+    // bound), waited for and its arena's chunks parked: the counts across its encoding, when its
+    // encoding ended, and when its chunks were parked.
+    let frame = |unbound: u64, label: &str| {
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut encoder = command_buffer.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&state).unwrap();
+        for index in [0, 1, 2] {
+            if index != unbound {
+                encoder.set_buffer(Some(&buffer), 0, index as u32).unwrap();
+            }
+        }
+        let before = device.work_counts();
+        let start = std::time::Instant::now();
+        for _ in 0..STEADY {
+            encoder
+                .dispatch_threads(crate::Size::new(1, 1, 1), crate::Size::new(1, 1, 1))
+                .unwrap();
+        }
+        let encoded = std::time::Instant::now();
+        let after = device.work_counts();
+        encoder.end_encoding().unwrap();
+        command_buffer.commit().unwrap();
+        command_buffer
+            .wait_until_completed_for(std::time::Duration::from_secs(60))
+            .unwrap();
+        let completed = start.elapsed();
+        assert_eq!(command_buffer.error(), None, "the dispatches ran");
+        drop(command_buffer);
+        // The chunks go as the command buffer's holds do, which a completion may let go of after
+        // the wait returned: one a dispatch at least where the slot is unbound.
+        let regions = match unbound {
+            1 => STEADY,
+            _ => 0,
+        };
+        let parked = before.object_churn.buffers_parked + regions;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while device.work_counts().object_churn.buffers_parked < parked {
+            assert!(
+                std::time::Instant::now() < until,
+                "the arena's chunks were parked"
+            );
+            std::thread::yield_now();
+        }
+        let churn =
+            |of: fn(&crate::ObjectChurn) -> u64| of(&after.object_churn) - of(&before.object_churn);
+        let (made, recycled) = (churn(|c| c.vk_buffers_made), churn(|c| c.buffers_recycled));
+        println!(
+            "STEADY-WRITTEN: {label}: {:.2} us encoded, {:.2} us completed a dispatch; {made} \
+             VkBuffers made, {recycled} recycled",
+            per(encoded - start),
+            per(completed)
+        );
+        (made, recycled, encoded, std::time::Instant::now())
+    };
+    for tried in 1..=TRIES {
+        let (_, _, _, mut parked) = frame(1, "written slot unbound, first");
+        let mut steady = Vec::new();
+        let mut stale = false;
+        for _ in 1..FRAMES {
+            let (made, recycled, encoded, next) = frame(1, "written slot unbound");
+            stale |= encoded.duration_since(parked) >= crate::recycle::BUFFERS.parked_for;
+            steady.push((made, recycled));
+            parked = next;
+        }
+        if stale && tried < TRIES {
+            continue;
+        }
+        for (made, recycled) in steady {
+            assert_eq!(
+                made, 0,
+                "a command buffer of {STEADY} dispatches with a written slot unbound made {made} \
+                 VkBuffers after the last one's chunks parked"
+            );
+            assert!(
+                recycled >= STEADY,
+                "its {STEADY} dispatches' regions took {recycled} parked chunks, not one each: \
+                 the regions were not the dedicated chunks this checks"
+            );
+        }
+        break;
+    }
+    for _ in 0..FRAMES {
+        frame(3, "every slot bound");
+    }
 }
