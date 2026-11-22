@@ -2235,6 +2235,7 @@ impl Lowering {
     /// its kept draw carried into its command buffer's next render encoder where it carries
     /// (`render/carried.rs`).
     pub(crate) fn end_encoding(mut self) -> Result<(), Error> {
+        crate::diag::end_pass();
         let _call = self.core.begin_call();
         let _for = self.core.notices_for();
         self.ending_carried().end_encoding()
@@ -2267,6 +2268,7 @@ impl CommandBuffer {
         // The last render encoder's end, where its call left it to the device's lowering thread,
         // and the kept draw it carried, or its end where it kept none (`render/carried.rs`),
         // which nothing came between.
+        crate::diag::begin_pass(descriptor);
         self.settle_ended();
         let carried = self.take_carried();
         let handed = carried::Handed {
@@ -13332,6 +13334,7 @@ impl RenderCommandEncoder {
         texture: Option<&Texture>,
         index: u32,
     ) -> Result<(), Error> {
+        crate::diag::bound_fragment_texture(index, texture);
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_fragment_texture(texture, index)),
             false => self.defer(|log| {
@@ -13348,6 +13351,7 @@ impl RenderCommandEncoder {
         textures: &[Option<&Texture>],
         first: u32,
     ) -> Result<(), Error> {
+        crate::diag::bound_fragment_textures(first, textures);
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_fragment_textures(textures, first)),
             false => self.defer(|log| {
@@ -13487,6 +13491,7 @@ impl RenderCommandEncoder {
     /// draws the compensated depths inexactly (`render_state.rs`). A refused call keeps the
     /// viewports set before.
     pub fn set_viewport(&mut self, viewport: Viewport) -> Result<(), Error> {
+        crate::diag::viewport(&viewport);
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_viewport(viewport)),
             false => self.defer(|_| RenderCall::Viewport(Box::new(viewport))),
@@ -13508,6 +13513,7 @@ impl RenderCommandEncoder {
     /// `setScissorRect:`. A rectangle past the render area is clipped to it, as plain Metal clips
     /// it where its validation stops the call (measured on an M4).
     pub fn set_scissor_rect(&mut self, rect: ScissorRect) -> Result<(), Error> {
+        crate::diag::scissor(&rect);
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_scissor_rect(rect)),
             false => self.defer(|_| RenderCall::ScissorRect(rect)),

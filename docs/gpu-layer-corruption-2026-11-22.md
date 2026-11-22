@@ -295,3 +295,56 @@ texel buffer view），以及那条路径里 `bufferRowLength` 用的是 **texel
 |---|---|
 | 一（单块缓冲拿到错合成） | 查该缓冲那一次的合成 draw：`REIMS_PASS_LOG` 只在"渲染进 1920×1080"的 pass 上记录采样纹理与 load/store |
 | 二（背景整体黑 7 秒） | 查那一时段是否**没有**背景层的 draw（`fragTex` 不含壁纸）——即 guest 层被我们"吃掉"了，还是采到黑 |
+
+---
+
+## pass 探针结果（`REIMS_PASS_LOG=1`）：一帧的合成结构
+
+显示 surface 的 pass 共有 **17493** 个（一轮 ~2900 present），`color0` 的 load 分布：
+
+| load | 次数 | 含义 |
+|---|---|---|
+| `Load` | 11771 | **保留旧内容、只画脏区**（局部更新） |
+| `Clear` | 2911 | 整屏清空后画 |
+| `DontCare` | 1811 | Metal 语义"内容未定义"，我们按 Clear 处理 |
+
+`color1` 恒为 `RGBA16Float 1920x1080 load DontCare store DontCare`（写入但从不保存的 scratch）。
+
+典型一帧（pass #300–#307）：
+
+```
+#300 load Load     scissor 65x51                       (游标)
+#301 load Load     scissor 692,450 403x181  frag[3]=RGBA16Float 1920x1080   (对话框+其背后的模糊背景)
+#301 load Load     全屏                     frag[3]=RGBA16Float 2184x1344   (窗口后备, 2x)
+#302 load DontCare scissor 440x218
+#303 load Load     全屏, 无 frag            (纯色填充)
+#304 load Clear    scissor 702x480          frag[3]=RGBA16Float 2184x1344   (窗口重绘)
+#305 load Load     scissor 63x49            frag[3]=RGBA16Float 125x151
+#307 = #301（同一脏区下一帧再画一遍）
+```
+
+### 图层是通过 `frag[3]` **复数绑定**进来的
+
+所以单纹理探针（`set_fragment_texture`）一条都抓不到，必须挂 `set_fragment_textures`。
+
+### 合成里**从未**采样 3840×2160 的壁纸
+
+出现的采样纹理清单（按次数）：
+
+| 形状 | 次数 | 推断 |
+|---|---|---|
+| `RGBA16Float 2184x1344` | 5754 | 窗口后备（2×） |
+| `RGBA16Float 1920x1080` | 2970 | **模糊背景的结果**（对话框后面用） |
+| `RGBA16Float 198x195` | 1378 | 模糊链某一级 |
+| `RGBA16Float 685x249` | 804 | 模糊链某一级 |
+| `RGBA16Float 703x185` / `134x191` / `64x64` | 299/168/154 | 模糊链各级 |
+| `BGRA8Unorm 1x1` / `64x64` / `18x18` / `1920x1080` | 170/79/75/46 | 蒙版/solid |
+
+**结论方向**：`2184x1344 → 1920x1080 → 685x249 → 198x195 → 64x64` 这条**模糊链**就是
+"背景该朦胧却变暗/变黑"的候选。链上某一级如果被写坏或读不到，最终背景就暗。
+
+### 下一步（唯一还没看过的数据）
+
+给 runtime 加 `REIMS_TEX_DUMP=<前缀>`：在**显示 pass 内被绑定的纹理**上，把内容
+`copyTextureToBuffer` 到一个可映射缓冲并写盘（1/200 采样、按尺寸去重）。这样能直接看到
+模糊链各级的实际内容，判断是"某一级没写对"还是"读到了黑"。
