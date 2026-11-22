@@ -69,3 +69,46 @@ HV_BOOT_ONLY=1 HV_LOG=1 HV_AUTO_INPUT=10 HV_GRAB_GPU=1 HV_GRAB_EVERY=5 \
 - **只看一部分图就会得出错结论**（今天先说"surf 全是干净的"，其实是抽样太少 + 打分指标
   只对"高频噪点"敏感，对"黑底碎片"失灵）。
 - 判断"谁坏了"要靠**同一时刻的两份字节**（surface 与 encode），不要靠时间上错开的两次采样。
+
+---
+
+## 2026-11-22 下午：进一步实测与两次自我纠错
+
+### 已经站得住的（有同刻对照数据）
+
+| 结论 | 证据 |
+|---|---|
+| **坏帧不是"读页面读早了"** | `REIMS_SURFACE_DUMP_LATE=50`：present 时立即 dump 一份、50 ms 后再 dump 一份，坏帧的两份**逐字节相同**（diff 0.00）。时序/回写竞争假设作废 |
+| **坏帧在计数器上毫无特征** | `fr.log` 里好帧与坏帧的 present 间隔、surface 创建/释放数、事件 seq 增量**完全相同**（5 present / 5 create / 5 release / 11 seq） |
+| **坏区间起点 = 对话框第一次淡入** | 好帧 0–13（present 0–65，启动进度条），坏帧从 present 70 起 —— 即 guest 第一次做真正的分层合成 |
+| **显示表面的格式全程不变** | `mapped format 0x52476841 1920x1080 stride 15360 bpe 8`（RGhA），数千次 present 一个元组 |
+
+### 我自己犯的两个错（记下来，避免再犯）
+
+1. **dump 工具的通道顺序错**：`'RGhA'` 是 **R,G,B,A**，我按"先取到的当蓝"写成了 `(b,g,r)=(ch0,ch2,ch4)`，
+   结果 **B/R 交换、alpha 进了红通道**。对照 `gpu-072` 与 `fr-0053` 量出来：
+   `fr.R = 0.22*gpu.R + 185`、`fr.B = 0.58*gpu.B + 97` —— 就是这个错。已修（`(ch4, ch2, ch0)`）。
+   **教训**：dump 工具本身要先和"引擎自己 encode 的同一帧"对齐校验，否则会把工具 bug 当成引擎 bug。
+2. **图层 dump 的语义**：`REIMS_LAYER_DUMP` 打的是**纹理创建那一刻**的表面字节，而 guest 常常
+   "先建纹理、后往里画"。所以图层里"只写了一半/竖条纹"**不能**当作丢写证据 —— 它可能只是还没画。
+
+### 仍然未知
+
+- 坏帧是哪一个 draw 产生的、它采样了哪些纹理（需要 runtime 层探针）。
+- 为什么"鼠标要移动、且要移得远"才会出现（现象已多次确认，机制未知）。
+
+## 新增工具开关（全部默认关）
+
+| 开关 | 作用 |
+|---|---|
+| `REIMS_PRESENT_LOG=1` | 每次 present 的路径（backing/mapped）+ 格式 + 尺寸 + stride + bpe，**只在元组变化时打印** |
+| `REIMS_SURFACE_DUMP=<前缀>` | 写 guest 显示表面原始字节的 BMP；**噪点超阈值立刻写**并以 `NOISY` 标出 |
+| `REIMS_SURFACE_DUMP_EVERY=<n>` / `_MAX=<n>` | 每 n 个 present 取一张 / 最多 n 张 |
+| `REIMS_SURFACE_DUMP_LATE=<ms>` | 同一表面延迟 ms 再 dump 一份（`-lateNN` 后缀），用于排除"读早了" |
+| `REIMS_PROBE_LOG=1` | surface 创建/释放事件带 seq 打印（`reims-vgpu-core::probe` 的统一时钟） |
+| `REIMS_LAYER_DUMP=<前缀>` | 尺寸 ≥200×200 的图层表面在**建纹理时**的原始字节（跳过显示表面，1/20 采样，上限 400） |
+| `HV_POINTER_MS=<ms>` | 指针**持续**随机移动（±80 像素/步，默认 8–10 ms 一次），并每 32 步补一次平板绝对坐标；这是让故障出现的前提 |
+| `HV_AUTO_INPUT=<秒>` | 每 n 秒点一次 Setup Assistant 的 Continue 箭头（(1560,793)@1920x1080） |
+
+每个 dump 都在 `<前缀>.log` 里留一行：`帧路径 | dump 序号 | 触发时 seq | present | probe seq |
+surfaces created/released | 端口/格式/尺寸/stride/bpe | 噪点分`。所以"哪张图坏了"可以直接对到那一刻的状态。

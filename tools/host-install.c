@@ -25,6 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <pthread.h>
 
 int hv_android_install_start(const char *rom, const char *disk, const char *aux, const char *ipsw,
                              const char *workdir, int ram_mb, int ncpus, uint64_t ecid,
@@ -75,6 +76,46 @@ static int make_aux(const char *path) {
     return ok ? 0 : -1;
 }
 
+
+/*
+ * HV_POINTER_MS=<ms>: a pointer that never stops moving, in random directions, for ever.
+ *
+ * The guest's compositor repaints only what its pointer dirties, so a still pointer leaves the
+ * screen frozen and no repaint is ever seen (the operator's words: it needs the mouse moving, or
+ * every frame caught happens to be a normal one). This thread sends a random move every `ms`
+ * milliseconds from the moment the process starts -- the reports wait in the guest's own xhci
+ * device until it configures the endpoint -- so the guest is repainting continuously by the time
+ * anything is worth grabbing. A tablet report now and then puts the pointer somewhere new, which
+ * keeps a relative-only pointer from being parked against an edge of the screen.
+ */
+static void *pointer_thread(void *arg) {
+    extern void hv_android_mouse_move(int dx, int dy);
+    extern void hv_android_tablet(int x16, int y16, int buttons, int wheel);
+    long ms = (long)(intptr_t)arg;
+    /* xorshift64: no libm, no table, different every run. */
+    uint64_t s = 0x9e3779b97f4a7c15ull ^ (uint64_t)time(NULL);
+    unsigned n = 0;
+    for (;;) {
+        usleep((useconds_t)ms * 1000);
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        /* Long strides, not jitter: the guest recomputes its layers when the pointer crosses
+           them, and a short move recomputes almost nothing (the operator's note: it must move,
+           and far enough to make it redraw). */
+        int dx = (int)(s % 161) - 80;
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        int dy = (int)(s % 161) - 80;
+        hv_android_mouse_move(dx, dy);
+        /* Every so often, say where the pointer is in absolute terms too: it is a tablet the guest
+           knows as a real pointing device, and it un-parks a cursor that drifted to an edge. */
+        if (++n % 32 == 0) {
+            int x = 32768 + (int)((s >> 8) % 26000) - 13000;
+            int y = 32768 + (int)((s >> 24) % 20000) - 10000;
+            hv_android_tablet(x, y, 0, 0);
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: %s <AVPBooter.bin> <image.ipsw> <workdir> [ram_mb] [cpus] [ecid]\n",
@@ -86,6 +127,21 @@ int main(int argc, char **argv) {
     int cpus = argc > 5 ? atoi(argv[5]) : 2;
     unsigned long long ecid = argc > 6 ? strtoull(argv[6], NULL, 0) : 0x1234567890abcdefull;
 
+    /* HV_POINTER_MS: the pointer thread, before the guest ever has a display: it queues its
+       reports, and the guest's own xhci device holds them until it configures the endpoint. */
+    {
+        const char *ms = getenv("HV_POINTER_MS");
+        if (ms && *ms && atoi(ms) > 0) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pointer_thread, (void *)(intptr_t)atoi(ms)) != 0)
+                fprintf(stderr, "henge: no pointer thread\n");
+            else {
+                pthread_detach(t);
+                fprintf(stderr, "henge: pointer moving in random directions every %d ms\n",
+                        atoi(ms));
+            }
+        }
+    }
     if (hv_android_map_commpage() != 0)
         fprintf(stderr, "no commpage: counter reads will use the helper path\n");
 
