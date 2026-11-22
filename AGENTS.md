@@ -7,12 +7,113 @@
 
 ---
 
+## 0. 仓库与提交（正式分支已存在，2026-11-22 起）
+
+**我们有了自己的正式仓库。** 上游保留为只读参照，**不再推送**。
+
+> ### ⛔ 权责划分：本地提交归 AI，推送归用户
+>
+> | 动作 | 归谁 | 说明 |
+> |---|---|---|
+> | 改文件 / `git add` / **`git commit`** | **AI** | 本地动作，可回退。**AI 主动做，不用每次请示** |
+> | **`git push`** / `git push --force*` | **用户** | 用用户的 SSH 凭据写入远端，不可逆且对外可见 |
+>
+> **`git push` 一律由用户亲自执行。AI 只准备提交，不执行推送。**
+>
+> - 理由：并不是“AI 不会推”，而是 **推送属于用户的授权范围** —— 它把你本地的内容写进你的远端
+>   （`--force` 时还可能改写已公开历史），并使用你的凭据。AI 不应持有也不应使用这项能力。
+> - AI 可以做的：`git status` / `git log` / `git diff` / **`git add` / `git commit`**（本地），
+>   以及**只读**核对远端（`git ls-remote`）。
+> - AI **不做**的：`git push`、`git push --force*`、往远端建分支/改默认分支、改用户仓库设置。
+> - 需要推送时，**把命令写出来交给用户**，等用户执行完再基于结果继续。
+>
+> 同理，`android/third_party/reims-vgpu` 子仓库的推送也由用户执行。
+
+### 远端布局
+
+| remote | 地址 | 用途 |
+|---|---|---|
+| **`origin`** | **`git@github.com:heworkalin/Henge.git`** | **我们的仓库。推送只走这里，走 SSH，且由用户执行** |
+| `upstream` | `https://github.com/Leviidev/Henge` | 上游 iOS 线。**只读**，用来对照/取上游改动，**不推** |
+
+- **默认分支 = `dev`**（远端 HEAD 指向 `dev`）。`git clone` 出来就是 `dev`，只检出它一个分支。
+- **`main` 暂时不管**：它跟上游同步，不含本移植。看/对比上游用 `upstream/main`。
+- 本地 `dev` 跟踪 `origin/dev`。核对一致性用只读命令：
+  `git ls-remote origin refs/heads/dev` 与 `git rev-parse dev` 比对。
+
+### 推送形式：**SSH，不用 HTTPS，由用户执行**
+
+给用户的推送命令（**AI 只写命令，不代跑**）：
+
+```bash
+cd /home/he/Henge
+git push origin dev                 # 日常推送，不加 --force
+```
+
+- **`origin` 用 SSH**（`git@github.com:...`），凭据是本机 SSH key，由用户掌握。HTTPS 只用于**克隆与只读核对**。
+- **文档/`.gitmodules` 里的 URL 一律写 HTTPS**：公开仓库、clone 与 `submodule update` 都不需要 key。
+  这条区分**不能混**：提交推送走 SSH，分发/克隆走 HTTPS。
+- 改写历史后必须 `--force-with-lease`（不要裸 `--force`）。**动手前先建备份分支**，
+  推完由**用户**核对无误再删备份。改写历史属于高危操作，**先问、得到明确同意才做**。
+
+### 提交署名（踩过的坑）
+
+**署名必须是 `heworkalin <2701814400@qq.com>`**，来自 `~/.gitconfig`。
+
+> **事故**：曾有 21 个提交被写成了 `Henge <henge@local>` —— 那是 agent 执行环境带进去的
+> 占位身份，覆盖了全局配置。已用 `git filter-repo` 改写回来（内容 tree 完全不变，只改 author/committer）。
+>
+> **提交后必查**：
+> ```bash
+> git log --format="%h %an <%ae> %s" -3
+> ```
+> 只要看到不是 `heworkalin`，停下来查 `git config --show-origin --get-regexp '^user\.'`
+> 与 `env | grep ^GIT_`，**不要带着错误署名继续提交**。
+
+### 第二个仓库：`heworkalin/reims-vgpu`
+
+图形链路依赖在 **`android/third_party/reims-vgpu`**，它是一个**独立仓库**（自己有 `.git`）：
+
+| 项 | 值 |
+|---|---|
+| 我们的远端 | `git@github.com:heworkalin/reims-vgpu.git` |
+| 上游 | `https://github.com/steelbrain/reims-vgpu` |
+| **我们的分支** | **`rebuild`**（`master` 跟随上游，别在上面工作） |
+| 推什么 | `git push origin rebuild`（**由用户执行**） |
+
+**Henge 主仓库里它的 gitlink 钉死在 `rebuild` 的某个提交上**（当前 `0830c4f`）。
+改了 reims 代码后，除了推 `rebuild`，还要回主仓库提交更新后的 gitlink，否则别人拿到的还是旧版。
+
+> 这个 commit **不在任何上游分支上** —— 所以 `reims-vgpu` 必须有我们自己的远端，不能只靠 upstream。
+
+### 依赖的三种形态（别被“clone 就完事”骗了）
+
+`git ls-tree` 能直接看出来，`160000` 是 gitlink，`040000` 是普通目录：
+
+```bash
+git ls-tree HEAD android/third_party/
+```
+
+| 形态 | 例子 | clone 后 |
+|---|---|---|
+| **gitlink + `.gitmodules`** | `reims-vgpu`、`libadrenotools` | ⚠️ **空目录**，要 `git submodule update --init` |
+| **vendored 普通目录** | `metal2vulkan-runtime`、`lzfse`、`third_party/*` | ✅ 直接就有 |
+| **下载物**（ignore） | Turnip `.so`、IPSW、`AVPBooter` | ❌ 不存在，另有脚本/手动 |
+
+**全部清单与各上游许可见 `THIRD_PARTY.md`（唯一出处）。** 填充 gitlink 也可以跑 `tools/clone-deps.sh`。
+
+> **`third_party/` 里有 4 棵树带着我们必需的本地补丁**（idevicerestore ×2、usbmuxd、libimobiledevice-glue）。
+> **用上游原版替换它们会让安装失败**，而且失败现象跟补丁无关（像超时、设备列表为空），极难排查。
+> 改动清单见 `THIRD_PARTY.md` §6。
+
+---
+
 ## 1. 项目是什么
 
 **Henge**：在非特权环境里跑 macOS 虚拟机的模拟器。
 
-- 上游：`https://github.com/Leviidev/Henge`（iOS 版，作者 Leviidev）
-- 本仓库：`dev` 分支 = 上游 + 我们的 **Android 移植**（`android/`）与内核启动调试
+- 上游：`https://github.com/Leviidev/Henge`（iOS 版，作者 Leviidev）。**只读参照，见第 0 节**
+- 本仓库：`https://github.com/heworkalin/Henge`，**默认分支 `dev`** = 上游 + 我们的 **Android 移植**（`android/`）与内核启动调试
 - 模拟对象：Apple **VMAPPLE** 平台（Virtualization.framework 的 guest 侧设备模型）
   引导链：`AVPBooter → iBoot Stage1 → Stage2(iBEC) → ramdisk + device tree + kernelcache → XNU → restored_external`
   （`restored` 与 `restored_external` 是**同一个 task** 的两个 `p_comm` 视图，后者被截成 `restored_externa`）
