@@ -3106,6 +3106,17 @@ pub(super) fn plane_copy_regions(
     let shared = layout.shared_bytes();
     let width = (layout.row_bytes / texel_bytes) as u32;
     let pitch = (layout.row_pitch / texel_bytes) as u32;
+    // TEMP DIAG (Android bring-up, GPU corruption): a wide surface's rows and their pitch, in the
+    // units Vulkan's copies take them in. A row pitch shorter than the surface's own stride shears
+    // every row by the difference, and a padded surface is exactly where that shows.
+    if std::env::var_os("REIMS_ROWDIAG").is_some() && width >= 1000 {
+        eprintln!(
+            "rowdiag: row_bytes {} texel {} -> width {} texels; row_pitch {} -> pitch {} texels; \
+             shared {} slices {} rows {}",
+            layout.row_bytes, texel_bytes, width, layout.row_pitch, pitch, shared, layout.slices,
+            layout.rows
+        );
+    }
     // The descriptor's checks bound a texture's extent and slices to `u32`s.
     let (slices, rows) = (layout.slices as u32, layout.rows as u32);
     // A block-compressed texture's rows of blocks, as Vulkan copies them: its pitch and offsets
