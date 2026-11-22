@@ -1,0 +1,71 @@
+# GPU：图层内容坏成"砖块噪点"（2026-11-22，已复现，未修）
+
+## 结论（今天的实测）
+
+1. **离屏可复现**：CLI 跑 `workB`，用自动输入（`HV_AUTO_INPUT`）点击 Setup Assistant 的
+   Continue 箭头，`HV_GRAB_GPU=1 HV_GRAB_EVERY=5` 抓帧。5 分钟 ~51 帧里有 **3 帧坏**
+   （`gpu-037/046/058`），其余正常 —— 与你看到的"偶发、要鼠标动才出现"一致。
+2. **encode 是忠实的**：`surf-0300`（guest 显示表面的原始字节）与
+   `gpu-059..065` 的统计**完全一致**（white=0.226 dark=0.765 dx=0.90）。
+   → 屏幕上看到的坏内容，**当且仅当 guest 的显示表面里就是坏的**。
+   上屏（swapchain/present）不是元凶；`docs/gpu-black-tiles-2026-11-21.md` 里
+   "部分提交/清屏"的猜测作废。
+3. **坏的是"某一层"**：坏帧里对话框白底整块变成砖块噪点，而**叠在上面的文字、地球图标、
+   蓝色高亮列表项都是对的**。所以是**某个图层的内容错**，不是整屏错。
+4. **形态是字形图集**：实测坏帧的图案周期 —— **列 ≈15 px、行 ≈32 px**（FFT 峰值）。
+   这是字形图集（glyph atlas）的格子尺寸，不是 stride/tile 的周期。
+   → 最可能是**这次 draw 采样到了"另一张纹理"**（图集），即绑定/描述符层面的错，
+   而不是几何、stride、UBWC。
+
+## 已排除
+
+| 假设 | 证据 |
+|---|---|
+| 显示 surface 的 stride/格式搞错 | `present #N: mapped format 0x52476841 1920x1080 stride 15360 bpe 8`，**全程不变**（几次运行 2600+ present 都是同一元组）→ 没有"格式动态切换"发生在显示表面上 |
+| 导入长度不够（surface 被截断） | 新增检查：`needs = bytes_per_row * height` 与导入长度比较，全程**无告警**；显示表面 needs `0xfd2000` = 16.6 MB，导入就是它 |
+| 上屏路径（清屏/区域/缩放） | 见结论 2：encode 与 surface 字节一致 |
+| 原厂驱动对照 | 原厂 Adreno 驱动在本路径上直接 fatal（`HostMemory` 需要 `VK_EXT_external_memory_host`，它没有）→ 对照不可做，本机只能是 Turnip |
+
+## 现场参数（重要，复现用）
+
+guest 用到的 surface 形状（`REIMS_DIAG=1` 的 `DIAG surface buffer` 计数）：
+
+| 形状 | 次数 | 推断 |
+|---|---|---|
+| `1920x1080 stride 15360 bpe 8` | 305 | **显示表面**（`'RGhA'` = RGBA16Float） |
+| `3840x2160 stride 16384 bpe 4` | 120 | 2× 图层（壁纸/大图，1920x1080 的 HiDPI 版） |
+| `512x512 stride 512 bpe 1` | 120 | **8 位单通道 512×512 = 字形/蒙版图集** |
+| `512x512 stride 2048 bpe 4` | 69 | RGBA8 512×512 |
+| `1920x24 stride 7680 bpe 4` | 7 | 菜单栏条带 |
+
+## 复现命令（设备侧 `/data/local/tmp/henge`）
+
+```bash
+REIMS_SURFACE_DUMP=/data/local/tmp/henge/workB/surf \
+REIMS_DIAG=1 \
+HV_RAM_NO_DMABUF=1 REIMS_ROG_UNORDERED=1 HV_VK_DRIVER=/data/local/tmp/henge/driver \
+HV_BOOT_ONLY=1 HV_LOG=1 HV_AUTO_INPUT=10 HV_GRAB_GPU=1 HV_GRAB_EVERY=5 \
+  ./host-install AVPBooter.vmapple2.bin workB/disk.img workB 2048 2 > run.log 2>&1
+```
+
+- `HV_AUTO_INPUT=<秒>`：每 N 秒移动一次指针（tablet 绝对坐标 + 相对移动），每 4 步点击
+  Continue 箭头（(1560,793) @1920x1080）。没有鼠标信号时坏帧不出现（你也这么说过），
+  这个开关就是离屏版的"鼠标在动"。
+- `REIMS_SURFACE_DUMP=<前缀>`：每 20 个 present 写一张 guest 表面原始字节的 BMP，
+  另外**一检测到噪点就立刻写**并打印 `surface noise:` 行。
+- 判读脚本 `/tmp/noisy.py`：按"相邻像素差"给 BMP 打分，快速从几十张里挑出坏帧
+  （注意：**这个指标抓不到"黑底+字母碎片"型损坏**，那种要靠肉眼看或按白像素分布判断）。
+
+## 下一步（按成本）
+
+1. **定位那一层的 draw**：在 runtime 里加"只对渲染到显示表面的 pass 打印其采样纹理
+   （格式/尺寸/指针）"的探针，抓一好一坏两帧对比。若坏帧里白底 draw 绑的是
+   `512x512 bpe 1` 的图集 → 绑定/描述符缓存问题，去查描述符缓存 key 与资源 ID 复用。
+2. 若确认是资源 ID 复用：过渡期 surface 释放/重建，ID 被复用而缓存没失效。
+3. 备选：`MTLHeap`/argument buffer 路径单独做单元测试（同一 slot 换不同纹理，看是否取到旧的）。
+
+## 记住的教训
+
+- **只看一部分图就会得出错结论**（今天先说"surf 全是干净的"，其实是抽样太少 + 打分指标
+  只对"高频噪点"敏感，对"黑底碎片"失灵）。
+- 判断"谁坏了"要靠**同一时刻的两份字节**（surface 与 encode），不要靠时间上错开的两次采样。

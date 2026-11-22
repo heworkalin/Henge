@@ -295,6 +295,43 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            /* HV_AUTO_INPUT=<seconds>: the pointer moves and Return is pressed, so a command-line
+               run reaches the screens a person would and has a cursor over them. The operator's
+               fault needs a moving pointer to appear at all ("at least one mouse signal"), and a
+               guest left on one dialog draws no cursor: this is the off-screen counterpart of
+               touching the screen. */
+            {
+                const char *secs = getenv("HV_AUTO_INPUT");
+                static time_t last_input;
+                static int step;
+                if (secs && *secs && time(NULL) - last_input >= atoi(secs)) {
+                    extern void hv_android_tablet(int x16, int y16, int buttons, int wheel);
+                    extern void hv_android_mouse_move(int dx, int dy);
+                    extern void hv_android_key(uint8_t usage, int down);
+                    last_input = time(NULL);
+                    step++;
+                    /* A tablet report puts the guest's pointer at a place; the relative move after
+                       it is what a trackpad would add, and what makes the guest repaint around it. */
+                    int x = 32768 + (step % 5) * 4000 - 8000;
+                    int y = 32768 + (step % 3) * 5000 - 5000;
+                    hv_android_tablet(x, y, 0, 0);
+                    hv_android_mouse_move((step % 2) ? 40 : -40, (step % 3) ? 25 : -25);
+                    /* Every fourth step: a click on Setup Assistant's Continue arrow (bottom right
+                       of the 1920x1080 mode), which is what advances it -- Return alone does not,
+                       the page wants the button (measured: eight Returns and the language page
+                       stayed). The button is a real one: the tablet reports absolute position. */
+                    if (step % 4 == 0) {
+                        int bx = (int)(1560.0 * 65535 / 1920), by = (int)(793.0 * 65535 / 1080);
+                        hv_android_tablet(bx, by, 0, 0);
+                        usleep(60000);
+                        hv_android_tablet(bx, by, 1, 0);
+                        usleep(60000);
+                        hv_android_tablet(bx, by, 0, 0);
+                        fprintf(stderr, "henge: auto input click at %d,%d\n", bx, by);
+                    }
+                    fprintf(stderr, "henge: auto input step %d (tablet %d,%d)\n", step, x, y);
+                }
+            }
             {
                 const char *after = getenv("HV_GRAB_FRAME");
                 static int grabbed;
