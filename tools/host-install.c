@@ -304,18 +304,31 @@ int main(int argc, char **argv) {
             /* HV_GRAB_EVERY=<seconds>: keep writing frame-NNN.bmp, so the firmware's progress bar
                can be compared across time (a stalled boot and a slow one look the same once). */
             {
+                /* Three dumps, three switches, each off unless its own variable says so: the
+                   firmware's boot framebuffer (HV_GRAB_FB), the GPU's frame (HV_GRAB_GPU), and the
+                   guest display surface's own bytes, which reims dumps itself (REIMS_SURFACE_DUMP).
+                   A run that wants only the last one sets no interval at all and writes no files
+                   here: the firmware's framebuffer goes black once the guest's own display renders
+                   (the boot display stops being drawn), so grabbing it forever says nothing. */
                 const char *every = getenv("HV_GRAB_EVERY");
+                const char *want_fb = getenv("HV_GRAB_FB");
+                const char *gpu_name = getenv("HV_GRAB_GPU");
                 static time_t last;
                 static int seq;
-                if (every && *every && time(NULL) - last >= atoi(every)) {
+                if (every && *every
+                    && ((want_fb && *want_fb && *want_fb != '0')
+                        || (gpu_name && *gpu_name && *gpu_name != '0'))
+                    && time(NULL) - last >= atoi(every)) {
                     extern int hv_android_boot_framebuffer(const uint8_t **px, uint32_t *w,
                                                            uint32_t *h, uint32_t *stride);
                     const uint8_t *px = NULL;
                     uint32_t w = 0, h = 0, st = 0;
                     last = time(NULL);
-                    if (hv_android_boot_framebuffer(&px, &w, &h, &st) == 0 && px) {
+                    seq++;
+                    if (want_fb && *want_fb && *want_fb != '0'
+                        && hv_android_boot_framebuffer(&px, &w, &h, &st) == 0 && px) {
                         char bmp[672];
-                        snprintf(bmp, sizeof bmp, "%s/fb-%03d.bmp", work, ++seq);
+                        snprintf(bmp, sizeof bmp, "%s/fb-%03d.bmp", work, seq);
                         FILE *f = fopen(bmp, "wb");
                         if (f) {
                             uint8_t hd[54];
