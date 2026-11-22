@@ -13319,6 +13319,7 @@ impl RenderCommandEncoder {
     /// [`set_vertex_bytes`](Self::set_vertex_bytes), in the fragment stage's table. Refused as
     /// that is.
     pub fn set_fragment_bytes(&mut self, bytes: &[u8], index: u32) -> Result<(), Error> {
+        crate::diag::fragment_bytes(index, bytes);
         match self.lowers_at_call() {
             true => self.at_call(|lowering| lowering.set_fragment_bytes(bytes, index)),
             false => {

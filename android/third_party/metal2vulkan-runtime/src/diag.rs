@@ -129,3 +129,27 @@ pub(crate) fn scissor(r: &crate::render_values::ScissorRect) {
     let pass = PASS_NUMBER.with(std::cell::Cell::get);
     eprintln!("pass #{pass} scissor: x {} y {} w {} h {}", r.x, r.y, r.width, r.height);
 }
+
+/// The fragment bytes set inside the display's pass, read as floats and words: the dither's own
+/// amplitude and scale live in such a constant, and a background that comes out as a full-contrast
+/// checkerboard is a constant read wrong.
+pub(crate) fn fragment_bytes(index: u32, bytes: &[u8]) {
+    if !passes() || !IN_DISPLAY_PASS.with(std::cell::Cell::get) {
+        return;
+    }
+    let pass = PASS_NUMBER.with(std::cell::Cell::get);
+    let floats: Vec<String> = bytes
+        .chunks_exact(4)
+        .take(8)
+        .map(|c| {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            format!("{v:?}/{w:#x}")
+        })
+        .collect();
+    eprintln!(
+        "pass #{pass} fragbytes[{index}]: {} bytes, {}",
+        bytes.len(),
+        floats.join(" ")
+    );
+}
