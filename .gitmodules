@@ -1,0 +1,7 @@
+[submodule "android/third_party/reims-vgpu"]
+	path = android/third_party/reims-vgpu
+	url = https://github.com/heworkalin/reims-vgpu.git
+	branch = rebuild
+[submodule "android/third_party/libadrenotools"]
+	path = android/third_party/libadrenotools
+	url = https://github.com/bylaws/libadrenotools.git
