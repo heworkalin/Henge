@@ -31,6 +31,23 @@
 
 ---
 
+## Scope of use — read this
+
+- **Personal research use only; non-commercial.**
+- **macOS is governed by Apple's Software Licence Agreement (SLA), and this project's use of it is outside what
+  Apple grants.** SLA §2B(iii) allows virtualising macOS only on **Apple-branded hardware that is already
+  running macOS**, **at most two** additional instances per machine, and only for software development, testing
+  during development, macOS Server, or **personal, non-commercial use**. SLA §2J is blunter: you may not
+  install, use or run macOS on **any non-Apple-branded computer**.
+- **So running macOS on Android is the same kind of personal hacker practice as a community “Hackintosh” —
+  tinker on your own hardware, at your own risk. We do not pretend this is compliant, and nothing here
+  grants any Apple permission.**
+- **This project provides no macOS image and does not redistribute the Boot ROM.** **Commercial use, packaged
+  redistribution and sublicensing are prohibited.**
+- **Users must read and comply with Apple's SLA themselves.** Nothing here is a licence or legal advice.
+
+---
+
 ## Test scope — read this first
 
 **This Android port has been tested on exactly one device:**
@@ -312,6 +329,14 @@ that file is the single source of truth for which switches exist.
 ---
 
 ## Licence
+
+**Personal research use only; non-commercial.** macOS is governed by Apple's SLA, and this project's use of it
+**falls outside what Apple grants** (§2B(iii) requires an Apple-branded host that is already running macOS, at most
+two extra VM instances per machine, and only four permitted purposes; §2J forbids running macOS on any
+non-Apple-branded computer). This is the same category of personal hacker practice as a community “Hackintosh”:
+tinker on your own hardware, at your own risk. We do not pretend it is compliant, and nothing here grants Apple
+permission. This project **provides no macOS image and does not redistribute the Boot ROM**; **commercial use,
+packaged redistribution and sublicensing are prohibited**. Users must read and comply with Apple's SLA themselves.
 
 **GPL-2.0-or-later**, same as upstream. Henge compiles in usbmuxd (GPLv2 or GPLv3) and code from Husk
 (GPL-2.0-or-later), so the shipped binary is a combined GPL work and **cannot go on the App Store**.
