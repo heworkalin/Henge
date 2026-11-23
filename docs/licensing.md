@@ -1,18 +1,26 @@
 # Licensing
 
-**Scope of use: personal research only, non-commercial.** macOS is governed by Apple's Software Licence
-Agreement, and this project's use of it **falls outside what Apple grants**: SLA §2B(iii) permits virtualising
-macOS on an **Apple-branded computer that is already running macOS**, at most **two** additional instances per
-machine, and only for software development, testing during development, macOS Server, or **personal,
-non-commercial use**; §2J forbids installing, using or running macOS on **any non-Apple-branded computer**.
-Running it on Android is therefore the same category of personal hacker practice as a community “Hackintosh” —
-your own hardware, your own risk. **This project provides no macOS image and does not redistribute the Boot
-ROM**; **commercial use, packaged redistribution and sublicensing are prohibited**. Users must read and comply
-with Apple's SLA themselves. Nothing in this file is a licence or legal advice.
+## Two layers, not one
 
-Henge is GPL-2.0-or-later ([LICENSE](../LICENSE)). The shipped binary is a combined
-GPL work because usbmuxd and code from Husk are compiled into it, so it cannot go on
-the App Store.
+**Code.** Henge and the Android port are **GPL-2.0-or-later** ([LICENSE](../LICENSE)). The shipped binary is a
+combined GPL work — usbmuxd (GPLv2 or GPLv3) and code from Husk (GPL-2.0-or-later) are compiled into it — so it
+cannot go on the App Store. Every imported component also remains bound by its own licence; this repository does
+not relicense them (see the table below).
+
+**System.** **macOS running inside the VM is Apple's**, in copyright and in licence, and is governed by
+**Apple's Software Licence Agreement**. **This project holds no Apple authorisation, endorsement or support**,
+and **provides no macOS image and no Boot ROM** — the device downloads them from Apple at install time.
+
+## Scope of use
+
+Personal research only, non-commercial. Apple's virtualisation grant (SLA §2B(iii)) requires an **Apple-branded
+host that is already running macOS**, **at most two** additional instances per machine, and only four permitted
+purposes (software development, testing during development, macOS Server, **personal non-commercial** use);
+§2J forbids installing, using or running macOS on **any non-Apple-branded computer** at all. **Running macOS on
+Android is therefore outside what Apple grants — the same category of personal hacker practice as a community
+“Hackintosh”: the hardware and data are yours, and so is the risk and the responsibility.** Commercial use,
+packaged redistribution and sublicensing are prohibited; users must read and comply with Apple's SLA themselves.
+Nothing in this file is a licence or legal advice.
 
 | Code | Licence | Where |
 | --- | --- | --- |

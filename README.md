@@ -33,15 +33,20 @@
 
 ## 使用范围（必读）
 
-- **仅限个人研究使用，非商用。**
-- **macOS 受 Apple 的软件许可协议（SLA）约束，而本项目的用法不在 Apple 授予的范围内。**
-  SLA §2B(iii) 授予的虚拟化许可要求：宿主机是**苹果品牌硬件、且该硬件已经在运行 macOS**，
-  每台最多**两份**额外虚拟实例，用途限于软件开发 / 开发期测试 / macOS Server / **个人非商业用途**四类。
-  SLA §2J 更直接：不得在**任何非 Apple 品牌计算机**上安装、使用或运行 macOS。
-- **所以：在 Android 上跑 macOS，属于社区里和“黑苹果”同一类个人极客实践 —— 自己玩、自担风险，
-  不合规这件事我们不掩饰，也不因此获得任何 Apple 授权。**
-- **本项目不提供 macOS 镜像，也不分发 Boot ROM**；**禁止商用、打包分发、再许可**。
-- **使用者需自行阅读并遵守 Apple 的 SLA**；本文不构成授权，也不构成法律意见。
+**许可分层：代码是 GPL，macOS 是 Apple 的，两者不能混为一谈。**
+
+- **代码**：本仓库的 Henge 虚拟机引擎与 Android 移植代码，以及并入的上游组件，遵循 **GPL-2.0-or-later**；
+  其中每个上游组件同时受其**自身许可**约束（含 LGPL-2.1+ / Apache-2.0 / BSD 等），明细见
+  [`THIRD_PARTY.md`](THIRD_PARTY.md) 与 [`docs/licensing.md`](docs/licensing.md)。
+- **系统**：虚拟机内运行的 **macOS 的版权与使用许可归 Apple 所有**，受 **Apple SLA** 约束。
+  **本项目未获得 Apple 的任何授权、认可或支持**，也**不提供 macOS 镜像与 Boot ROM**（安装时由设备从 Apple 下载）。
+- **边界**：Apple 授予的虚拟化许可（SLA §2B(iii)）要求宿主机是**已在运行 macOS 的 Apple 品牌硬件**、
+  每台最多**两份**额外实例、用途限四类（软件开发 / 开发期测试 / macOS Server / **个人非商业**）；
+  而 SLA §2J 直接禁止在任何 **非 Apple 品牌计算机**上安装、使用或运行 macOS。
+  因此**在 Android 上跑 macOS，不在 Apple 授予范围内 —— 这与社区的「黑苹果」是同一类个人极客实践：
+  设备由个人持有，风险与责任由个人承担。** 本项目不掩饰这一点，也不因此获得任何 Apple 授权。
+- **本项目禁止商用、打包分发、再许可**；使用者需自行阅读并遵守 Apple 的 SLA。
+  本文不构成授权，也不构成法律意见。
 
 ---
 
@@ -322,16 +327,19 @@ cd /home/he/Henge
 
 ## 许可
 
-**GPL-2.0-or-later**，与上游一致。Henge 编译进 usbmuxd（GPLv2 或 GPLv3）与 Husk 的代码
-（GPL-2.0-or-later），因此发行的二进制是合并的 GPL 作品，**不能上架 App Store**。
+**许可分层：代码是 GPL，macOS 是 Apple 的。**
 
-**仅限个人研究使用，非商用。** macOS 受 Apple 的 SLA 约束，而本项目的用法**不在 Apple 授予的范围内**（§2B(iii) 要求宿主机为已在运行 macOS 的苹果硬件、每台最多两份虚拟实例、用途限四类；§2J 禁止在任何非 Apple 品牌计算机上安装/使用/运行）。
-这与社区的“黑苹果”属同一类个人极客实践：自己玩、自担风险，本项目不掩饰不合规，也不因此获得任何 Apple 授权。
-本项目**不提供 macOS 镜像，也不分发 Boot ROM**；**禁止商用、打包分发、再许可**。使用者需自行阅读并遵守 Apple 的 SLA。
+**代码**：**GPL-2.0-or-later**，与上游一致。Henge 编译进 usbmuxd（GPLv2 或 GPLv3）与 Husk 的代码
+（GPL-2.0-or-later），因此发行的二进制是合并的 GPL 作品，**不能上架 App Store**。各上游组件同时受其自身许可约束，
+本仓库不重新授权它们 —— 见 [`THIRD_PARTY.md`](THIRD_PARTY.md) 与 [`docs/licensing.md`](docs/licensing.md)。
 
-macOS 与 Mac 的 boot ROM 是 Apple 的，不属于本仓库；安装时从 Apple 下载。
-各上游组件的版权归各自作者，**本仓库不重新授权**它们 —— 见 [`THIRD_PARTY.md`](THIRD_PARTY.md) 与
-[`docs/licensing.md`](docs/licensing.md)。
+**系统**：虚拟机内运行的 **macOS 版权与使用许可归 Apple 所有**，受 **Apple SLA** 约束。**本项目未获得 Apple
+的任何授权、认可或支持**，也**不提供 macOS 镜像与 Boot ROM**（安装时由设备从 Apple 下载）。
+
+**边界**：Apple 的虚拟化许可（§2B(iii)）只覆盖“宿主机为已在运行 macOS 的 Apple 品牌硬件、每台最多两份实例、
+用途限四类”这一情形；§2J 禁止在任何非 Apple 品牌计算机上安装/使用/运行 macOS。**在 Android 上跑 macOS 因此
+不在 Apple 授予范围内，与「黑苹果」同类：设备与数据由个人持有，风险与责任由个人承担。**
+本项目**禁止商用、打包分发、再许可**；使用者需自行阅读并遵守 Apple 的 SLA；本文不构成授权或法律意见。
 
 ## 致谢
 

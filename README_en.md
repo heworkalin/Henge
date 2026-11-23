@@ -33,18 +33,23 @@
 
 ## Scope of use — read this
 
-- **Personal research use only; non-commercial.**
-- **macOS is governed by Apple's Software Licence Agreement (SLA), and this project's use of it is outside what
-  Apple grants.** SLA §2B(iii) allows virtualising macOS only on **Apple-branded hardware that is already
-  running macOS**, **at most two** additional instances per machine, and only for software development, testing
-  during development, macOS Server, or **personal, non-commercial use**. SLA §2J is blunter: you may not
-  install, use or run macOS on **any non-Apple-branded computer**.
-- **So running macOS on Android is the same kind of personal hacker practice as a community “Hackintosh” —
-  tinker on your own hardware, at your own risk. We do not pretend this is compliant, and nothing here
-  grants any Apple permission.**
-- **This project provides no macOS image and does not redistribute the Boot ROM.** **Commercial use, packaged
-  redistribution and sublicensing are prohibited.**
-- **Users must read and comply with Apple's SLA themselves.** Nothing here is a licence or legal advice.
+**Licensing is layered: the code is GPL, macOS is Apple's, and the two must not be conflated.**
+
+- **Code**: the Henge VM engine, the Android port and the imported upstream components are under
+  **GPL-2.0-or-later**; each upstream component remains bound by **its own licence** too (LGPL-2.1+, Apache-2.0,
+  BSD, …). See [`THIRD_PARTY.md`](THIRD_PARTY.md) and [`docs/licensing.md`](docs/licensing.md).
+- **System**: **macOS running inside the VM is Apple's**, in copyright and in licence, and is governed by
+  **Apple's SLA**. **This project holds no Apple authorisation, endorsement or support**, and **provides no macOS
+  image and no Boot ROM** (the device downloads them from Apple at install time).
+- **Boundary**: Apple's virtualisation grant (SLA §2B(iii)) requires an **Apple-branded host that is already
+  running macOS**, **at most two** additional instances per machine, and only four permitted purposes (software
+  development, testing during development, macOS Server, **personal non-commercial** use); SLA §2J forbids
+  installing, using or running macOS on **any non-Apple-branded computer** at all. **Running macOS on Android is
+  therefore outside what Apple grants — the same kind of personal hacker practice as a community “Hackintosh”:
+  the hardware is yours, and so is the risk and the responsibility.** We do not disguise that, and nothing here
+  grants any Apple permission.
+- **Commercial use, packaged redistribution and sublicensing are prohibited**; users must read and comply with
+  Apple's SLA themselves. Nothing here is a licence or legal advice.
 
 ---
 
@@ -330,19 +335,23 @@ that file is the single source of truth for which switches exist.
 
 ## Licence
 
-**Personal research use only; non-commercial.** macOS is governed by Apple's SLA, and this project's use of it
-**falls outside what Apple grants** (§2B(iii) requires an Apple-branded host that is already running macOS, at most
-two extra VM instances per machine, and only four permitted purposes; §2J forbids running macOS on any
-non-Apple-branded computer). This is the same category of personal hacker practice as a community “Hackintosh”:
-tinker on your own hardware, at your own risk. We do not pretend it is compliant, and nothing here grants Apple
-permission. This project **provides no macOS image and does not redistribute the Boot ROM**; **commercial use,
-packaged redistribution and sublicensing are prohibited**. Users must read and comply with Apple's SLA themselves.
+**Licensing is layered: the code is GPL, macOS is Apple's.**
 
-**GPL-2.0-or-later**, same as upstream. Henge compiles in usbmuxd (GPLv2 or GPLv3) and code from Husk
-(GPL-2.0-or-later), so the shipped binary is a combined GPL work and **cannot go on the App Store**.
+**Code**: **GPL-2.0-or-later**, same as upstream. Henge compiles in usbmuxd (GPLv2 or GPLv3) and code from Husk
+(GPL-2.0-or-later), so the shipped binary is a combined GPL work and **cannot go on the App Store**. Every
+imported component also remains bound by its own licence; this repository does not relicense them — see
+[`THIRD_PARTY.md`](THIRD_PARTY.md) and [`docs/licensing.md`](docs/licensing.md).
 
-macOS and the Mac's boot ROM are Apple's and are not part of this repository; Henge downloads both from
-Apple at install time.
+**System**: **macOS running inside the VM is Apple's**, in copyright and in licence, and is governed by
+**Apple's SLA**. **This project holds no Apple authorisation, endorsement or support**, and **provides no macOS
+image and no Boot ROM** (the device downloads them from Apple at install time).
+
+**Boundary**: Apple's §2B(iii) grant only covers “an Apple-branded host that is already running macOS, at most two
+instances per machine, four permitted purposes”; §2J forbids installing, using or running macOS on any
+non-Apple-branded computer. **Running macOS on Android is therefore outside what Apple grants — the same category
+as a community “Hackintosh”: the hardware and data are yours, and so is the risk and the responsibility.**
+**Commercial use, packaged redistribution and sublicensing are prohibited**; users must read and comply with
+Apple's SLA themselves. Nothing here is a licence or legal advice.
 
 ## Credits
 
